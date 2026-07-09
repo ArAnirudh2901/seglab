@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>SEGLAB — on-device segmentation</title>
+<style>
+    :root {
+        --bg: #0b0d10;
+        --panel: #14171c;
+        --panel-2: #1a1e25;
+        --line: #262c35;
+        --text: #e8ecf1;
+        --dim: #8b94a1;
+        --accent: #35e0c2;
+        --accent-dim: rgba(53, 224, 194, 0.14);
+        --pos: #35e08a;
+        --neg: #ff5d6c;
+        --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    header {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+        flex-wrap: wrap;
+    }
+    .brand { font-weight: 700; letter-spacing: 0.14em; font-size: 15px; }
+    .brand em { color: var(--accent); font-style: normal; }
+    .badge {
+        font-size: 11px;
+        color: var(--accent);
+        background: var(--accent-dim);
+        border: 1px solid rgba(53, 224, 194, 0.35);
+        padding: 2px 8px;
+        border-radius: 999px;
+        white-space: nowrap;
+    }
+    .spacer { flex: 1; }
+
+    .modes { display: flex; gap: 6px; }
+    button {
+        appearance: none;
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--text);
+        border-radius: var(--radius);
+        padding: 7px 14px;
+        font: inherit;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+        touch-action: manipulation;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: 0.38; cursor: not-allowed; }
+    button.active {
+        background: var(--accent-dim);
+        border-color: var(--accent);
+        color: var(--accent);
+    }
+    button.small { padding: 5px 10px; font-size: 12.5px; }
+
+    .signtoggle.pos { color: var(--pos); border-color: var(--pos); }
+    .signtoggle.neg { color: var(--neg); border-color: var(--neg); }
+
+    main {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 18px;
+        min-height: 0;
+        position: relative;
+    }
+    #stage {
+        position: relative;
+        max-width: 100%;
+        max-height: 100%;
+        border-radius: var(--radius);
+        overflow: hidden;
+        box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+        /* checkerboard peeks through when a cutout preview is shown */
+        background:
+            repeating-conic-gradient(#191d23 0% 25%, #12151a 0% 50%) 0 0 / 24px 24px;
+        display: none;
+    }
+    #stage.visible { display: block; }
+    #stage canvas {
+        display: block;
+        max-width: 100%;
+        max-height: calc(100vh - 170px);
+        width: auto;
+        height: auto;
+        user-select: none;
+        -webkit-user-select: none;
+    }
+    #overlay {
+        position: absolute;
+        inset: 0;
+        width: 100% !important;
+        height: 100% !important;
+        cursor: crosshair;
+        touch-action: none;
+    }
+
+    #dropzone {
+        border: 1.5px dashed var(--line);
+        border-radius: 18px;
+        padding: 56px 64px;
+        text-align: center;
+        color: var(--dim);
+        transition: border-color 0.2s, background 0.2s;
+        max-width: 520px;
+    }
+    #dropzone.drag { border-color: var(--accent); background: var(--accent-dim); }
+    #dropzone h2 { color: var(--text); font-size: 19px; margin-bottom: 8px; font-weight: 600; }
+    #dropzone p { margin-bottom: 18px; }
+    #dropzone .actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
+    footer {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 8px 16px;
+        border-top: 1px solid var(--line);
+        background: var(--panel);
+        font-size: 12.5px;
+        color: var(--dim);
+        flex-wrap: wrap;
+        min-height: 38px;
+    }
+    #status { flex: 1; min-width: 160px; }
+    .chip {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 2px 10px;
+        white-space: nowrap;
+    }
+    .chip.on { color: var(--accent); border-color: rgba(53, 224, 194, 0.4); }
+    #loadbar {
+        position: absolute;
+        left: 0;
+        top: 0;
+        height: 2px;
+        background: var(--accent);
+        width: 0%;
+        transition: width 0.25s;
+        z-index: 5;
+    }
+    .hint { font-size: 12px; color: var(--dim); }
+    kbd {
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        border-bottom-width: 2px;
+        border-radius: 4px;
+        padding: 0 5px;
+        font: 11px/1.6 ui-monospace, monospace;
+    }
+</style>
+</head>
+<body>
+<div id="loadbar"></div>
+<header>
+    <div class="brand">SEG<em>LAB</em></div>
+    <span class="badge">100% on-device · zero cloud</span>
+    <div class="spacer"></div>
+    <div class="modes">
+        <button id="mode-click" class="active" title="Click to select — left/tap = include, right/Alt = exclude">Click</button>
+        <button id="mode-box" title="Drag a box around the object">Box</button>
+        <button id="mode-lasso" title="Draw a rough lasso — it snaps to the object">Lasso</button>
+        <button id="mode-text" disabled title="Describe the object in text — next step">Text</button>
+    </div>
+    <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
+    <div class="spacer"></div>
+    <button id="undo" class="small" disabled title="Undo last prompt (Z)">Undo</button>
+    <button id="reset" class="small" disabled title="Clear all prompts (R)">Reset</button>
+    <button id="cutout" class="small" disabled title="Download the cutout as transparent PNG">Cutout PNG</button>
+    <button id="newimg" class="small">New image</button>
+</header>
+
+<main id="main">
+    <div id="dropzone">
+        <h2>Drop a photo anywhere</h2>
+        <p>Click any object — person, product, a minute thing — and get a precise mask.<br>
+        Everything runs in your browser. Nothing is uploaded, to anyone, ever.</p>
+        <div class="actions">
+            <button id="pick">Choose a photo</button>
+            <button id="demo">Try the demo scene</button>
+        </div>
+    </div>
+    <div id="stage">
+        <canvas id="view"></canvas>
+        <canvas id="overlay"></canvas>
+    </div>
+    <input id="file" type="file" accept="image/*" hidden>
+</main>
+
+<footer>
+    <span id="status">Idle — import a photo to begin</span>
+    <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt-click = exclude</span>
+    <span id="chip-mode" class="chip">engine: —</span>
+    <span id="chip-device" class="chip">device: —</span>
+    <span id="chip-timing" class="chip">— ms</span>
+</footer>
+
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>
