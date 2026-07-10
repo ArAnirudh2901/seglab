@@ -46,20 +46,20 @@ const check = (label, ok, detail) => {
   console.log(`[verify] ${ok ? 'ok' : '✗'} ${label} — ${detail}`)
 }
 
-/* ─── Playwright (local, else Pixxel's install) ─────────────────────────── */
-// Prefer the Pixxel repo's install: its browser build is known-downloaded
-// (a bare 'playwright' can resolve to a different version whose browser
-// binary was never fetched).
+/* ─── Playwright (local dev dependency) ─────────────────────────────────── */
+// A missing playwright is a HARD failure: a gate that silently exits green
+// is worse than no gate. CI_SKIP_BROWSER=1 is the only sanctioned skip.
 let chromium
 try {
-  ({ chromium } = await import('/Users/andhetharuntej/Pixxel/node_modules/playwright/index.mjs'))
-} catch {
-  try {
-    ({ chromium } = await import('playwright'))
-  } catch {
-    log('skip — playwright not found in ~/Pixxel or locally')
+  ({ chromium } = await import('playwright'))
+} catch (err) {
+  if (process.env.CI_SKIP_BROWSER === '1') {
+    log('skip — CI_SKIP_BROWSER=1')
     process.exit(0)
   }
+  console.error('[verify] ✗ playwright not installed — run: bun add -d playwright && bunx playwright install chromium')
+  console.error(`[verify]   (${err?.message})`)
+  process.exit(1)
 }
 
 /* ─── Static server ─────────────────────────────────────────────────────── */
