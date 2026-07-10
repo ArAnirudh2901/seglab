@@ -93,7 +93,7 @@ const SQUARE = { x: 615, y: 245, half: 95 }
 const DOT = { x: 700, y: 480, r: 9 }
 const FRAME = 900 * 620
 
-const newAppPage = async (context, query) => {
+const newAppPage = async (context, query, longSide) => {
   const page = await context.newPage()
   page.on('console', (msg) => {
     const text = msg.text()
@@ -103,7 +103,7 @@ const newAppPage = async (context, query) => {
   page.setDefaultTimeout(TIMEOUT_MS)
   await page.goto(`http://127.0.0.1:${port}/${query}`)
   await page.waitForFunction(() => window.__seglabReady === true, null, { timeout: 30_000 })
-  await page.evaluate(() => window.__seglab.loadDemo())
+  await page.evaluate((ls) => window.__seglab.loadDemo(ls), longSide)
   return page
 }
 
@@ -218,6 +218,43 @@ try {
     `log ${JSON.stringify(m0.log)} (current revision ${m0.revision})`,
   )
   await pageC.close()
+
+  /* ─── Phase A3: M1 native-resolution HD export ──────────────────────── */
+  // Original 2400 px wide > 1024 proxy, so export genuinely upscales. Click
+  // the disc (proxy coords), export, and measure the composited full-res
+  // cutout against the analytic disc (original coords).
+  const pageD = await newAppPage(context, '?flagship=0', 2400)
+  log('phase A3 (HD export) — original 2400px, proxy 1024px, native-res cutout…')
+  const geo = await pageD.evaluate(() => window.__seglab.demoGeometry())
+  await pageD.evaluate(
+    ({ x, y }) => window.__seglab.clickAt(x, y),
+    { x: geo.disc.x * geo.proxyScale, y: geo.disc.y * geo.proxyScale },
+  )
+  const ex = await pageD.evaluate(
+    (probe) => window.__seglab.exportCutout(probe),
+    { cx: geo.disc.x, cy: geo.disc.y, r: geo.disc.r },
+  )
+  check(
+    'HD export: cutout matches the original dimensions',
+    ex && ex.w === geo.originalW && ex.h === geo.originalH,
+    `export ${ex?.w}×${ex?.h} vs original ${geo.originalW}×${geo.originalH}`,
+  )
+  check(
+    'HD export: re-decoded the crop at native resolution',
+    ex && ex.decoded === true,
+    `decoded=${ex?.decoded}`,
+  )
+  check(
+    'HD export: alpha is opaque on the disc, clear off it',
+    ex && ex.centerOpaque && ex.outsideTransparent,
+    `centerOpaque=${ex?.centerOpaque} outsideTransparent=${ex?.outsideTransparent}`,
+  )
+  check(
+    'HD export: boundary within 3px of the analytic disc (no loss)',
+    ex && ex.radialErr <= 3 && ex.softPixels > 100,
+    `radialErr=${ex?.radialErr?.toFixed(1)}px (r=${geo.disc.r.toFixed(0)}), softPixels=${ex?.softPixels}`,
+  )
+  await pageD.close()
 
   /* ─── Phase B: flagship upgrade (WARN on failure, headless WebGPU ≠
          real Chrome) ──────────────────────────────────────────────────── */

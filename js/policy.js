@@ -1,32 +1,23 @@
 /**
- * policy — device profiles and runtime budgets (main thread)
- * ------------------------------------------------------------
- * One budget object drives everything resource-shaped in the engine: proxy
- * sizes, model residency, embedding cache caps, escalation and HD-export
- * behaviour. Profiles change HOW MUCH hardware a feature gets — never
- * WHETHER a device gets the feature (the Offline-Pro promise: equal
- * features everywhere, seconds scale with silicon).
- *
- * M0 ships static presets + URL overrides; the M4 capability probe
- * (WebGPU adapter, deviceMemory, warm-up encode timing) will pick the
- * preset automatically and persist it. Computed on the main thread
- * (workers have no localStorage) and passed into warm({ budget }).
+ * policy — device profiles and runtime budgets (main thread).
+ * One budget object gates proxy size, residency, cache caps, escalation,
+ * HD export. Profiles scale HOW MUCH hardware a feature gets, never WHETHER.
+ * M0: static presets + URL overrides; M4 fills these from a capability probe.
  */
 
 const PRESETS = {
     lite: {
         profile: 'lite',
-        proxyMax: 768,           // interaction proxy longest side
-        detectorCanvas: 640,     // detector input canvas (OWLv2 model input is FIXED 960²
-        //                          — this knob saves canvas memory, not FLOPs)
-        flagship: false,         // SAM3 lane off — SlimSAM + post pipeline carries quality
-        maxResidentHeavy: 1,     // one heavyweight model at a time (flagship/detector swap)
-        draftCacheMax: 3,        // embedding LRU caps per lane
+        proxyMax: 768,
+        detectorCanvas: 640,     // OWLv2 input is fixed 960²; this only caps canvas memory
+        flagship: false,
+        maxResidentHeavy: 1,     // flagship/detector swap, never co-resident
+        draftCacheMax: 3,
         flagshipCacheMax: 0,
-        bitmapMaxMP: 0,          // original kept as Blob, re-decoded on demand
-        autoEscalate: false,     // crop escalation is manual-only on Lite
-        hdExportDecode: false,   // HD export refines with the guided filter only (no re-decode)
-        detectorDispose: 'now',  // release OWLv2 right after boxes
+        bitmapMaxMP: 0,          // original as Blob, re-decoded on demand
+        autoEscalate: false,     // crop escalation manual-only
+        hdExportDecode: false,   // filter-only HD export (no crop re-decode)
+        detectorDispose: 'now',  // free OWLv2 right after boxes
     },
     standard: {
         profile: 'standard',
@@ -36,10 +27,10 @@ const PRESETS = {
         maxResidentHeavy: 2,
         draftCacheMax: 4,
         flagshipCacheMax: 2,
-        bitmapMaxMP: 24,         // original resident as ImageBitmap up to 24 MP, else Blob
+        bitmapMaxMP: 24,         // resident bitmap up to 24 MP, else Blob
         autoEscalate: true,
         hdExportDecode: true,
-        detectorDispose: 'idle', // dispose OWLv2 ~10 s after boxes (re-phrase stays warm)
+        detectorDispose: 'idle', // free OWLv2 ~10 s after boxes
     },
     pro: {
         profile: 'pro',
@@ -56,15 +47,8 @@ const PRESETS = {
     },
 }
 
-/**
- * Resolve the session budget: preset (static Standard until the M4 probe
- * lands) + URL overrides. Overrides are for tests, data-saving, and forcing
- * weak-device behaviour on strong hardware:
- *   ?profile=lite|standard|pro   pick a preset explicitly
- *   ?flagship=0                  keep the session on the draft lane
- *   ?force=wasm                  pretend WebGPU does not exist
- *   ?escalate=0                  disable auto crop escalation (M3 control runs)
- */
+/** Session budget: preset (Standard until M4) + URL overrides —
+ *  ?profile=lite|standard|pro, ?flagship=0, ?force=wasm, ?escalate=0. */
 export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '') => {
     const params = new URLSearchParams(search)
     const name = params.get('profile')

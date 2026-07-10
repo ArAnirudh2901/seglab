@@ -32,9 +32,10 @@ import {
     buildPointPrompt,
     cleanupMaskRGBA,
     maskChannelToRGBA,
+    maskIoU,
     pickBestMask,
 } from './sam-core.js'
-import { refineMaskEdges } from './edge-refine.js'
+import { refineMaskEdges, refineMaskEdgesTiled } from './edge-refine.js'
 
 // Pinned CDN build of transformers.js (ESM single file, CORS-enabled) —
 // version-locked so a CDN-side major bump can never break the app.
@@ -73,9 +74,7 @@ const withTimeout = (promise, ms, label) =>
         )
     })
 
-// Default budget (Standard-equivalent). policy.js on the main thread may
-// override any of these via warm({ budget }) — the engine itself never
-// probes hardware beyond the WebGPU check.
+// Standard-equivalent default; policy.js overrides via warm({ budget }).
 const DEFAULT_BUDGET = {
     profile: 'standard',
     flagship: true,
@@ -93,17 +92,15 @@ const state = {
     budget: { ...DEFAULT_BUDGET },
 }
 
-/** Mark every job older than `revision` obsolete: queued ones are dropped at
- *  dequeue; in-flight ones finish their (uninterruptible) ONNX kernel but
- *  skip the post pipeline and report {stale:true}. Stale can never commit. */
+/** Obsolete jobs older than `revision`: queued ones drop at dequeue,
+ *  in-flight ones skip the post pipeline and report {stale:true}. */
 export const cancelBefore = (revision) => {
     if (revision > state.obsoleteBefore) state.obsoleteBefore = revision
 }
 
 const isStale = (req) => req.revision !== undefined && req.revision < state.obsoleteBefore
 
-// One heavy GPU job at a time (Offline Pro's one-GPU-job rule) — also caps
-// transient memory peaks: encode/decode never overlap on 8 GB devices.
+// One heavy GPU job at a time (Offline Pro rule; also caps memory peaks).
 let jobChain = Promise.resolve()
 const serialize = (fn) => {
     const run = jobChain.then(() => fn())
@@ -263,8 +260,10 @@ const makeCanvas = (w, h) => {
 /**
  * Encode `source` once per lane and cache embeddings + a grayscale copy of
  * the photo (the guide image for edge refinement) under `lane:imageKey`.
+ * `ephemeral` skips the cache insert — one-shot crop encodes (HD export)
+ * must never evict a document embedding the user is actively clicking on.
  */
-const ensureEmbeddings = async (bundle, imageKey, source) => {
+const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } = {}) => {
     const lane = LANES[bundle.laneKey]
     const cacheKey = `${bundle.laneKey}:${imageKey}`
     const hit = embedCache.get(cacheKey)
@@ -306,6 +305,7 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
         w,
         h,
     }
+    if (ephemeral) return { entry, encoded: true }
     embedCache.set(cacheKey, entry)
     // Per-lane LRU eviction, cap owned by the session budget.
     const cacheMax = (bundle.laneKey === 'draft'
@@ -355,17 +355,15 @@ const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
 
 const staleResult = (req) => ({ stale: true, revision: req.revision })
 
-const segmentOnce = async (req) => {
-    // Dropped at dequeue: a queued job whose revision was cancelled while it
-    // waited must not touch the model at all.
-    if (isStale(req)) return staleResult(req)
-    const t0 = Date.now()
-    const laneKey = req.lane || activeLaneKey()
-    const bundle = await loadBundle(laneKey)
+/**
+ * Prompt build → decode → best-candidate RGBA → lasso clamp → hygiene.
+ * The shared decode core: the proxy path (segmentOnce) and the crop paths
+ * (hdRefine now, interactive escalation next) all run THIS against their
+ * own embeddings entry — prompts are expressed in the entry's pixel space.
+ * Returns null when the job went stale mid-kernel.
+ */
+const decodeMask = async (bundle, entry, req) => {
     const { Tensor } = bundle.transformers
-    const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
-    const tEncoded = Date.now()
-
     const { clicks, box } = req
     const reshaped = entry.reshaped_input_sizes[0]
     const boxPrompt = buildBoxPrompt(box, entry.w, entry.h, reshaped)
@@ -400,7 +398,7 @@ const segmentOnce = async (req) => {
 
     // The kernel above was uninterruptible; if this job was cancelled while
     // it ran, skip the post pipeline — the encode is cached, nothing wasted.
-    if (isStale(req)) return staleResult(req)
+    if (isStale(req)) return null
 
     const masks = await bundle.processor.post_process_masks(
         outputs.pred_masks,
@@ -412,17 +410,16 @@ const segmentOnce = async (req) => {
     const [, , mh, mw] = masks[0].dims
     if (!mw || !mh) throw new Error('Decoder returned a malformed mask')
     const rawRgba = maskChannelToRGBA(masks[0].data, mw, mh, best)
-    const tDecoded = Date.now()
+    const decodedAt = Date.now()
 
-    // Shared post pipeline: clamp → hygiene → edge refinement. `rawRgba`
-    // survives untouched for the UI's raw-vs-refined comparison toggle.
+    // Clamp → hygiene. `rawRgba` survives untouched for the UI's
+    // raw-vs-refined comparison toggle.
     const rgba = rawRgba.slice()
     if (Array.isArray(req.clampPoly) && req.clampPoly.length >= 3) {
         clampRGBAToPolygon(rgba, mw, mh, req.clampPoly, req.clampMargin || 8)
     }
     const seeds = effectiveClicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
     const hygiene = cleanupMaskRGBA(rgba, mw, mh, seeds)
-    const refined = refineMaskEdges(rgba, mw, mh, entry.gray)
 
     return {
         rgba,
@@ -430,14 +427,40 @@ const segmentOnce = async (req) => {
         width: mw,
         height: mh,
         score: Number(scores[best]) || 0,
+        hygiene,
+        decodedAt,
+    }
+}
+
+const segmentOnce = async (req) => {
+    // Dropped at dequeue: a queued job whose revision was cancelled while it
+    // waited must not touch the model at all.
+    if (isStale(req)) return staleResult(req)
+    const t0 = Date.now()
+    const laneKey = req.lane || activeLaneKey()
+    const bundle = await loadBundle(laneKey)
+    const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+    const tEncoded = Date.now()
+
+    const dec = await decodeMask(bundle, entry, req)
+    if (!dec) return staleResult(req)
+
+    const refined = refineMaskEdges(dec.rgba, dec.width, dec.height, entry.gray)
+
+    return {
+        rgba: dec.rgba,
+        rawRgba: dec.rawRgba,
+        width: dec.width,
+        height: dec.height,
+        score: dec.score,
         device: state.device,
         lane: LANES[laneKey].label,
         revision: req.revision,
         encoded,
         encodeMs: tEncoded - t0,
-        decodeMs: tDecoded - tEncoded,
-        postMs: Date.now() - tDecoded,
-        hygiene,
+        decodeMs: dec.decodedAt - tEncoded,
+        postMs: Date.now() - dec.decodedAt,
+        hygiene: dec.hygiene,
         bandPixels: refined.bandPixels,
     }
 }
@@ -479,3 +502,113 @@ export const segment = async (req) => {
         return serialize(() => segmentOnce({ ...req, lane: 'draft' }))
     }
 }
+
+/**
+ * Encode a crop (cached under `cacheKey`, or `ephemeral` for one-shot export
+ * crops that must not evict a live document embedding) and decode prompts
+ * expressed in the crop's OWN pixel space. The shared crop primitive behind
+ * both HD export (M1) and interactive escalation (M3). Returns the hygiene'd
+ * crop mask + the crop's gray guide so the caller runs edge refinement with
+ * whatever band it needs; null when the job went stale mid-kernel.
+ */
+const cropSegment = async (req) => {
+    const laneKey = req.lane || activeLaneKey()
+    const bundle = await loadBundle(laneKey)
+    const { entry, encoded } = await ensureEmbeddings(bundle, req.cacheKey, req.source, { ephemeral: req.ephemeral })
+    const dec = await decodeMask(bundle, entry, req)
+    if (!dec) return null
+    return { ...dec, gray: entry.gray, encoded, lane: LANES[laneKey].label }
+}
+
+/* ─── HD export refinement (original-resolution crop) ────────────────────── */
+
+const hdRefineOnce = async (req) => {
+    if (isStale(req)) return staleResult(req)
+    const t0 = Date.now()
+    const { source, proxyMask, proxySubrect, prompts, doDecode, cropKey } = req
+    const w = source.width
+    const h = source.height
+    if (!w || !h) throw new Error('HD crop has no usable dimensions')
+
+    // The crop's own pixels are both the (optional) model input and the
+    // guide image for edge refinement.
+    const canvas = makeCanvas(w, h)
+    const cctx = canvas.getContext('2d', { willReadFrequently: true })
+    cctx.drawImage(source, 0, 0)
+    const pixels = cctx.getImageData(0, 0, w, h)
+    const gray = new Float32Array(w * h)
+    for (let i = 0; i < gray.length; i += 1) {
+        const j = i * 4
+        gray[i] = (0.299 * pixels.data[j] + 0.587 * pixels.data[j + 1] + 0.114 * pixels.data[j + 2]) / 255
+    }
+
+    // Base alpha = the user-approved proxy mask, bilinearly upscaled. The
+    // export may sharpen this, but never contradict it.
+    const pm = makeCanvas(proxyMask.width, proxyMask.height)
+    pm.getContext('2d').putImageData(
+        new ImageData(new Uint8ClampedArray(proxyMask.data), proxyMask.width, proxyMask.height), 0, 0,
+    )
+    const up = makeCanvas(w, h)
+    const uctx = up.getContext('2d', { willReadFrequently: true })
+    uctx.imageSmoothingEnabled = true
+    uctx.imageSmoothingQuality = 'high'
+    uctx.drawImage(pm, proxySubrect.sx, proxySubrect.sy, proxySubrect.sw, proxySubrect.sh, 0, 0, w, h)
+    let rgba = uctx.getImageData(0, 0, w, h).data
+
+    // One crop re-decode at native resolution (the real detail recovery),
+    // IoU-gated: if the decoder grabbed a different object than the preview,
+    // keep the base — the export must match what the user saw.
+    let decoded = false
+    let iou = 0
+    if (doDecode && cropKey) {
+        try {
+            const dec = await cropSegment({
+                source: canvas,
+                cacheKey: cropKey,
+                ephemeral: true,
+                lane: req.lane,
+                revision: req.revision,
+                ...prompts,
+            })
+            if (dec === null) return staleResult(req)
+            iou = maskIoU(dec.rgba, rgba)
+            if (iou >= 0.5) {
+                rgba = dec.rgba
+                decoded = true
+            }
+        } catch (err) {
+            console.warn('[seglab] HD crop decode failed; filter-only refinement:', err?.message)
+        }
+    }
+    if (isStale(req)) return staleResult(req)
+
+    // Band scales with the upsampling factor (a 1-proxy-pixel staircase is
+    // upFactor original pixels wide), capped so the edge never goes mushy.
+    const band = Math.max(6, Math.min(16, Math.round(6 * (req.upFactor || 1))))
+    const refined = refineMaskEdgesTiled(rgba, w, h, gray, { band })
+
+    return {
+        alpha: rgba,
+        width: w,
+        height: h,
+        decoded,
+        iou,
+        revision: req.revision,
+        bandPixels: refined.bandPixels,
+        lane: decoded ? LANES[req.lane || activeLaneKey()].label : null,
+        ms: Date.now() - t0,
+    }
+}
+
+/**
+ * Build the original-resolution alpha for an export crop: upscaled proxy
+ * mask base → optional one crop re-decode (IoU-gated) → band-tiled guided
+ * refinement against the crop's own gray. Serialized like every heavy job.
+ *
+ * @param {{ revision?: number, cropKey: string|null, source: ImageBitmap,
+ *           proxyMask: { data: Uint8ClampedArray|ArrayBuffer, width: number, height: number },
+ *           proxySubrect: { sx: number, sy: number, sw: number, sh: number },
+ *           prompts: { clicks: Array, box: number[]|null, clampPoly: Array|null, clampMargin: number },
+ *           doDecode: boolean, upFactor: number, lane?: string }} req
+ */
+export const hdRefine = (req) => serialize(() => hdRefineOnce(req))

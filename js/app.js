@@ -14,12 +14,13 @@
 import { countMaskComponents, lassoToPrompts } from './sam-core.js'
 import { cancelBefore, clientState, segment, subscribe, warmUp } from './sam-client.js'
 import { resolveBudget } from './policy.js'
+import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
+import { buildCutout, exportCutoutBlob } from './export-hd.js'
 
 // Session budget: profile preset + URL overrides (?flagship=0, ?profile=,
 // ?force=wasm, ?escalate=0). The M4 capability probe will pick the preset.
 const BUDGET = resolveBudget()
 
-const CANON_MAX = 1024
 const ACCENT = '#35e0c2'
 const POS_COLOR = '#35e08a'
 const NEG_COLOR = '#ff5d6c'
@@ -74,7 +75,6 @@ const bumpRevision = () => {
     cancelBefore(state.revision)
 }
 
-const viewCtx = els.view.getContext('2d')
 const overlayCtx = els.overlay.getContext('2d')
 
 /* ─── Status / chips ─────────────────────────────────────────────────────── */
@@ -132,15 +132,14 @@ subscribe((event) => {
 
 /* ─── Image import ───────────────────────────────────────────────────────── */
 
-const showImage = (bitmapOrCanvas) => {
-    const w0 = bitmapOrCanvas.width
-    const h0 = bitmapOrCanvas.height
-    const scale = Math.min(1, CANON_MAX / Math.max(w0, h0))
-    els.view.width = Math.max(1, Math.round(w0 * scale))
-    els.view.height = Math.max(1, Math.round(h0 * scale))
+// `source` is a decoded ImageBitmap or a canvas; asset-store takes custody
+// of it as the ORIGINAL (the export truth) and builds the ≤proxyMax
+// interaction proxy into #view. `blob` (when present) lets weak-device /
+// huge-photo custody fall back to re-decoding instead of holding pixels.
+const showImage = (source, blob = null) => {
+    importOriginal(source, { blob, budget: BUDGET, proxyCanvas: els.view })
     els.overlay.width = els.view.width
     els.overlay.height = els.view.height
-    viewCtx.drawImage(bitmapOrCanvas, 0, 0, els.view.width, els.view.height)
 
     state.hasImage = true
     clearPrompts()
@@ -156,40 +155,52 @@ const showImage = (bitmapOrCanvas) => {
 const loadFile = async (file) => {
     if (!file || !file.type?.startsWith('image/')) return
     try {
-        // from-image: honour EXIF orientation (phone photos).
+        // from-image: honour EXIF orientation (phone photos). asset-store
+        // owns the bitmap from here (do NOT close it); it keeps the File as
+        // the blob for re-decode custody on constrained profiles.
         const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' })
-        showImage(bmp)
-        bmp.close()
+        showImage(bmp, file)
     } catch (err) {
         setStatus(`Could not read that image: ${err?.message}`)
     }
 }
 
-/** Synthetic scene with known answers — instant demo, and what the headless
- *  verify drives: big disc, rounded square, and a MINUTE dot (r=9). */
-const buildDemoScene = () => {
-    const w = 900
-    const h = 620
+// Canonical demo geometry in a 900×620 logical space (the known answers the
+// headless verify asserts against): big disc, rounded square, MINUTE dot.
+const DEMO = {
+    baseW: 900,
+    baseH: 620,
+    disc: { x: 230, y: 340, r: 105 },
+    square: { x: 520, y: 150, w: 190, h: 190 },
+    dot: { x: 700, y: 480, r: 9 },
+}
+
+/** Render the demo scene at `longSide` px on the long edge (default 900).
+ *  A larger longSide makes the ORIGINAL exceed the ≤1024 proxy, so HD export
+ *  genuinely upscales — that's what the M1 gate needs. */
+const buildDemoScene = (longSide = DEMO.baseW) => {
+    const mult = longSide / DEMO.baseW
     const c = document.createElement('canvas')
-    c.width = w
-    c.height = h
+    c.width = Math.round(DEMO.baseW * mult)
+    c.height = Math.round(DEMO.baseH * mult)
     const ctx = c.getContext('2d')
-    const grad = ctx.createLinearGradient(0, 0, 0, h)
+    ctx.scale(mult, mult) // draw in 900×620 space, rasterize at native size
+    const grad = ctx.createLinearGradient(0, 0, 0, DEMO.baseH)
     grad.addColorStop(0, '#3c4250')
     grad.addColorStop(1, '#20242d')
     ctx.fillStyle = grad
-    ctx.fillRect(0, 0, w, h)
+    ctx.fillRect(0, 0, DEMO.baseW, DEMO.baseH)
     ctx.fillStyle = '#d8433b'
     ctx.beginPath()
-    ctx.arc(230, 340, 105, 0, Math.PI * 2)
+    ctx.arc(DEMO.disc.x, DEMO.disc.y, DEMO.disc.r, 0, Math.PI * 2)
     ctx.fill()
     ctx.fillStyle = '#3b6fd8'
     ctx.beginPath()
-    ctx.roundRect(520, 150, 190, 190, 24)
+    ctx.roundRect(DEMO.square.x, DEMO.square.y, DEMO.square.w, DEMO.square.h, 24)
     ctx.fill()
     ctx.fillStyle = '#e8c33b'
     ctx.beginPath()
-    ctx.arc(700, 480, 9, 0, Math.PI * 2)
+    ctx.arc(DEMO.dot.x, DEMO.dot.y, DEMO.dot.r, 0, Math.PI * 2)
     ctx.fill()
     return c
 }
@@ -200,6 +211,7 @@ els.demo.addEventListener('click', () => showImage(buildDemoScene()))
 els.newimg.addEventListener('click', () => {
     state.hasImage = false
     clearPrompts()
+    releaseAsset() // drop the held original (bitmap custody) before a new import
     els.stage.classList.remove('visible')
     els.dropzone.style.display = ''
     setStatus('Idle — import a photo to begin')
@@ -540,8 +552,9 @@ function renderOverlay() {
 
 /* ─── Cutout export ──────────────────────────────────────────────────────── */
 
-els.cutout.addEventListener('click', async () => {
-    if (!state.mask) return
+/** Proxy-resolution cutout — the fallback when no original is held (or HD
+ *  export fails): composite the ≤1024 #view against the proxy mask. */
+const proxyCutoutBlob = async () => {
     const c = document.createElement('canvas')
     c.width = els.view.width
     c.height = els.view.height
@@ -556,12 +569,41 @@ els.cutout.addEventListener('click', async () => {
     maskCanvas.getContext('2d').putImageData(md, 0, 0)
     ctx.globalCompositeOperation = 'destination-in'
     ctx.drawImage(maskCanvas, 0, 0)
-    const blob = await new Promise((res) => c.toBlob(res, 'image/png'))
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = 'seglab-cutout.png'
-    a.click()
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+    return { blob: await new Promise((res) => c.toBlob(res, 'image/png')), width: c.width, height: c.height }
+}
+
+/** Prompts in proxy coords for the current selection — the exact set the
+ *  proxy decode used, so an HD re-decode reproduces the same object. */
+const currentPrompts = () => ({
+    clicks: state.lasso ? [state.lasso.point, ...state.clicks] : state.clicks,
+    box: state.lasso ? state.lasso.box : state.box,
+    clampPoly: state.lasso?.poly || null,
+    clampMargin: state.lasso?.margin || 0,
+})
+
+els.cutout.addEventListener('click', async () => {
+    if (!state.mask) return
+    els.cutout.disabled = true
+    const wasNative = hasOriginal()
+    setStatus(wasNative ? 'Exporting at full resolution…' : 'Exporting…')
+    try {
+        let out = null
+        if (wasNative) {
+            out = await exportCutoutBlob(state.mask, currentPrompts(), { budget: BUDGET, revision: state.revision })
+        }
+        if (!out) out = await proxyCutoutBlob() // fallback: proxy-res
+        const a = document.createElement('a')
+        a.href = URL.createObjectURL(out.blob)
+        a.download = 'seglab-cutout.png'
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+        setStatus(`Exported ${out.width}×${out.height} cutout${out.decoded ? ' · HD re-decode' : ''}`)
+    } catch (err) {
+        console.error('[seglab] export failed:', err)
+        setStatus(`Export failed: ${err?.message}`)
+    } finally {
+        els.cutout.disabled = !state.mask
+    }
 })
 
 /* ─── Headless test hooks (verify.mjs) ───────────────────────────────────── */
@@ -578,10 +620,29 @@ const waitForRun = async () => {
 }
 
 window.__seglab = {
-    loadDemo: () => { showImage(buildDemoScene()) },
+    loadDemo: (longSide) => { showImage(buildDemoScene(longSide)) },
     reset: () => clearPrompts(),
     revision: () => state.revision,
     commitLog,
+    // Demo ground truth in ORIGINAL pixels + the proxy transform, so the
+    // headless gate derives click points (proxy space) and export checks
+    // (original space) from one source instead of hardcoding scaled numbers.
+    demoGeometry: () => {
+        const tf = getTransform()
+        if (!tf) return null
+        const mult = tf.originalW / DEMO.baseW
+        const scaleShape = (s) => Object.fromEntries(
+            Object.entries(s).map(([k, v]) => [k, v * mult]),
+        )
+        return {
+            originalW: tf.originalW,
+            originalH: tf.originalH,
+            proxyScale: tf.scale, // original px → proxy px
+            disc: scaleShape(DEMO.disc),
+            square: scaleShape(DEMO.square),
+            dot: scaleShape(DEMO.dot),
+        }
+    },
     state: () => ({
         ready: clientState.ready,
         device: clientState.device,
@@ -601,6 +662,48 @@ window.__seglab = {
             if (data[i] > 16 && data[i] < 240) soft += 1
         }
         return { components: countMaskComponents(data, width, height), softPixels: soft }
+    },
+    // Run the real HD export and measure the composited full-res cutout.
+    // `probe` = { cx, cy, r } in ORIGINAL px (a synthetic disc): reports the
+    // max radial error of the alpha boundary vs the analytic circle — the
+    // quantitative "no loss at native resolution" check.
+    exportCutout: async (probe = null) => {
+        if (!state.mask) return null
+        const res = await buildCutout(state.mask, currentPrompts(), { budget: BUDGET, revision: state.revision })
+        if (!res) return null
+        const { canvas, width, height, decoded } = res
+        const d = canvas.getContext('2d').getImageData(0, 0, width, height).data
+        const alphaAt = (x, y) => {
+            const xi = Math.round(x)
+            const yi = Math.round(y)
+            if (xi < 0 || yi < 0 || xi >= width || yi >= height) return 0
+            return d[(yi * width + xi) * 4 + 3]
+        }
+        let opaque = 0
+        let soft = 0
+        for (let i = 3; i < d.length; i += 4) {
+            if (d[i] >= 128) opaque += 1
+            if (d[i] > 16 && d[i] < 240) soft += 1
+        }
+        const out = { w: width, h: height, decoded, coverage: opaque / (width * height), softPixels: soft }
+        if (probe) {
+            let maxErr = 0
+            const N = 64
+            for (let k = 0; k < N; k += 1) {
+                const ang = (k / N) * Math.PI * 2
+                const cos = Math.cos(ang)
+                const sin = Math.sin(ang)
+                let cross = probe.r * 1.5 // no crossing found ⇒ big error (too-large mask)
+                for (let rr = probe.r * 0.5; rr <= probe.r * 1.5; rr += 0.5) {
+                    if (alphaAt(probe.cx + cos * rr, probe.cy + sin * rr) < 128) { cross = rr; break }
+                }
+                maxErr = Math.max(maxErr, Math.abs(cross - probe.r))
+            }
+            out.radialErr = maxErr
+            out.centerOpaque = alphaAt(probe.cx, probe.cy) >= 128
+            out.outsideTransparent = alphaAt(probe.cx + probe.r * 1.3, probe.cy) < 16
+        }
+        return out
     },
     clickAt: async (x, y, negative = false) => {
         state.clicks.push([x, y, negative ? 0 : 1])

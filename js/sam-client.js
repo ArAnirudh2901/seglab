@@ -149,9 +149,10 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
     }
     const engine = await getInlineEngine()
     if (op === 'warm') return withTimeout(engine.warm(payload || {}), timeoutMs, label)
-    if (op === 'segment') {
+    if (op === 'segment' || op === 'hdExport') {
+        const fn = op === 'segment' ? engine.segment : engine.hdRefine
         try {
-            return await withTimeout(engine.segment(payload), timeoutMs, label)
+            return await withTimeout(fn(payload), timeoutMs, label)
         } finally {
             // The worker shell closes transferred bitmaps; inline, that's ours.
             try { payload?.source?.close?.() } catch { /* already closed */ }
@@ -282,4 +283,18 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
         bandPixels: result.bandPixels,
         ms: Date.now() - startedAt,
     }
+}
+
+/**
+ * Original-resolution alpha for one export crop. Thin transport over the
+ * worker's `hdExport` op; export-hd.js owns bbox/padding/crop/composite. The
+ * crop bitmap transfers zero-copy (worker closes it); the proxy-mask buffer
+ * transfers too. Returns { alpha: Uint8ClampedArray, width, height, decoded }
+ * or { stale:true }.
+ */
+export const hdExport = async (payload, transfer) => {
+    const result = await call('hdExport', payload, transfer, INFER_TIMEOUT_MS, 'HD export')
+    if (result?.stale) return { stale: true }
+    const alpha = result.alpha instanceof Uint8ClampedArray ? result.alpha : new Uint8ClampedArray(result.alpha)
+    return { alpha, width: result.width, height: result.height, decoded: result.decoded, lane: result.lane }
 }

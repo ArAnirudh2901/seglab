@@ -282,6 +282,52 @@ export const countMaskComponents = (rgba, w, h) => {
     return labelComponents(bin, w, h).areas.length
 }
 
+/* ─── Crop-space helpers (M1 crop pyramid / HD export) ──────────────────── */
+
+/**
+ * Map proxy-space prompts into a crop's own pixel space. `proxyToOriginal`
+ * scales proxy → original coords; `rect` is the crop's origin+size in
+ * original coords. Points/boxes are clamped into the crop so a prompt a few
+ * pixels outside (padding round-off) still lands.
+ *
+ * @param {{ clicks?: Array<[number,number,0|1]>, box?: number[]|null,
+ *           clampPoly?: Array<[number,number]>|null, clampMargin?: number }} prompts
+ * @param {number} proxyToOriginal  originalW / proxyW
+ * @param {{ x:number, y:number, w:number, h:number }} rect
+ */
+export const mapPromptsToCrop = (prompts, proxyToOriginal, rect) => {
+    const px = (v) => Math.min(rect.w, Math.max(0, v * proxyToOriginal - rect.x))
+    const py = (v) => Math.min(rect.h, Math.max(0, v * proxyToOriginal - rect.y))
+    const clicks = (prompts.clicks || []).map(([x, y, label]) => [px(x), py(y), label])
+    const box = Array.isArray(prompts.box) && prompts.box.length === 4
+        ? [px(prompts.box[0]), py(prompts.box[1]), px(prompts.box[2]), py(prompts.box[3])]
+        : null
+    const clampPoly = Array.isArray(prompts.clampPoly) && prompts.clampPoly.length >= 3
+        ? prompts.clampPoly.map(([x, y]) => [px(x), py(y)])
+        : null
+    return {
+        clicks,
+        box,
+        clampPoly,
+        clampMargin: (prompts.clampMargin || 0) * proxyToOriginal,
+    }
+}
+
+/** IoU of two white-on-black RGBA masks of identical dims (R ≥ 128 = on).
+ *  Used to sanity-gate a crop re-decode against the mask the user approved:
+ *  a low IoU means the decoder grabbed a different object — distrust it. */
+export const maskIoU = (a, b) => {
+    let inter = 0
+    let union = 0
+    for (let i = 0; i < a.length; i += 4) {
+        const av = a[i] >= 128
+        const bv = b[i] >= 128
+        if (av && bv) inter += 1
+        if (av || bv) union += 1
+    }
+    return union ? inter / union : 0
+}
+
 /**
  * Lasso stroke → SAM prompts. The lasso is a PROMPT GENERATOR, not a
  * geometric cut: its bounding box becomes the box prompt and its centroid a

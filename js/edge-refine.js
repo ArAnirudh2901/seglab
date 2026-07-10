@@ -143,3 +143,54 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
     }
     return { bandPixels }
 }
+
+/**
+ * Tiled variant for original-resolution crops (HD export): a 12 MP frame
+ * through the full-frame filter would churn ~580 MB (the SATs are Float64),
+ * so process `tileSide`² tiles with an `overlap` halo instead. The guided
+ * filter is strictly window-local — every output pixel depends on at most
+ * band + 2·radius neighbours — so with overlap ≥ that influence radius the
+ * tile interiors are bit-identical to a full-frame pass: seamless by
+ * construction, peak memory ~tens of MB per tile.
+ *
+ * bandPixels is telemetry-only and may count overlap bands twice.
+ */
+export const refineMaskEdgesTiled = (rgba, w, h, gray, {
+    band = 6, radius = 8, eps = 1e-3, tileSide = 2048, overlap = 64,
+} = {}) => {
+    if (w <= tileSide && h <= tileSide) return refineMaskEdges(rgba, w, h, gray, { band, radius, eps })
+
+    let bandPixels = 0
+    for (let ty = 0; ty < h; ty += tileSide) {
+        for (let tx = 0; tx < w; tx += tileSide) {
+            // Interior this tile owns, plus the halo it reads.
+            const ix1 = Math.min(w, tx + tileSide)
+            const iy1 = Math.min(h, ty + tileSide)
+            const ex0 = Math.max(0, tx - overlap)
+            const ey0 = Math.max(0, ty - overlap)
+            const ex1 = Math.min(w, ix1 + overlap)
+            const ey1 = Math.min(h, iy1 + overlap)
+            const ew = ex1 - ex0
+            const eh = ey1 - ey0
+
+            const tileRgba = new Uint8ClampedArray(ew * eh * 4)
+            const tileGray = new Float32Array(ew * eh)
+            for (let y = 0; y < eh; y += 1) {
+                const src = ((ey0 + y) * w + ex0)
+                tileRgba.set(rgba.subarray(src * 4, (src + ew) * 4), y * ew * 4)
+                tileGray.set(gray.subarray(src, src + ew), y * ew)
+            }
+
+            const r = refineMaskEdges(tileRgba, ew, eh, tileGray, { band, radius, eps })
+            bandPixels += r.bandPixels
+
+            // Write back the interior rows only — halo pixels belong to
+            // whichever tile owns them as interior.
+            for (let y = ty; y < iy1; y += 1) {
+                const srcRow = ((y - ey0) * ew + (tx - ex0)) * 4
+                rgba.set(tileRgba.subarray(srcRow, srcRow + (ix1 - tx) * 4), (y * w + tx) * 4)
+            }
+        }
+    }
+    return { bandPixels }
+}

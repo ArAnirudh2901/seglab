@@ -17,7 +17,7 @@
  * when worker construction fails (see sam-client.js).
  */
 
-import { cancelBefore, getEngineState, segment, setEventSink, warm } from './sam-engine.js'
+import { cancelBefore, getEngineState, hdRefine, segment, setEventSink, warm } from './sam-engine.js'
 
 setEventSink((event) => {
     try { self.postMessage(event) } catch { /* non-cloneable — best-effort */ }
@@ -48,6 +48,17 @@ self.onmessage = async (event) => {
                 self.postMessage({ id, ok: true, result }, transfer)
             } finally {
                 // The transferred bitmap is this side's to release.
+                try { source?.close?.() } catch { /* already closed */ }
+            }
+            return
+        }
+        if (op === 'hdExport') {
+            const { source } = payload || {}
+            try {
+                const result = await hdRefine(payload || {})
+                const transfer = result?.alpha ? [result.alpha.buffer] : []
+                self.postMessage({ id, ok: true, result }, transfer)
+            } finally {
                 try { source?.close?.() } catch { /* already closed */ }
             }
             return
