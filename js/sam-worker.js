@@ -17,7 +17,7 @@
  * when worker construction fails (see sam-client.js).
  */
 
-import { getEngineState, segment, setEventSink, warm } from './sam-engine.js'
+import { cancelBefore, getEngineState, segment, setEventSink, warm } from './sam-engine.js'
 
 setEventSink((event) => {
     try { self.postMessage(event) } catch { /* non-cloneable — best-effort */ }
@@ -25,7 +25,14 @@ setEventSink((event) => {
 
 self.onmessage = async (event) => {
     const { id, op, payload } = event.data || {}
-    if (!id || !op) return
+    if (!op) return
+    // Cancel is fire-and-forget (no id, no reply): it must take effect
+    // immediately, never queue behind the job it is trying to obsolete.
+    if (op === 'cancel') {
+        cancelBefore(payload?.before || 0)
+        return
+    }
+    if (!id) return
     try {
         if (op === 'warm') {
             const result = await warm(payload || {})
@@ -36,7 +43,9 @@ self.onmessage = async (event) => {
             const { source } = payload || {}
             try {
                 const result = await segment(payload || {})
-                self.postMessage({ id, ok: true, result }, [result.rgba.buffer, result.rawRgba.buffer])
+                // Stale (cancelled) results carry no mask buffers.
+                const transfer = result?.rgba ? [result.rgba.buffer, result.rawRgba.buffer] : []
+                self.postMessage({ id, ok: true, result }, transfer)
             } finally {
                 // The transferred bitmap is this side's to release.
                 try { source?.close?.() } catch { /* already closed */ }

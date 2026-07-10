@@ -100,13 +100,29 @@ const getWorker = () => {
 }
 
 let inlineSinkSet = false
+let inlineEngine = null
 const getInlineEngine = async () => {
     const engine = await import('./sam-engine.js')
     if (!inlineSinkSet) {
         engine.setEventSink(onEngineEvent)
         inlineSinkSet = true
     }
+    inlineEngine = engine
     return engine
+}
+
+/**
+ * Obsolete every in-flight/queued job older than `revision` (fire-and-forget
+ * — cancellation must never queue behind the job it cancels). Call on any
+ * prompt or document change; the engine skips stale post-processing and a
+ * stale result can never commit.
+ */
+export const cancelBefore = (revision) => {
+    if (worker) {
+        try { worker.postMessage({ op: 'cancel', payload: { before: revision } }) } catch { /* dying worker */ }
+    }
+    // If neither transport has started, nothing is in flight to cancel.
+    if (inlineEngine) inlineEngine.cancelBefore(revision)
 }
 
 /** One request over the worker, or inline when the worker is unavailable. */
@@ -149,10 +165,11 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
 let warmPromise = null
 
 /** Download + compile the draft lane, then the flagship in the background
- *  (idempotent). `flagship:false` skips the background upgrade. */
-export const warmUp = ({ flagship = true } = {}) => {
+ *  (idempotent). `budget` is policy.js's resolved profile budget;
+ *  `flagship:false` skips the background upgrade. */
+export const warmUp = ({ flagship = true, budget = null } = {}) => {
     if (warmPromise) return warmPromise
-    warmPromise = call('warm', { flagship }, null, LOAD_TIMEOUT_MS, 'model load')
+    warmPromise = call('warm', { flagship, budget }, null, LOAD_TIMEOUT_MS, 'model load')
         .then((engineState) => {
             clientState.device = engineState?.device || clientState.device
             clientState.lane = engineState?.lane || clientState.lane
@@ -181,7 +198,9 @@ const contentKey = (canvas) => {
         h ^= px[i]
         h = Math.imul(h, 0x01000193) >>> 0
     }
-    return `${canvas.width}x${canvas.height}:${h.toString(16)}`
+    // `doc:` namespaces whole-document embeddings; crop re-encodes will live
+    // under `crop:${hash}:${rect}` and must never collide with these.
+    return `doc:${canvas.width}x${canvas.height}:${h.toString(16)}`
 }
 
 /**
@@ -192,9 +211,10 @@ const contentKey = (canvas) => {
  *
  * @param {HTMLCanvasElement} canvas
  * @param {{ clicks?: Array<[number, number, 0|1]>, box?: number[]|null,
- *           clampPoly?: Array<[number, number]>|null, clampMargin?: number }} prompts
+ *           clampPoly?: Array<[number, number]>|null, clampMargin?: number,
+ *           revision?: number }} prompts
  */
-export const segment = async (canvas, { clicks = [], box = null, clampPoly = null, clampMargin = 0 } = {}) => {
+export const segment = async (canvas, { clicks = [], box = null, clampPoly = null, clampMargin = 0, revision } = {}) => {
     const startedAt = Date.now()
     if (!canvas?.width || !canvas?.height) throw new Error('Selection source has no usable dimensions')
     if ((!clicks || clicks.length === 0) && !box) throw new Error('No clicks or box to select with')
@@ -203,7 +223,7 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     const buildPayload = async () => {
         // The bitmap transfers zero-copy into the worker; the worker closes it.
         const source = await createImageBitmap(canvas)
-        return { payload: { imageKey, source, clicks, box, clampPoly, clampMargin }, transfer: [source] }
+        return { payload: { imageKey, source, clicks, box, clampPoly, clampMargin, revision }, transfer: [source] }
     }
 
     let result
@@ -219,6 +239,8 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
         const { payload, transfer } = await buildPayload()
         result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection (inline retry)')
     }
+    // A cancelled job: no mask, no state churn — the caller just drops it.
+    if (result?.stale) return { stale: true, revision: result.revision }
     clientState.device = result.device || clientState.device
     clientState.lane = result.lane || clientState.lane
     clientState.ready = true
@@ -254,6 +276,7 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
         reason: verdict.reason,
         device: result.device,
         lane: result.lane,
+        revision: result.revision,
         encoded: result.encoded,
         hygiene: result.hygiene,
         bandPixels: result.bandPixels,

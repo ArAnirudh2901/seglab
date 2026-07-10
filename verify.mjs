@@ -197,6 +197,28 @@ try {
   log(`phase A done: engine=${stA.mode} device=${stA.device} lane=${stA.lane}`)
   await page.close()
 
+  /* ─── Phase A2: M0 revision/cancel — overlapping prompts, one commit ──── */
+  // Fresh page = cold encode, so the first click's run is in flight for
+  // seconds; the second click must obsolete it (stale or superseded) and be
+  // the only revision that commits.
+  const pageC = await newAppPage(context, '?flagship=0')
+  log('phase A2 (revision/cancel) — second click lands while the first is in flight…')
+  const m0 = await pageC.evaluate(async ({ disc, sq }) => {
+    const a = window.__seglab.clickAt(disc.x, disc.y)
+    await new Promise((r) => setTimeout(r, 350)) // run A started (80 ms debounce), mid-encode
+    const b = window.__seglab.clickAt(sq.x, sq.y) // bumps revision → cancels A
+    await Promise.all([a, b])
+    return { log: window.__seglab.commitLog.slice(), revision: window.__seglab.revision() }
+  }, { disc: DISC, sq: SQUARE })
+  const committed = m0.log.filter((e) => e.outcome === 'committed')
+  check(
+    'revision/cancel: only the newest prompt commits',
+    committed.length === 1 && committed[0].revision === m0.revision
+      && m0.log.some((e) => e.revision < m0.revision && (e.outcome === 'stale' || e.outcome === 'superseded')),
+    `log ${JSON.stringify(m0.log)} (current revision ${m0.revision})`,
+  )
+  await pageC.close()
+
   /* ─── Phase B: flagship upgrade (WARN on failure, headless WebGPU ≠
          real Chrome) ──────────────────────────────────────────────────── */
   try {

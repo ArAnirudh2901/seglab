@@ -73,11 +73,42 @@ const withTimeout = (promise, ms, label) =>
         )
     })
 
+// Default budget (Standard-equivalent). policy.js on the main thread may
+// override any of these via warm({ budget }) — the engine itself never
+// probes hardware beyond the WebGPU check.
+const DEFAULT_BUDGET = {
+    profile: 'standard',
+    flagship: true,
+    draftCacheMax: 4,
+    flagshipCacheMax: 2,
+    forceWasm: false,
+}
+
 const state = {
     device: null,            // 'webgpu' | 'wasm' once known
     forcedWasm: false,       // sticky downgrade after a WebGPU runtime failure
     ready: false,            // draft lane serving
     flagship: 'idle',        // 'idle' | 'loading' | 'ready' | 'failed' | 'unavailable'
+    obsoleteBefore: 0,       // jobs with revision < this must not commit (cancel op)
+    budget: { ...DEFAULT_BUDGET },
+}
+
+/** Mark every job older than `revision` obsolete: queued ones are dropped at
+ *  dequeue; in-flight ones finish their (uninterruptible) ONNX kernel but
+ *  skip the post pipeline and report {stale:true}. Stale can never commit. */
+export const cancelBefore = (revision) => {
+    if (revision > state.obsoleteBefore) state.obsoleteBefore = revision
+}
+
+const isStale = (req) => req.revision !== undefined && req.revision < state.obsoleteBefore
+
+// One heavy GPU job at a time (Offline Pro's one-GPU-job rule) — also caps
+// transient memory peaks: encode/decode never overlap on 8 GB devices.
+let jobChain = Promise.resolve()
+const serialize = (fn) => {
+    const run = jobChain.then(() => fn())
+    jobChain = run.then(() => {}, () => {})
+    return run
 }
 
 let transformersPromise = null
@@ -109,6 +140,7 @@ export const getEngineState = () => ({
     ready: state.ready,
     flagship: state.flagship,
     lane: LANES[activeLaneKey()].label,
+    profile: state.budget.profile,
     cachedImages: embedCache.size,
 })
 
@@ -202,13 +234,19 @@ const maybeStartFlagship = () => {
 
 /**
  * Warm the draft lane (download + compile), then start the flagship
- * download in the background (pass flagship:false to skip — used by tests
- * and as a data-saver escape hatch).
+ * download in the background. `budget` comes from policy.js on the main
+ * thread (profiles, cache caps, lane gating); `flagship:false` remains the
+ * data-saver / test escape hatch on top of whatever the budget says.
  */
-export const warm = async ({ flagship = true } = {}) => {
+export const warm = async ({ flagship = true, budget = null } = {}) => {
+    if (budget) state.budget = { ...DEFAULT_BUDGET, ...budget }
+    if (state.budget.forceWasm && !state.forcedWasm) {
+        state.forcedWasm = true
+        state.device = 'wasm'
+    }
     await loadBundle('draft')
     state.ready = true
-    if (flagship) maybeStartFlagship()
+    if (flagship && state.budget.flagship) maybeStartFlagship()
     else if (state.flagship === 'idle') state.flagship = 'unavailable'
     return getEngineState()
 }
@@ -269,10 +307,13 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
         h,
     }
     embedCache.set(cacheKey, entry)
-    // Per-lane LRU eviction.
+    // Per-lane LRU eviction, cap owned by the session budget.
+    const cacheMax = (bundle.laneKey === 'draft'
+        ? state.budget.draftCacheMax
+        : state.budget.flagshipCacheMax) ?? lane.cacheMax
     let laneCount = 0
     for (const key of embedCache.keys()) if (key.startsWith(`${bundle.laneKey}:`)) laneCount += 1
-    if (laneCount > lane.cacheMax) {
+    if (laneCount > cacheMax) {
         for (const key of embedCache.keys()) {
             if (key.startsWith(`${bundle.laneKey}:`)) { embedCache.delete(key); break }
         }
@@ -312,7 +353,12 @@ const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
     }
 }
 
+const staleResult = (req) => ({ stale: true, revision: req.revision })
+
 const segmentOnce = async (req) => {
+    // Dropped at dequeue: a queued job whose revision was cancelled while it
+    // waited must not touch the model at all.
+    if (isStale(req)) return staleResult(req)
     const t0 = Date.now()
     const laneKey = req.lane || activeLaneKey()
     const bundle = await loadBundle(laneKey)
@@ -352,6 +398,10 @@ const segmentOnce = async (req) => {
         outputs = await withTimeout(bundle.model(decoderInputs), INFER_TIMEOUT_MS, 'mask decode (points only)')
     }
 
+    // The kernel above was uninterruptible; if this job was cancelled while
+    // it ran, skip the post pipeline — the encode is cached, nothing wasted.
+    if (isStale(req)) return staleResult(req)
+
     const masks = await bundle.processor.post_process_masks(
         outputs.pred_masks,
         entry.original_sizes,
@@ -382,6 +432,7 @@ const segmentOnce = async (req) => {
         score: Number(scores[best]) || 0,
         device: state.device,
         lane: LANES[laneKey].label,
+        revision: req.revision,
         encoded,
         encodeMs: tEncoded - t0,
         decodeMs: tDecoded - tEncoded,
@@ -403,8 +454,9 @@ const segmentOnce = async (req) => {
 export const segment = async (req) => {
     const laneKey = activeLaneKey()
     try {
-        return await segmentOnce({ ...req, lane: laneKey })
+        return await serialize(() => segmentOnce({ ...req, lane: laneKey }))
     } catch (err) {
+        if (isStale(req)) return staleResult(req) // don't demote lanes over a cancelled job
         if (laneKey === 'flagship') {
             console.warn('[seglab] flagship decode failed; demoting to draft lane:', err?.message)
             state.flagship = 'failed'
@@ -424,6 +476,6 @@ export const segment = async (req) => {
             bundles.flagship = null
         }
         embedCache.clear()
-        return segmentOnce({ ...req, lane: 'draft' })
+        return serialize(() => segmentOnce({ ...req, lane: 'draft' }))
     }
 }

@@ -12,10 +12,12 @@
  */
 
 import { countMaskComponents, lassoToPrompts } from './sam-core.js'
-import { clientState, segment, subscribe, warmUp } from './sam-client.js'
+import { cancelBefore, clientState, segment, subscribe, warmUp } from './sam-client.js'
+import { resolveBudget } from './policy.js'
 
-// ?flagship=0 keeps the session on the 14 MB draft lane (tests, data saver).
-const FLAGSHIP_ENABLED = new URLSearchParams(location.search).get('flagship') !== '0'
+// Session budget: profile preset + URL overrides (?flagship=0, ?profile=,
+// ?force=wasm, ?escalate=0). The M4 capability probe will pick the preset.
+const BUDGET = resolveBudget()
 
 const CANON_MAX = 1024
 const ACCENT = '#35e0c2'
@@ -52,9 +54,24 @@ const state = {
     maskSummary: null,
     score: 0,
     drag: null,               // in-progress interaction {kind, points|start}
-    runSeq: 0,                // stale-result guard
+    revision: 0,              // document revision — bumped on every prompt/image change
     running: false,
     runQueued: false,
+}
+
+// Commit bookkeeping for the headless gate: every finished run records
+// whether it committed or was stale/superseded (capped, newest last).
+const commitLog = []
+const logCommit = (revision, outcome) => {
+    commitLog.push({ revision, outcome })
+    if (commitLog.length > 20) commitLog.shift()
+}
+
+/** Any prompt or document change: newer truth exists, so obsolete every
+ *  older in-flight job (they skip post-processing and can never commit). */
+const bumpRevision = () => {
+    state.revision += 1
+    cancelBefore(state.revision)
 }
 
 const viewCtx = els.view.getContext('2d')
@@ -133,7 +150,7 @@ const showImage = (bitmapOrCanvas) => {
         ? 'Ready — click any object'
         : 'Preparing the model in the background — you can aim already')
     // Start the one-time model download NOW, while the user is aiming.
-    warmUp({ flagship: FLAGSHIP_ENABLED }).catch((err) => setStatus(`Model load failed: ${err?.message}`))
+    warmUp({ budget: BUDGET }).catch((err) => setStatus(`Model load failed: ${err?.message}`))
 }
 
 const loadFile = async (file) => {
@@ -238,7 +255,7 @@ function clearPrompts() {
     state.maskSummary = null
     state.score = 0
     state.drag = null
-    state.runSeq += 1 // orphan any in-flight result
+    bumpRevision() // orphan + cancel any in-flight result
     renderOverlay()
     refreshButtons()
 }
@@ -247,11 +264,11 @@ const undoPrompt = () => {
     if (state.clicks.length > 0) state.clicks.pop()
     else if (state.box) state.box = null
     else if (state.lasso) state.lasso = null
+    bumpRevision()
     if (state.clicks.length === 0 && !state.box && !state.lasso) {
         state.mask = null
         state.maskRaw = null
         state.maskSummary = null
-        state.runSeq += 1
         renderOverlay()
         refreshButtons()
         setStatus('Cleared')
@@ -325,6 +342,7 @@ els.overlay.addEventListener('pointerup', (e) => {
     if (drag.kind === 'tap' && !drag.moved) {
         const label = drag.negative || state.sign === 0 ? 0 : 1
         state.clicks.push([x, y, label])
+        bumpRevision()
         scheduleRun()
     } else if (drag.kind === 'box') {
         const [sx, sy] = drag.start
@@ -332,6 +350,7 @@ els.overlay.addEventListener('pointerup', (e) => {
         if (Math.abs(x - sx) > 8 && Math.abs(y - sy) > 8) {
             state.box = [Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)]
             state.lasso = null // a box replaces a lasso region
+            bumpRevision()
             scheduleRun()
         }
     } else if (drag.kind === 'lasso') {
@@ -343,6 +362,7 @@ els.overlay.addEventListener('pointerup', (e) => {
             state.lasso = { poly: drag.points, ...prompts }
             state.clicks = []
             state.box = null
+            bumpRevision()
             scheduleRun()
         }
     }
@@ -353,9 +373,11 @@ els.overlay.addEventListener('pointerup', (e) => {
 /* ─── Segmentation pipeline ──────────────────────────────────────────────── */
 
 let debounceTimer = null
+let debounceArmed = false // a run is scheduled but not yet started (waitForRun must see this)
 const scheduleRun = () => {
     clearTimeout(debounceTimer)
-    debounceTimer = setTimeout(runNow, 80)
+    debounceArmed = true
+    debounceTimer = setTimeout(() => { debounceArmed = false; runNow() }, 80)
 }
 
 async function runNow() {
@@ -365,7 +387,9 @@ async function runNow() {
     const box = state.lasso ? state.lasso.box : state.box
     if (clicks.length === 0 && !box) return
 
-    const seq = ++state.runSeq
+    // Snapshot the document revision this run speaks for; prompts bump it,
+    // so any change while we are in flight makes this run stale.
+    const revision = state.revision
     state.running = true
     setStatus(clientState.ready ? 'Selecting…' : 'Selecting… (first run loads the model)')
     try {
@@ -376,9 +400,12 @@ async function runNow() {
             box,
             clampPoly: state.lasso?.poly || null,
             clampMargin: state.lasso?.margin || 0,
+            revision,
         })
-        if (seq !== state.runSeq) return // superseded — a newer prompt owns the state
+        if (res.stale) { logCommit(revision, 'stale'); return } // cancelled mid-flight
+        if (revision !== state.revision) { logCommit(revision, 'superseded'); return } // a newer prompt owns the state
 
+        logCommit(revision, res.usable ? 'committed' : 'unusable')
         if (!res.usable) {
             state.mask = null
             state.maskRaw = null
@@ -394,7 +421,8 @@ async function runNow() {
         renderOverlay()
         refreshButtons()
     } catch (err) {
-        if (seq !== state.runSeq) return
+        logCommit(revision, 'error')
+        if (revision !== state.revision) return
         console.error('[seglab] selection failed:', err)
         setStatus(`Selection failed: ${err?.message}`)
     } finally {
@@ -539,9 +567,12 @@ els.cutout.addEventListener('click', async () => {
 /* ─── Headless test hooks (verify.mjs) ───────────────────────────────────── */
 
 const waitForRun = async () => {
-    // Wait out the debounce + the run; poll because runs can chain.
+    // Wait out the debounce + the run; poll because runs can chain. A
+    // just-finished run may have re-armed the debounce for a queued one
+    // (running=false, runQueued=false, timer pending) — debounceArmed
+    // covers that window.
     await new Promise((res) => setTimeout(res, 120))
-    while (state.running || state.runQueued) {
+    while (debounceArmed || state.running || state.runQueued) {
         await new Promise((res) => setTimeout(res, 40))
     }
 }
@@ -549,6 +580,8 @@ const waitForRun = async () => {
 window.__seglab = {
     loadDemo: () => { showImage(buildDemoScene()) },
     reset: () => clearPrompts(),
+    revision: () => state.revision,
+    commitLog,
     state: () => ({
         ready: clientState.ready,
         device: clientState.device,
@@ -558,6 +591,7 @@ window.__seglab = {
         maskSummary: state.maskSummary,
         score: state.score,
         clicks: state.clicks.length,
+        revision: state.revision,
     }),
     maskStats: () => {
         if (!state.mask) return null
@@ -570,6 +604,7 @@ window.__seglab = {
     },
     clickAt: async (x, y, negative = false) => {
         state.clicks.push([x, y, negative ? 0 : 1])
+        bumpRevision() // mirror the real pointerup path
         scheduleRun()
         await waitForRun()
         return window.__seglab.state()
@@ -585,6 +620,7 @@ window.__seglab = {
         state.lasso = { poly, ...prompts }
         state.clicks = []
         state.box = null
+        bumpRevision()
         scheduleRun()
         await waitForRun()
         return window.__seglab.state()
