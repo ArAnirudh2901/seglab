@@ -131,6 +131,18 @@ const emitEvent = (event) => {
 
 const activeLaneKey = () => (state.flagship === 'ready' ? 'flagship' : 'draft')
 
+export const getBudget = () => ({ ...state.budget })
+
+// OWLv2 [device,dtype] fallback ladder: WebGPU first when available, WASM
+// always in reserve (headless/driver quirks reject the quantized WebGPU graph;
+// q8 also breaks on WASM — see the M2 smoke test).
+export const detectorCandidates = () => {
+    const list = []
+    if (!state.forcedWasm && state.device === 'webgpu') list.push(['webgpu', 'fp16'])
+    list.push(['wasm', 'uint8'], ['wasm', 'q4'], ['wasm', 'fp32'])
+    return list
+}
+
 export const getEngineState = () => ({
     device: state.device,
     forcedWasm: state.forcedWasm,
@@ -141,7 +153,7 @@ export const getEngineState = () => ({
     cachedImages: embedCache.size,
 })
 
-const loadTransformers = () => {
+export const loadTransformers = () => {
     transformersPromise ??= import(TRANSFORMERS_CDN)
     return transformersPromise
 }

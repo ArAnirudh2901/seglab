@@ -34,6 +34,7 @@ import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
+import { normalizePhrase, nms, rankDetections, scaleBox } from './js/text-core.js'
 
 const ROOT = path.resolve(import.meta.dir)
 const PROFILE_DIR = path.join(ROOT, '.cache', 'profile')
@@ -126,6 +127,30 @@ const checkDisc = (tag, s) => {
 let context = null
 let failed = false
 try {
+  /* ─── Phase T: text-core pure logic (no browser) ────────────────────── */
+  const np = normalizePhrase('all red cars')
+  check(
+    'text-core: phrase → template + multi intent',
+    np && np.multi === true && np.labels[0] === 'a photo of a red car',
+    `${JSON.stringify(np)}`,
+  )
+  const deduped = nms([
+    { box: [0, 0, 100, 100], score: 0.9 },
+    { box: [5, 5, 105, 105], score: 0.8 },  // ~IoU 0.8 → dropped
+    { box: [400, 400, 500, 500], score: 0.7 }, // disjoint → kept
+  ], 0.5)
+  check('text-core: NMS drops overlaps, keeps distinct', deduped.length === 2, `kept ${deduped.length}`)
+  const ranked = rankDetections(
+    [{ box: [0, 0, 10, 10], score: 0.05 }, { box: [20, 20, 30, 30], score: 0.4 }],
+    { threshold: 0.15, topK: 8 },
+  )
+  const sb = scaleBox([10, 20, 30, 40], 2, 3)
+  check(
+    'text-core: rank filters by threshold; scaleBox maps coords',
+    ranked.length === 1 && ranked[0].score === 0.4 && sb[0] === 20 && sb[3] === 120,
+    `ranked=${ranked.length} scaled=[${sb}]`,
+  )
+
   context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: true,
     args: ['--enable-unsafe-webgpu', '--enable-gpu'],
@@ -255,6 +280,30 @@ try {
     `radialErr=${ex?.radialErr?.toFixed(1)}px (r=${geo.disc.r.toFixed(0)}), softPixels=${ex?.softPixels}`,
   )
   await pageD.close()
+
+  /* ─── Phase A5: M2 text-select plumbing (box → mask → union) ─────────── */
+  // The detector (OWLv2) can't build a session headless (ORT op gap), so the
+  // live phrase→boxes step is confirmed in real Chrome (WARN below). The
+  // machinery that turns a chosen box into a mask and unions instances is
+  // SAM-based and gated deterministically here.
+  const pageE = await newAppPage(context, '?flagship=0')
+  log('phase A5 (text-select plumbing) — candidate box → mask → multi-union…')
+  const discBox = [120, 230, 340, 450]
+  const squareBox = [515, 145, 715, 345]
+  const one = await pageE.evaluate((b) => window.__seglab.selectBoxes([b]), discBox)
+  checkDisc('text', one)
+  await pageE.evaluate(() => window.__seglab.reset())
+  const both = await pageE.evaluate(([a, b]) => window.__seglab.selectBoxes([a, b]), [discBox, squareBox])
+  check(
+    'text select: "all" unions instances → 2 components',
+    both && both.components === 2,
+    `components=${both?.components}, coverage ${((both?.maskSummary?.coverage || 0) * 100).toFixed(1)}%`,
+  )
+  // The live OWLv2 detector is NOT exercised here: it can't build a session
+  // under headless ORT, and its fallback ladder would download ~1 GB failing.
+  // Confirm phrase→boxes manually in real Chrome (chip should show candidates).
+  log('⚠ phase A5: OWLv2 phrase→boxes not gated headless (ORT op gap) — confirm in real Chrome')
+  await pageE.close()
 
   /* ─── Phase B: flagship upgrade (WARN on failure, headless WebGPU ≠
          real Chrome) ──────────────────────────────────────────────────── */

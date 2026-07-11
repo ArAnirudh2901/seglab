@@ -17,7 +17,10 @@
  * when worker construction fails (see sam-client.js).
  */
 
-import { cancelBefore, getEngineState, hdRefine, segment, setEventSink, warm } from './sam-engine.js'
+import {
+    cancelBefore, detectorCandidates, getBudget, getEngineState, hdRefine, segment, setEventSink, warm,
+} from './sam-engine.js'
+import { detect } from './detect-engine.js'
 
 setEventSink((event) => {
     try { self.postMessage(event) } catch { /* non-cloneable — best-effort */ }
@@ -48,6 +51,27 @@ self.onmessage = async (event) => {
                 self.postMessage({ id, ok: true, result }, transfer)
             } finally {
                 // The transferred bitmap is this side's to release.
+                try { source?.close?.() } catch { /* already closed */ }
+            }
+            return
+        }
+        if (op === 'detect') {
+            const { source } = payload || {}
+            try {
+                const progress_callback = (info) => self.postMessage({
+                    type: 'progress',
+                    detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total },
+                })
+                const res = await detect({
+                    source,
+                    labels: payload.labels,
+                    threshold: payload.threshold,
+                    candidates: detectorCandidates(),
+                    dispose: getBudget().detectorDispose === 'now',
+                    progress_callback,
+                })
+                self.postMessage({ id, ok: true, result: res })
+            } finally {
                 try { source?.close?.() } catch { /* already closed */ }
             }
             return

@@ -77,6 +77,18 @@
     .signtoggle.pos { color: var(--pos); border-color: var(--pos); }
     .signtoggle.neg { color: var(--neg); border-color: var(--neg); }
 
+    .textinput {
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        color: var(--text);
+        padding: 7px 12px;
+        font: inherit;
+        min-width: 260px;
+    }
+    .textinput:focus { outline: none; border-color: var(--accent); }
+    .textinput::placeholder { color: var(--dim); }
+
     main {
         flex: 1;
         display: flex;
@@ -182,9 +194,11 @@
         <button id="mode-click" class="active" title="Click to select — left/tap = include, right/Alt = exclude">Click</button>
         <button id="mode-box" title="Drag a box around the object">Box</button>
         <button id="mode-lasso" title="Draw a rough lasso — it snaps to the object">Lasso</button>
-        <button id="mode-text" disabled title="Describe the object in text — next step">Text</button>
+        <button id="mode-text" title="Describe the object in words — runs a local detector">Text</button>
     </div>
     <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
+    <input id="textinput" class="textinput" type="text" placeholder="describe an object — e.g. “the red car”, “all bottles”" hidden>
+    <button id="selectall" class="small" hidden title="Select every match">Select all</button>
     <div class="spacer"></div>
     <button id="undo" class="small" disabled title="Undo last prompt (Z)">Undo</button>
     <button id="reset" class="small" disabled title="Clear all prompts (R)">Reset</button>

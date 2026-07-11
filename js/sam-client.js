@@ -158,6 +158,21 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
             try { payload?.source?.close?.() } catch { /* already closed */ }
         }
     }
+    if (op === 'detect') {
+        const det = await import('./detect-engine.js')
+        try {
+            return await withTimeout(det.detect({
+                source: payload.source,
+                labels: payload.labels,
+                threshold: payload.threshold,
+                candidates: engine.detectorCandidates(),
+                dispose: engine.getBudget().detectorDispose === 'now',
+                progress_callback: (info) => onEngineEvent({ type: 'progress', detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total } }),
+            }), timeoutMs, label)
+        } finally {
+            try { payload?.source?.close?.() } catch { /* already closed */ }
+        }
+    }
     throw new Error(`Unknown op: ${op}`)
 }
 
@@ -297,4 +312,11 @@ export const hdExport = async (payload, transfer) => {
     if (result?.stale) return { stale: true }
     const alpha = result.alpha instanceof Uint8ClampedArray ? result.alpha : new Uint8ClampedArray(result.alpha)
     return { alpha, width: result.width, height: result.height, decoded: result.decoded, lane: result.lane }
+}
+
+/** OWLv2 detection over `canvas` (already sized to the detector canvas).
+ *  Returns { dets:[{box,score,label}] (canvas-pixel space), backend }. */
+export const detectText = async (canvas, labels, { threshold = 0.02 } = {}) => {
+    const source = await createImageBitmap(canvas)
+    return call('detect', { source, labels, threshold }, [source], INFER_TIMEOUT_MS, 'Text detection')
 }

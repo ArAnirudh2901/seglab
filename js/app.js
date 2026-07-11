@@ -11,11 +11,12 @@
  * frame — display scaling is pure CSS, undone at the pointer.
  */
 
-import { countMaskComponents, lassoToPrompts } from './sam-core.js'
+import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA } from './sam-core.js'
 import { cancelBefore, clientState, segment, subscribe, warmUp } from './sam-client.js'
 import { resolveBudget } from './policy.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
 import { buildCutout, exportCutoutBlob } from './export-hd.js'
+import { detectCandidates } from './text-ui.js'
 
 // Session budget: profile preset + URL overrides (?flagship=0, ?profile=,
 // ?force=wasm, ?escalate=0). The M4 capability probe will pick the preset.
@@ -33,7 +34,7 @@ const els = {
     status: $('status'), loadbar: $('loadbar'),
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipTiming: $('chip-timing'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
-    signtoggle: $('signtoggle'),
+    signtoggle: $('signtoggle'), textinput: $('textinput'), selectall: $('selectall'),
     modes: {
         click: $('mode-click'), box: $('mode-box'),
         lasso: $('mode-lasso'), text: $('mode-text'),
@@ -44,11 +45,13 @@ const els = {
 
 const state = {
     hasImage: false,
-    mode: 'click',            // 'click' | 'box' | 'lasso'
+    mode: 'click',            // 'click' | 'box' | 'lasso' | 'text'
     sign: 1,                  // primary-tap label for touch devices
     clicks: [],               // [[x, y, label], ...] canonical coords
     box: null,                // [x0, y0, x1, y1] canonical
     lasso: null,              // { poly, box, point, margin } from lassoToPrompts
+    textCandidates: [],       // [{ box, score, label }] proxy coords, from the detector
+    textMulti: false,         // phrase implied "all/every"
     mask: null,               // refined ImageData (white-on-black), canonical size
     maskRaw: null,            // decoder output before hygiene/refinement (E toggle)
     showRaw: false,
@@ -237,10 +240,14 @@ const setMode = (mode) => {
         btn.classList.toggle('active', name === mode)
     }
     els.signtoggle.style.display = mode === 'click' ? '' : 'none'
+    els.textinput.hidden = mode !== 'text'
+    els.selectall.hidden = mode !== 'text' || state.textCandidates.length === 0
+    if (mode === 'text') els.textinput.focus()
 }
 els.modes.click.addEventListener('click', () => setMode('click'))
 els.modes.box.addEventListener('click', () => setMode('box'))
 els.modes.lasso.addEventListener('click', () => setMode('lasso'))
+els.modes.text.addEventListener('click', () => setMode('text'))
 
 els.signtoggle.addEventListener('click', () => {
     state.sign = state.sign ? 0 : 1
@@ -262,11 +269,13 @@ function clearPrompts() {
     state.clicks = []
     state.box = null
     state.lasso = null
+    state.textCandidates = []
     state.mask = null
     state.maskRaw = null
     state.maskSummary = null
     state.score = 0
     state.drag = null
+    els.selectall.hidden = true
     bumpRevision() // orphan + cancel any in-flight result
     renderOverlay()
     refreshButtons()
@@ -324,6 +333,9 @@ els.overlay.addEventListener('pointerdown', (e) => {
         state.drag = { kind: 'box', start: [x, y], now: [x, y] }
     } else if (state.mode === 'lasso') {
         state.drag = { kind: 'lasso', points: [[x, y]] }
+    } else if (state.mode === 'text') {
+        const i = candidateAt(x, y) // tap a detected box to select it
+        if (i >= 0) selectCandidate(i)
     }
     renderOverlay()
 })
@@ -443,6 +455,111 @@ async function runNow() {
     }
 }
 
+/* ─── Text select ────────────────────────────────────────────────────────── */
+
+let detectTimer = null
+
+async function runDetect(phrase) {
+    if (!state.hasImage || !phrase.trim()) {
+        state.textCandidates = []
+        els.selectall.hidden = true
+        renderOverlay()
+        return
+    }
+    bumpRevision()
+    const revision = state.revision
+    setStatus(`Looking for “${phrase.trim()}”…`)
+    try {
+        const res = await detectCandidates(phrase, BUDGET)
+        if (revision !== state.revision) return // superseded by newer input
+        if (!res || res.candidates.length === 0) {
+            state.textCandidates = []
+            els.selectall.hidden = true
+            setStatus(`No matches for “${phrase.trim()}”. Try different words.`)
+            renderOverlay()
+            return
+        }
+        state.textCandidates = res.candidates
+        state.textMulti = res.multi
+        els.selectall.hidden = res.candidates.length < 2
+        const n = res.candidates.length
+        setStatus(`${n} match${n > 1 ? `es — tap one or Select all` : ' — tap it'}`)
+        renderOverlay()
+    } catch (err) {
+        if (revision !== state.revision) return
+        console.error('[seglab] detect failed:', err)
+        setStatus(`Text detection failed: ${err?.message}`)
+    }
+}
+
+/** A detector box → a box prompt through the normal pipeline (mask + HD export). */
+const selectCandidate = (i) => {
+    const c = state.textCandidates[i]
+    if (!c) return
+    state.box = c.box.slice()
+    state.clicks = []
+    state.lasso = null
+    state.textCandidates = []
+    els.selectall.hidden = true
+    bumpRevision()
+    scheduleRun()
+}
+
+/** Union every candidate into one mask (multi-instance: "all bottles"). */
+async function selectAll() {
+    const boxes = state.textCandidates.map((c) => c.box.slice())
+    if (boxes.length === 0 || state.running) return
+    bumpRevision()
+    const revision = state.revision
+    state.running = true
+    state.textCandidates = []
+    els.selectall.hidden = true
+    setStatus(`Selecting ${boxes.length} objects…`)
+    try {
+        let union = null
+        for (const box of boxes) {
+            const res = await segment(els.view, { box, revision })
+            if (res.stale || revision !== state.revision) return
+            if (!res.usable) continue
+            if (!union) {
+                union = new ImageData(new Uint8ClampedArray(res.imageData.data), res.width, res.height)
+            } else {
+                const u = union.data
+                const m = res.imageData.data
+                for (let k = 0; k < u.length; k += 4) if (m[k] > u[k]) { u[k] = m[k]; u[k + 1] = m[k + 1]; u[k + 2] = m[k + 2] }
+            }
+        }
+        if (!union) { setStatus('No objects selected'); return }
+        state.mask = union
+        state.maskRaw = new ImageData(new Uint8ClampedArray(union.data), union.width, union.height)
+        state.maskSummary = summarizeMaskRGBA(union.data, union.width, union.height)
+        state.box = null
+        setStatus(`Selected ${boxes.length} objects`)
+        renderOverlay()
+        refreshButtons()
+    } finally {
+        state.running = false
+    }
+}
+
+/** Candidate index under a proxy-space point, or -1. */
+const candidateAt = (x, y) => {
+    for (let i = 0; i < state.textCandidates.length; i += 1) {
+        const [x0, y0, x1, y1] = state.textCandidates[i].box
+        if (x >= x0 && x <= x1 && y >= y0 && y <= y1) return i
+    }
+    return -1
+}
+
+els.textinput.addEventListener('input', () => {
+    clearTimeout(detectTimer)
+    detectTimer = setTimeout(() => runDetect(els.textinput.value), 400)
+})
+els.textinput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { clearTimeout(detectTimer); runDetect(els.textinput.value) }
+})
+els.selectall.addEventListener('click', selectAll)
+
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
 /** Colorize the white-on-black mask; returns {fill, ring} canvases. */
@@ -502,6 +619,23 @@ function renderOverlay() {
         ctx.lineWidth = 1.75
         ctx.strokeRect(state.box[0], state.box[1], state.box[2] - state.box[0], state.box[3] - state.box[1])
         ctx.setLineDash([])
+    }
+
+    // Text candidates: numbered boxes to tap.
+    for (let i = 0; i < state.textCandidates.length; i += 1) {
+        const [x0, y0, x1, y1] = state.textCandidates[i].box
+        ctx.setLineDash([6, 4])
+        ctx.strokeStyle = 'rgba(90,160,255,0.95)'
+        ctx.lineWidth = 2
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
+        ctx.setLineDash([])
+        const tag = String(i + 1)
+        ctx.font = '600 13px -apple-system, sans-serif'
+        const tw = ctx.measureText(tag).width + 10
+        ctx.fillStyle = 'rgba(90,160,255,0.95)'
+        ctx.fillRect(x0, Math.max(0, y0 - 18), tw, 18)
+        ctx.fillStyle = '#fff'
+        ctx.fillText(tag, x0 + 5, Math.max(13, y0 - 5))
     }
 
     // Lasso region (kept faint once the mask lands, so the clamp is visible).
@@ -653,6 +787,7 @@ window.__seglab = {
         score: state.score,
         clicks: state.clicks.length,
         revision: state.revision,
+        candidates: state.textCandidates.length,
     }),
     maskStats: () => {
         if (!state.mask) return null
@@ -727,6 +862,20 @@ window.__seglab = {
         scheduleRun()
         await waitForRun()
         return window.__seglab.state()
+    },
+    // Run the OWLv2 detector; returns candidate boxes (for the WARN-level
+    // detector gate — headless model quality is not asserted hard).
+    detect: async (phrase) => {
+        await runDetect(phrase)
+        return { candidates: state.textCandidates.length, boxes: state.textCandidates.map((c) => c.box), multi: state.textMulti }
+    },
+    // Deterministic text-select PLUMBING (no detector): drive given proxy
+    // boxes through the box→mask→union path exactly as a real pick would.
+    selectBoxes: async (boxes) => {
+        state.textCandidates = boxes.map((box) => ({ box, score: 1, label: 'test' }))
+        if (boxes.length === 1) { selectCandidate(0); await waitForRun() } else { await selectAll() }
+        const s = window.__seglab.state()
+        return { ...s, ...(window.__seglab.maskStats() || {}) }
     },
 }
 window.__seglabReady = true

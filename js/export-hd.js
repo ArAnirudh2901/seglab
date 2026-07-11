@@ -49,7 +49,10 @@ export const buildCutout = async (proxyMask, prompts, { budget, revision } = {})
     // already at the proxy ceiling) and the profile allows it.
     const frameArea = tf.originalW * tf.originalH
     const cropArea = rect.w * rect.h
-    const doDecode = !!budget?.hdExportDecode && cropArea / frameArea < 0.85
+    const cropPrompts = mapPromptsToCrop(prompts, p2o, rect)
+    // Re-decode needs a prompt; a union ("all bottles") has none → filter-only.
+    const hasPrompt = cropPrompts.clicks.length > 0 || !!cropPrompts.box
+    const doDecode = !!budget?.hdExportDecode && hasPrompt && cropArea / frameArea < 0.85
 
     const cropBitmap = await getCropBitmap(rect) // may be downscaled if huge
     const cropW = cropBitmap.width
@@ -63,7 +66,6 @@ export const buildCutout = async (proxyMask, prompts, { budget, revision } = {})
     }
     const upFactor = cropW / proxySubrect.sw
 
-    const cropPrompts = mapPromptsToCrop(prompts, p2o, rect)
     const proxyBuf = new Uint8ClampedArray(proxyMask.data) // clone for transfer
     const payload = {
         revision,
