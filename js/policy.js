@@ -47,11 +47,12 @@ const PRESETS = {
     },
 }
 
-/** Session budget: preset (Standard until M4) + URL overrides —
- *  ?profile=lite|standard|pro, ?flagship=0, ?force=wasm, ?escalate=0. */
-export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '') => {
+/** Session budget: preset + URL overrides. The preset is `?profile=` if given,
+ *  else the boot capability probe's `probedProfile` (M4), else Standard.
+ *  Overrides: ?profile=lite|standard|pro, ?flagship=0, ?force=wasm, ?escalate=0. */
+export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probedProfile = null) => {
     const params = new URLSearchParams(search)
-    const name = params.get('profile')
+    const name = params.get('profile') || probedProfile
     const budget = { ...(PRESETS[name] || PRESETS.standard) }
     if (params.get('flagship') === '0') budget.flagship = false
     if (params.get('force') === 'wasm') { budget.forceWasm = true; budget.flagship = false }

@@ -12,15 +12,26 @@
  */
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA } from './sam-core.js'
-import { cancelBefore, clientState, segment, subscribe, warmUp } from './sam-client.js'
+import { cancelBefore, clientState, segment, subscribe, warmUp, relievePressure } from './sam-client.js'
 import { resolveBudget } from './policy.js'
+import { probeCapability } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
 import { detectCandidates } from './text-ui.js'
 
 // Session budget: profile preset + URL overrides (?flagship=0, ?profile=,
-// ?force=wasm, ?escalate=0). The M4 capability probe will pick the preset.
-const BUDGET = resolveBudget()
+// ?force=wasm, ?escalate=0). The capability probe (M4) picks the preset at
+// boot unless ?profile= forces it; provisional Standard covers the ~50 ms gap.
+let BUDGET = resolveBudget()
+let capability = null
+const bootProbe = probeCapability().then((cap) => {
+    capability = cap
+    BUDGET = resolveBudget(location.search, cap.profile)
+    return cap
+}).catch((err) => {
+    capability = { profile: BUDGET.profile, error: String(err?.message || err) }
+    return capability
+})
 
 const ACCENT = '#35e0c2'
 const POS_COLOR = '#35e08a'
@@ -140,7 +151,8 @@ subscribe((event) => {
 // of it as the ORIGINAL (the export truth) and builds the ≤proxyMax
 // interaction proxy into #view. `blob` (when present) lets weak-device /
 // huge-photo custody fall back to re-decoding instead of holding pixels.
-const showImage = (source, blob = null) => {
+const showImage = async (source, blob = null) => {
+    await bootProbe // BUDGET reflects the capability probe before we size the proxy
     importOriginal(source, { blob, budget: BUDGET, proxyCanvas: els.view })
     els.overlay.width = els.view.width
     els.overlay.height = els.view.height
@@ -231,6 +243,11 @@ window.addEventListener('drop', (e) => {
 window.addEventListener('paste', (e) => {
     const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'))
     if (item) loadFile(item.getAsFile())
+})
+
+// Backgrounded tab → drop the detector (cheap to reload); flagship stays.
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden && state.hasImage) relievePressure(1).catch(() => {})
 })
 
 /* ─── Modes ──────────────────────────────────────────────────────────────── */
@@ -815,10 +832,15 @@ const waitForRun = async () => {
 }
 
 window.__seglab = {
-    loadDemo: (longSide) => { showImage(buildDemoScene(longSide)) },
+    loadDemo: async (longSide) => { await showImage(buildDemoScene(longSide)) },
     reset: () => clearPrompts(),
     revision: () => state.revision,
     commitLog,
+    // Boot capability probe result { webgpu, fallback, f16, deviceMemoryGB,
+    // profile } — awaits the probe so it is never null.
+    capability: async () => { await bootProbe; return capability },
+    // Drive the memory-pressure ladder; returns what was freed.
+    relievePressure: (level) => relievePressure(level),
     // Demo ground truth in ORIGINAL pixels + the proxy transform, so the
     // headless gate derives click points (proxy space) and export checks
     // (original space) from one source instead of hardcoding scaled numbers.

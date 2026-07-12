@@ -338,6 +338,39 @@ try {
   log('⚠ phase A5: OWLv2 phrase→boxes not gated headless (ORT op gap) — confirm in real Chrome')
   await pageE.close()
 
+  /* ─── Phase A6: M4 capability probe + weak-device (wasm) full pipeline ── */
+  // (a) the default boot probe reports the dev machine as 'pro'; (b) forced
+  // onto wasm — the weak-device path — click + text + export all still
+  // complete; (c) the pressure ladder frees residents on demand.
+  const pageP = await newAppPage(context, '?flagship=0', 900)
+  const cap = await pageP.evaluate(() => window.__seglab.capability())
+  check(
+    'capability: dev machine probes as pro (WebGPU non-fallback + 8 GB)',
+    cap && cap.profile === 'pro' && cap.webgpu === true && cap.fallback === false,
+    JSON.stringify(cap),
+  )
+  await pageP.close()
+
+  const pageW = await newAppPage(context, '?force=wasm', 900)
+  log('phase A6 (weak-device) — full pipeline forced onto wasm (click + text + export)…')
+  const wClick = await pageW.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: DISC.x, y: DISC.y })
+  await pageW.evaluate(() => window.__seglab.reset())
+  const wText = await pageW.evaluate((b) => window.__seglab.selectBoxes([b]), [120, 230, 340, 450])
+  const wExport = await pageW.evaluate(() => window.__seglab.exportCutout())
+  check(
+    'weak-device (wasm): click + text + export all complete',
+    wClick.device === 'wasm' && !!wClick.maskSummary && !!wText.maskSummary
+      && wExport && wExport.w === 900 && wExport.coverage > 0,
+    `device=${wClick.device} click=${!!wClick.maskSummary} text=${!!wText?.maskSummary} export=${wExport?.w}×${wExport?.h} cov=${((wExport?.coverage || 0) * 100).toFixed(1)}%`,
+  )
+  const freed = await pageW.evaluate(() => window.__seglab.relievePressure(3))
+  check(
+    'pressure ladder: level 3 frees detector + flagship embeddings + session',
+    Array.isArray(freed) && ['detector', 'flagship-embeddings', 'flagship-session'].every((f) => freed.includes(f)),
+    `freed=${JSON.stringify(freed)}`,
+  )
+  await pageW.close()
+
   /* ─── Phase B: flagship upgrade (WARN on failure, headless WebGPU ≠
          real Chrome) ──────────────────────────────────────────────────── */
   try {

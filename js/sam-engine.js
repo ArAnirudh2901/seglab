@@ -339,6 +339,27 @@ const purgeLane = (laneKey) => {
     }
 }
 
+/**
+ * Memory-pressure ladder (M4) — free heavy GPU residents worst-effort,
+ * cheapest-to-reload first:
+ *   1 dispose the OWLv2 detector   2 drop flagship embeddings
+ *   3 drop the flagship session (reloads on demand; extends the sticky demote)
+ * The detector lives in another module — dynamic import dodges a static cycle.
+ */
+export const relievePressure = async (level = 1) => {
+    const freed = []
+    if (level >= 1) {
+        try { (await import('./detect-engine.js')).disposeDetector(); freed.push('detector') } catch { /* no detector loaded */ }
+    }
+    if (level >= 2) { purgeLane('flagship'); freed.push('flagship-embeddings') }
+    if (level >= 3) {
+        state.flagship = 'unavailable'
+        bundles.flagship = null
+        freed.push('flagship-session')
+    }
+    return freed
+}
+
 /** Zero the mask outside `poly` dilated by `margin` — the lasso guarantee:
  *  the decoder snaps the boundary INSIDE the region, the clamp owns the
  *  outside, so a lasso can never bleed onto a neighbouring object. */
@@ -492,6 +513,11 @@ export const segment = async (req) => {
         return await serialize(() => segmentOnce({ ...req, lane: laneKey }))
     } catch (err) {
         if (isStale(req)) return staleResult(req) // don't demote lanes over a cancelled job
+        // Out-of-memory: free the detector + flagship embeddings before the
+        // lane demote below retries (cheapest residents go first).
+        if (/out of memory|allocation failed|\boom\b|out of device memory/i.test(String(err?.message))) {
+            await relievePressure(2)
+        }
         if (laneKey === 'flagship') {
             console.warn('[seglab] flagship decode failed; demoting to draft lane:', err?.message)
             state.flagship = 'failed'

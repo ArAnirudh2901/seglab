@@ -173,6 +173,7 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
             try { payload?.source?.close?.() } catch { /* already closed */ }
         }
     }
+    if (op === 'pressure') return { freed: await engine.relievePressure(payload?.level || 1) }
     throw new Error(`Unknown op: ${op}`)
 }
 
@@ -319,4 +320,11 @@ export const hdExport = async (payload, transfer) => {
 export const detectText = async (canvas, labels, { threshold = 0.02 } = {}) => {
     const source = await createImageBitmap(canvas)
     return call('detect', { source, labels, threshold }, [source], INFER_TIMEOUT_MS, 'Text detection')
+}
+
+/** Free heavy GPU residents under memory pressure (M4 ladder). Returns the
+ *  list of what was freed. Level 1 detector · 2 +flagship embeddings · 3 +session. */
+export const relievePressure = async (level = 1) => {
+    const res = await call('pressure', { level }, null, INFER_TIMEOUT_MS, 'relieve pressure')
+    return res?.freed || []
 }

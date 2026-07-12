@@ -18,7 +18,7 @@
  */
 
 import {
-    cancelBefore, detectorCandidates, getBudget, getEngineState, hdRefine, segment, setEventSink, warm,
+    cancelBefore, detectorCandidates, getBudget, getEngineState, hdRefine, relievePressure, segment, setEventSink, warm,
 } from './sam-engine.js'
 import { detect } from './detect-engine.js'
 
@@ -89,6 +89,11 @@ self.onmessage = async (event) => {
         }
         if (op === 'state') {
             self.postMessage({ id, ok: true, result: getEngineState() })
+            return
+        }
+        if (op === 'pressure') {
+            const freed = await relievePressure(payload?.level || 1)
+            self.postMessage({ id, ok: true, result: { freed } })
             return
         }
         throw new Error(`Unknown op: ${op}`)
