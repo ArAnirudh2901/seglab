@@ -14,6 +14,14 @@
  *   5. click the MINUTE dot    → a genuinely small mask is returned
  *   6. lasso around the square → mask confined to lasso ∪ margin
  *
+ * Phases A2–A6 gate the milestones: revision/cancel, HD export, crop
+ * escalation, text-select plumbing, capability + weak-device.
+ *
+ * Phase A7/A8 (M5): the network is CUT (context.setOffline) after a warm
+ * import and click/text/export must still pass — zero-cloud as a tested
+ * property; then a fresh session must serve its import-time encode from
+ * OPFS (encoded=false) and decode a sane mask from the restored tensors.
+ *
  * Phase B (default URL — flagship upgrade path):
  *   7. background SAM3 download → lane flips to 'sam3' (first run pulls
  *      ~300 MB into the persistent profile; cached after)
@@ -156,6 +164,15 @@ try {
     args: ['--enable-unsafe-webgpu', '--enable-gpu'],
   })
 
+  // M5 phases assume a cold embed store; the persistent profile could carry
+  // one over if a previous run landed on the same port. Clear once.
+  const pageZ = await context.newPage()
+  await pageZ.goto(`http://127.0.0.1:${port}/`)
+  await pageZ.evaluate(() => navigator.storage.getDirectory()
+    .then((r) => r.removeEntry('seglab-embeds', { recursive: true }))
+    .catch(() => {}))
+  await pageZ.close()
+
   /* ─── Phase A: draft lane, deterministic ────────────────────────────── */
   const page = await newAppPage(context, '?flagship=0')
   log('phase A (draft lane) — first click downloads the model on a cold profile…')
@@ -223,10 +240,11 @@ try {
   await page.close()
 
   /* ─── Phase A2: M0 revision/cancel — overlapping prompts, one commit ──── */
-  // Fresh page = cold encode, so the first click's run is in flight for
-  // seconds; the second click must obsolete it (stale or superseded) and be
-  // the only revision that commits.
-  const pageC = await newAppPage(context, '?flagship=0')
+  // The 920px size is unique to this phase so the import-time eager encode
+  // (M5) is genuinely cold: click A queues behind a multi-second encode and
+  // click B must obsolete it (stale or superseded) — only B commits.
+  // (Same content as Phase A would hit OPFS and make the race flaky.)
+  const pageC = await newAppPage(context, '?flagship=0', 920)
   log('phase A2 (revision/cancel) — second click lands while the first is in flight…')
   const m0 = await pageC.evaluate(async ({ disc, sq }) => {
     const a = window.__seglab.clickAt(disc.x, disc.y)
@@ -370,6 +388,92 @@ try {
     `freed=${JSON.stringify(freed)}`,
   )
   await pageW.close()
+
+  /* ─── Phase A7: M5 zero-cloud proof — warmed profile, then offline ────── */
+  // Import a 2400px doc online (models + OPFS warm from earlier phases),
+  // then CUT the network at the context level and run a fresh click, the
+  // text plumbing, and a native-crop export. The export encodes a crop from
+  // scratch — real inference, provably needing no network. Route
+  // interception is deliberately NOT used: it would bypass the HTTP cache
+  // and false-fail the very caching this proves.
+  const pageO = await newAppPage(context, '?flagship=0', 2400)
+  await pageO.evaluate(() => window.__seglab.eagerEncode()) // embedding resident before the cut
+  const geoO = await pageO.evaluate(() => window.__seglab.demoGeometry())
+  let attempted = 0
+  let succeeded = 0
+  try {
+    await context.setOffline(true)
+    // Attached after the cut: only requests inside the offline window count.
+    pageO.on('request', () => { attempted += 1 })
+    pageO.on('requestfinished', () => { succeeded += 1 })
+    log('phase A7 (offline) — network cut; click + text plumbing + HD export…')
+    const oClick = await pageO.evaluate(
+      ({ x, y }) => window.__seglab.clickAt(x, y),
+      { x: geoO.disc.x * geoO.proxyScale, y: geoO.disc.y * geoO.proxyScale },
+    )
+    await pageO.evaluate(() => window.__seglab.reset())
+    const dbox = [
+      (geoO.disc.x - geoO.disc.r * 1.2) * geoO.proxyScale,
+      (geoO.disc.y - geoO.disc.r * 1.2) * geoO.proxyScale,
+      (geoO.disc.x + geoO.disc.r * 1.2) * geoO.proxyScale,
+      (geoO.disc.y + geoO.disc.r * 1.2) * geoO.proxyScale,
+    ]
+    const oText = await pageO.evaluate((b) => window.__seglab.selectBoxes([b]), dbox)
+    const oEx = await pageO.evaluate(
+      (probe) => window.__seglab.exportCutout(probe),
+      { cx: geoO.disc.x, cy: geoO.disc.y, r: geoO.disc.r },
+    )
+    check(
+      'offline: click + text + native export all pass with the network cut',
+      !!oClick?.maskSummary && !!oText?.maskSummary
+        && oEx && oEx.w === geoO.originalW && oEx.decoded === true && oEx.centerOpaque,
+      `click=${!!oClick.maskSummary} text=${!!oText?.maskSummary} export=${oEx?.w}×${oEx?.h} decoded=${oEx?.decoded} radialErr=${oEx?.radialErr?.toFixed(1)}px`,
+    )
+    check(
+      'offline: zero successful network fetches during inference',
+      succeeded === 0,
+      `${attempted} attempted, ${succeeded} succeeded`,
+    )
+  } finally {
+    await context.setOffline(false) // Phase B needs the network back
+  }
+  await pageO.close()
+
+  /* ─── Phase A8: M5 revisit — OPFS embedding survives a fresh session ──── */
+  // The 1600px size is unique to this phase (store cleared at run start).
+  // Visit 1: cold encode + OPFS save (eagerEncode resolves after the write).
+  // Visit 2 is a NEW page — empty in-memory cache — so encoded:false can
+  // only mean the embedding came back from OPFS; the click then proves the
+  // restored tensors actually decode.
+  log('phase A8 (revisit) — OPFS persistence across sessions…')
+  const pageR1 = await newAppPage(context, '?flagship=0', 1600)
+  const r1 = await pageR1.evaluate(() => window.__seglab.eagerEncode())
+  await pageR1.close()
+  check('revisit: first visit encodes fresh (cold store)', r1?.encoded === true, `encoded=${r1?.encoded} lane=${r1?.lane}`)
+
+  const pageR2 = await newAppPage(context, '?flagship=0', 1600)
+  const r2 = await pageR2.evaluate(() => window.__seglab.eagerEncode())
+  const geoR = await pageR2.evaluate(() => window.__seglab.demoGeometry())
+  const sR = await pageR2.evaluate(
+    ({ x, y }) => window.__seglab.clickAt(x, y),
+    { x: geoR.disc.x * geoR.proxyScale, y: geoR.disc.y * geoR.proxyScale },
+  )
+  const bR = sR.maskSummary?.bbox || [0, 0, -1, -1]
+  const cxp = geoR.disc.x * geoR.proxyScale
+  const cyp = geoR.disc.y * geoR.proxyScale
+  const discFracR = (Math.PI * geoR.disc.r * geoR.disc.r) / (geoR.originalW * geoR.originalH)
+  check(
+    'revisit: fresh session serves the import encode from OPFS',
+    r2?.encoded === false && sR.lastRun?.encoded === false,
+    `eager encoded=${r2?.encoded}, first click encoded=${sR.lastRun?.encoded}`,
+  )
+  check(
+    'revisit: restored embedding decodes a sane disc',
+    !!sR?.maskSummary && bR[0] <= cxp && cxp <= bR[2] && bR[1] <= cyp && cyp <= bR[3]
+      && sR.maskSummary.coverage > discFracR * 0.4 && sR.maskSummary.coverage < discFracR * 3,
+    `bbox [${bR.map((v) => Math.round(v))}] vs (${cxp.toFixed(0)},${cyp.toFixed(0)}); coverage ${((sR.maskSummary?.coverage || 0) * 100).toFixed(1)}% vs disc ${(discFracR * 100).toFixed(1)}%`,
+  )
+  await pageR2.close()
 
   /* ─── Phase B: flagship upgrade (WARN on failure, headless WebGPU ≠
          real Chrome) ──────────────────────────────────────────────────── */

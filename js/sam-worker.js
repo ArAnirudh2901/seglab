@@ -18,7 +18,7 @@
  */
 
 import {
-    cancelBefore, detectorCandidates, getBudget, getEngineState, hdRefine, relievePressure, segment, setEventSink, warm,
+    cancelBefore, detectorCandidates, encodeImage, getBudget, getEngineState, hdRefine, relievePressure, segment, setEventSink, warm,
 } from './sam-engine.js'
 import { detect } from './detect-engine.js'
 
@@ -51,6 +51,16 @@ self.onmessage = async (event) => {
                 self.postMessage({ id, ok: true, result }, transfer)
             } finally {
                 // The transferred bitmap is this side's to release.
+                try { source?.close?.() } catch { /* already closed */ }
+            }
+            return
+        }
+        if (op === 'encode') {
+            const { source } = payload || {}
+            try {
+                const result = await encodeImage(payload || {})
+                self.postMessage({ id, ok: true, result })
+            } finally {
                 try { source?.close?.() } catch { /* already closed */ }
             }
             return

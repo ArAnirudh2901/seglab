@@ -36,6 +36,7 @@ import {
     pickBestMask,
 } from './sam-core.js'
 import { refineMaskEdges, refineMaskEdgesTiled } from './edge-refine.js'
+import { loadEmbedding, saveEmbedding } from './embed-store.js'
 
 // Pinned CDN build of transformers.js (ESM single file, CORS-enabled) —
 // version-locked so a CDN-side major bump can never break the app.
@@ -276,7 +277,6 @@ const makeCanvas = (w, h) => {
  * must never evict a document embedding the user is actively clicking on.
  */
 const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } = {}) => {
-    const lane = LANES[bundle.laneKey]
     const cacheKey = `${bundle.laneKey}:${imageKey}`
     const hit = embedCache.get(cacheKey)
     if (hit) {
@@ -284,6 +284,16 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } 
         embedCache.delete(cacheKey)
         embedCache.set(cacheKey, hit)
         return { entry: hit, encoded: false }
+    }
+    // M5: revisit — document embeddings persist in OPFS across sessions.
+    // Crop keys stay memory-only (per-selection rects would churn the store).
+    const persistable = !ephemeral && imageKey.startsWith('doc:')
+    if (persistable) {
+        const persisted = await loadEmbedding(cacheKey, bundle.transformers.Tensor)
+        if (persisted) {
+            insertWithCap(bundle, cacheKey, persisted)
+            return { entry: persisted, encoded: false }
+        }
     }
     if (!source) throw new Error('Embedding cache miss and no image source provided')
     const { RawImage } = bundle.transformers
@@ -318,11 +328,18 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } 
         h,
     }
     if (ephemeral) return { entry, encoded: true }
+    insertWithCap(bundle, cacheKey, entry)
+    // `saved` resolves when the OPFS write lands (best-effort false on failure);
+    // segment ignores it, the eager encode op awaits it.
+    return { entry, encoded: true, saved: persistable ? saveEmbedding(cacheKey, entry) : null }
+}
+
+// Insert + per-lane LRU eviction, cap owned by the session budget.
+const insertWithCap = (bundle, cacheKey, entry) => {
     embedCache.set(cacheKey, entry)
-    // Per-lane LRU eviction, cap owned by the session budget.
     const cacheMax = (bundle.laneKey === 'draft'
         ? state.budget.draftCacheMax
-        : state.budget.flagshipCacheMax) ?? lane.cacheMax
+        : state.budget.flagshipCacheMax) ?? LANES[bundle.laneKey].cacheMax
     let laneCount = 0
     for (const key of embedCache.keys()) if (key.startsWith(`${bundle.laneKey}:`)) laneCount += 1
     if (laneCount > cacheMax) {
@@ -330,7 +347,6 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } 
             if (key.startsWith(`${bundle.laneKey}:`)) { embedCache.delete(key); break }
         }
     }
-    return { entry, encoded: true }
 }
 
 const purgeLane = (laneKey) => {
@@ -540,6 +556,19 @@ export const segment = async (req) => {
         return serialize(() => segmentOnce({ ...req, lane: 'draft' }))
     }
 }
+
+/**
+ * M5 encode-at-import: warm the active lane's embedding for `imageKey` in the
+ * background so the first click skips straight to decode. Awaits the OPFS
+ * save — when this resolves, the embedding is persisted (best-effort).
+ */
+export const encodeImage = (req) => serialize(async () => {
+    const laneKey = req.lane || activeLaneKey()
+    const bundle = await loadBundle(laneKey)
+    const { encoded, saved } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+    if (saved) await saved
+    return { encoded, lane: LANES[laneKey].label, device: state.device }
+})
 
 /**
  * Encode a crop (cached under `cacheKey`, or `ephemeral` for one-shot export

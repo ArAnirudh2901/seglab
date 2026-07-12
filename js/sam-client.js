@@ -149,8 +149,8 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
     }
     const engine = await getInlineEngine()
     if (op === 'warm') return withTimeout(engine.warm(payload || {}), timeoutMs, label)
-    if (op === 'segment' || op === 'hdExport') {
-        const fn = op === 'segment' ? engine.segment : engine.hdRefine
+    if (op === 'segment' || op === 'hdExport' || op === 'encode') {
+        const fn = op === 'segment' ? engine.segment : op === 'encode' ? engine.encodeImage : engine.hdRefine
         try {
             return await withTimeout(fn(payload), timeoutMs, label)
         } finally {
@@ -299,6 +299,18 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
         bandPixels: result.bandPixels,
         ms: Date.now() - startedAt,
     }
+}
+
+/**
+ * M5 encode-at-import: eagerly encode `canvas` on the active lane so the
+ * first click hits the embedding cache. Resolves after the OPFS save lands
+ * (best-effort). `encoded:false` ⇒ served from memory or OPFS.
+ */
+export const encodeImage = async (canvas) => {
+    if (!canvas?.width || !canvas?.height) return null
+    const imageKey = contentKey(canvas)
+    const source = await createImageBitmap(canvas)
+    return call('encode', { imageKey, source }, [source], INFER_TIMEOUT_MS, 'Encode at import')
 }
 
 /**

@@ -12,7 +12,7 @@
  */
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA } from './sam-core.js'
-import { cancelBefore, clientState, segment, subscribe, warmUp, relievePressure } from './sam-client.js'
+import { cancelBefore, clientState, encodeImage, segment, subscribe, warmUp, relievePressure } from './sam-client.js'
 import { resolveBudget } from './policy.js'
 import { probeCapability } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
@@ -166,6 +166,9 @@ const showImage = async (source, blob = null) => {
         : 'Preparing the model in the background — you can aim already')
     // Start the one-time model download NOW, while the user is aiming.
     warmUp({ budget: BUDGET }).catch((err) => setStatus(`Model load failed: ${err?.message}`))
+    // M5 encode-at-import: queue the encode behind the warm so the first
+    // click only pays a decode. encoded:false ⇒ came from memory/OPFS.
+    state.eagerEncode = encodeImage(els.view).catch(() => null)
 }
 
 const loadFile = async (file) => {
@@ -841,6 +844,9 @@ window.__seglab = {
     capability: async () => { await bootProbe; return capability },
     // Drive the memory-pressure ladder; returns what was freed.
     relievePressure: (level) => relievePressure(level),
+    // Resolves when the import-time eager encode (and its OPFS save) lands.
+    // { encoded, lane } — encoded:false on a revisit ⇒ served from OPFS.
+    eagerEncode: () => Promise.resolve(state.eagerEncode),
     // Demo ground truth in ORIGINAL pixels + the proxy transform, so the
     // headless gate derives click points (proxy space) and export checks
     // (original space) from one source instead of hardcoding scaled numbers.
