@@ -281,6 +281,39 @@ try {
   )
   await pageD.close()
 
+  /* ─── Phase A4: M3 crop escalation (small-object native recovery) ────── */
+  // 4000 px scene, an ~80 px dot: in the ≤1024 proxy it is ~20 px and coarse.
+  // Escalation re-decodes ONE native crop and merges it back; its boundary
+  // must beat the ?escalate=0 control (proxy only) by a wide margin.
+  const runDot = async (query) => {
+    const p = await newAppPage(context, query, 4000)
+    const geo = await p.evaluate(() => window.__seglab.demoGeometry())
+    await p.evaluate(
+      ({ x, y }) => window.__seglab.clickAt(x, y),
+      { x: geo.dot.x * geo.proxyScale, y: geo.dot.y * geo.proxyScale },
+    )
+    const esc = await p.evaluate(
+      (probe) => window.__seglab.escalation(probe),
+      { cx: geo.dot.x, cy: geo.dot.y, r: geo.dot.r },
+    )
+    await p.close()
+    return { esc, r: geo.dot.r }
+  }
+  log('phase A4 (crop escalation) — 4000px scene, small dot, native re-decode vs ?escalate=0…')
+  const on = await runDot('?flagship=0')
+  const off = await runDot('?flagship=0&escalate=0')
+  check(
+    'escalation: fires on Std/Pro for a small object, off under ?escalate=0',
+    on.esc.fired === true && on.esc.decoded === true && on.esc.centerOpaque === true && off.esc.fired === false,
+    `on{fired:${on.esc.fired},decoded:${on.esc.decoded},center:${on.esc.centerOpaque}} off{fired:${off.esc.fired}}`,
+  )
+  check(
+    'escalation: native re-decode recovers the boundary (materially better)',
+    on.esc.radialErr != null && off.esc.radialErr != null
+      && on.esc.radialErr <= 6 && on.esc.radialErr < off.esc.radialErr * 0.7,
+    `escalate=1 ${on.esc.radialErr?.toFixed(1)}px vs control ${off.esc.radialErr?.toFixed(1)}px (r=${on.r.toFixed(0)})`,
+  )
+
   /* ─── Phase A5: M2 text-select plumbing (box → mask → union) ─────────── */
   // The detector (OWLv2) can't build a session headless (ORT op gap), so the
   // live phrase→boxes step is confirmed in real Chrome (WARN below). The

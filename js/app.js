@@ -15,7 +15,7 @@ import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA } from './sam-co
 import { cancelBefore, clientState, segment, subscribe, warmUp } from './sam-client.js'
 import { resolveBudget } from './policy.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
-import { buildCutout, exportCutoutBlob } from './export-hd.js'
+import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
 import { detectCandidates } from './text-ui.js'
 
 // Session budget: profile preset + URL overrides (?flagship=0, ?profile=,
@@ -75,6 +75,7 @@ const logCommit = (revision, outcome) => {
  *  older in-flight job (they skip post-processing and can never commit). */
 const bumpRevision = () => {
     state.revision += 1
+    clearHdPatch() // a new selection retires the escalation patch
     cancelBefore(state.revision)
 }
 
@@ -444,6 +445,8 @@ async function runNow() {
         }
         renderOverlay()
         refreshButtons()
+        // Show the coarse mask first, then sharpen a tiny object at native res.
+        if (res.usable) await maybeEscalate(revision)
     } catch (err) {
         logCommit(revision, 'error')
         if (revision !== state.revision) return
@@ -453,6 +456,64 @@ async function runNow() {
         state.running = false
         if (state.runQueued) { state.runQueued = false; scheduleRun() }
     }
+}
+
+/* ─── Crop escalation (M3) ───────────────────────────────────────────────── */
+
+// A small object loses detail in the ≤1024 proxy. When the committed mask is
+// tiny AND the original out-resolves the proxy, re-decode ONE native crop,
+// merge it back, and cache it for HD export. Auto on Std/Pro (autoEscalate);
+// ?escalate=0 disables. No native headroom (proxy == original) ⇒ nothing to gain.
+const shouldEscalate = (summary) => {
+    if (!BUDGET.autoEscalate || !hasOriginal() || !summary?.bbox) return false
+    const tf = getTransform()
+    if (!tf || tf.originalW / tf.proxyW < 1.2) return false
+    const [minX, minY, maxX, maxY] = summary.bbox
+    const diag = Math.hypot(maxX - minX, maxY - minY)
+    return diag < Math.hypot(els.view.width, els.view.height) * 0.15
+}
+
+async function maybeEscalate(revision) {
+    if (!shouldEscalate(state.maskSummary)) return
+    try {
+        const crop = await escalateCrop(state.mask, currentPrompts(), { budget: BUDGET, revision })
+        if (!crop || revision !== state.revision) return // rejected or superseded
+        mergeCropIntoProxy(crop)
+        renderOverlay()
+    } catch (err) {
+        console.warn('[seglab] escalation skipped:', err?.message)
+    }
+}
+
+// Downscale the native crop mask into its proxy subrect and REPLACE that
+// region (same object, sharper — the padded crop fully contains it).
+function mergeCropIntoProxy({ alpha, width, height, proxySubrect }) {
+    const { sx, sy, sw, sh } = proxySubrect
+    const W = els.view.width
+    const H = els.view.height
+    const cropCanvas = new OffscreenCanvas(width, height)
+    cropCanvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(alpha), width, height), 0, 0)
+    const layer = new OffscreenCanvas(W, H)
+    const lctx = layer.getContext('2d', { willReadFrequently: true })
+    lctx.imageSmoothingEnabled = true
+    lctx.imageSmoothingQuality = 'high'
+    lctx.drawImage(cropCanvas, 0, 0, width, height, sx, sy, sw, sh)
+    const down = lctx.getImageData(0, 0, W, H).data
+
+    const merged = new Uint8ClampedArray(state.mask.data)
+    const x0 = Math.max(0, Math.floor(sx))
+    const y0 = Math.max(0, Math.floor(sy))
+    const x1 = Math.min(W, Math.ceil(sx + sw))
+    const y1 = Math.min(H, Math.ceil(sy + sh))
+    for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+            const i = (y * W + x) * 4
+            const v = down[i]
+            merged[i] = v; merged[i + 1] = v; merged[i + 2] = v; merged[i + 3] = 255
+        }
+    }
+    state.mask = new ImageData(merged, W, H)
+    state.maskSummary = summarizeMaskRGBA(merged, W, H)
 }
 
 /* ─── Text select ────────────────────────────────────────────────────────── */
@@ -788,6 +849,7 @@ window.__seglab = {
         clicks: state.clicks.length,
         revision: state.revision,
         candidates: state.textCandidates.length,
+        escalated: !!getHdPatch(state.revision),
     }),
     maskStats: () => {
         if (!state.mask) return null
@@ -839,6 +901,53 @@ window.__seglab = {
             out.outsideTransparent = alphaAt(probe.cx + probe.r * 1.3, probe.cy) < 16
         }
         return out
+    },
+    // Crop-escalation probe. Measures the current small-object boundary in
+    // ORIGINAL px against a synthetic disc `probe` {cx,cy,r}: the native patch
+    // when escalation fired, else the proxy mask upscaled (the control). Lets
+    // the gate compare escalate=1 vs ?escalate=0 on one metric.
+    escalation: (probe = null) => {
+        const patch = getHdPatch(state.revision)
+        const out = { fired: !!patch, decoded: !!(patch && patch.decoded) }
+        if (!probe) return out
+        let d
+        let W
+        let H
+        let s
+        let ox
+        let oy
+        if (patch) {
+            d = patch.alpha; W = patch.width; H = patch.height
+            s = patch.width / patch.rect.w; ox = patch.rect.x; oy = patch.rect.y
+        } else if (state.mask) {
+            const tf = getTransform()
+            d = state.mask.data; W = state.mask.width; H = state.mask.height
+            s = tf ? tf.scale : 1; ox = 0; oy = 0
+        } else {
+            return { ...out, radialErr: null }
+        }
+        const cx = (probe.cx - ox) * s
+        const cy = (probe.cy - oy) * s
+        const r = probe.r * s
+        const alphaAt = (x, y) => {
+            const xi = Math.round(x)
+            const yi = Math.round(y)
+            if (xi < 0 || yi < 0 || xi >= W || yi >= H) return 0
+            return d[(yi * W + xi) * 4]
+        }
+        let maxErr = 0
+        const N = 64
+        for (let k = 0; k < N; k += 1) {
+            const ang = (k / N) * Math.PI * 2
+            const cos = Math.cos(ang)
+            const sin = Math.sin(ang)
+            let cross = r * 1.6 // no crossing ⇒ big error
+            for (let rr = r * 0.4; rr <= r * 1.6; rr += 0.5) {
+                if (alphaAt(cx + cos * rr, cy + sin * rr) < 128) { cross = rr; break }
+            }
+            maxErr = Math.max(maxErr, Math.abs(cross - r))
+        }
+        return { ...out, radialErr: maxErr / s, centerOpaque: alphaAt(cx, cy) >= 128 }
     },
     clickAt: async (x, y, negative = false) => {
         state.clicks.push([x, y, negative ? 0 : 1])
