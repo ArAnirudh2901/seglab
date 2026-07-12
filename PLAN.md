@@ -68,13 +68,26 @@ upgrade every current and future lane.
 
 ---
 
-## Merged roadmap (in order; each phase = verify green, then commit)
+## Merged roadmap — SHIPPED (in order; each phase verify-green, then committed)
 
-### ENV — verify gate must be real on this machine
+All seven phases are on `main`, each with its verify gate passing at commit
+time. Full run: `bun verify.mjs` (Phases T, A–A8, B).
+
+| Phase | Commit | Gate proof |
+|-------|--------|------------|
+| ENV | `798e2d3` | local playwright+chromium; missing playwright = hard fail |
+| M0  | `e217f9e` | overlapping selections → only the newest commits |
+| M1  | `d0a86e6` | 2400 px export dims exact; radial err 1.5 px ≤ 3 px |
+| M2  | `73117e6` | box → mask same bars as clicks; "all" → 2 components |
+| M3  | `92bb517` | 4000 px scene: escalated 1.0 px vs 5.3 px control |
+| M4  | `f6d48b3` | dev machine probes `pro`; `?force=wasm` runs full pipeline |
+| M5  | `8b62f07` | offline: click+text+export, 0 net fetches; revisit `encoded=false` |
+
+### ENV — verify gate must be real on this machine ✅ `798e2d3`
 Local playwright dev-dependency + chromium; drop the foreign hard-coded path;
 missing playwright = hard fail (CI_SKIP_BROWSER=1 is the only skip).
 
-### M0 — Contracts: revision, cancel, serialize, policy stub
+### M0 — Contracts: revision, cancel, serialize, policy stub ✅ `e217f9e`
 `document.revision` carried through client → worker → engine; `cancel` op
 (ONNX kernels can't be interrupted → in-flight jobs skip the post pipeline and
 return `{stale:true}`; queued jobs drop at dequeue; stale can never commit).
@@ -83,7 +96,7 @@ peaks). `policy.js` static Standard budget + URL overrides. Cache key scheme
 `doc:${assetHash}` / `crop:${assetHash}:${rect}`.
 **Gate:** overlapping selections → only the newest commits; older reported stale.
 
-### M1 — Original asset + cropSegment + HD export (the "no loss" keystone)
+### M1 — Original asset + cropSegment + HD export (the "no loss" keystone) ✅ `d0a86e6`
 Today the original bitmap is CLOSED after building the ≤1024 proxy and the
 cutout exports from the proxy — native pixels are discarded. `asset-store.js`
 takes custody (Bitmap ≤24 MP, else Blob) + AssetTransform. New engine
@@ -97,7 +110,7 @@ composite → native-resolution PNG.
 **Gate:** 2400×1600 demo — export dims exact; radial boundary error ≤ 3 px vs
 the analytic disc.
 
-### M2 — Text select, local on every device (OWLv2)
+### M2 — Text select, local on every device (OWLv2) ✅ `73117e6`
 `Xenova/owlv2-base-patch16-ensemble` (verified present in the pinned
 transformers.js 4.2.0 build). `text-core.js` (pure: phrase normalization with
 the "a photo of a X" template, all/every → multi-intent, NMS, mapping),
@@ -112,7 +125,7 @@ out-of-distribution on flat synthetic shapes — photo patches carry the gates).
 **Gate:** text prompt lands a candidate on the photo patch → selecting it
 passes the same bbox/coverage bars as clicks; shape prompts WARN-only.
 
-### M3 — Crop pyramid: interactive small-object escalation
+### M3 — Crop pyramid: interactive small-object escalation ✅ `92bb517`
 After post pipeline: bbox diag < 15% of proxy diag OR near-empty/solid →
 exactly ONE auto `cropSegment` escalation (original-res padded crop), merged
 back to the proxy mask + kept as an original-res `hdPatch` that HD export
@@ -120,7 +133,7 @@ reuses. Auto on Standard/Pro; Lite = manual action (later).
 **Gate:** 4000 px scene, 60 px object — radial error/coverage materially
 better than a `?escalate=0` control run.
 
-### M4 — Capability probe fills policy.js
+### M4 — Capability probe fills policy.js ✅ `f6d48b3`
 Probe at boot (WebGPU adapter, deviceMemory, 512 px warm-up encode timing) →
 Lite/Standard/Pro budgets (proxy 768/1024/1024; detector canvas 640/960/960;
 flagship off/on/on; maxResidentHeavy 1/2/2; original Blob/Bitmap/Bitmap;
@@ -131,14 +144,20 @@ session (extends the existing sticky demote). Memory check (Pro, 12 MP):
 **Gate:** `?force=wasm` completes click + text + export (the "entire pipeline
 on weak devices" proof); default run on the dev machine reports `pro`.
 
-### M5 — Kill the waits + prove zero-cloud
+### M5 — Kill the waits + prove zero-cloud ✅ `8b62f07`
 Encode-at-import (eager background `encode` op — first click hits cache).
-OPFS persistence of flagship embeddings keyed by assetHash (write-then-rename,
-~500 MB LRU; read failure ⇒ re-encode). **Gates:** (A) warmed profile +
-`setOffline(true)` + request log ⇒ click/text/export still pass — zero-cloud
-as a tested property, not a promise (route-interception would bypass the HTTP
-cache and false-fail; models live in CacheStorage which serves offline);
-(B) revisit the same image ⇒ first click `encoded=false`.
+OPFS persistence of document embeddings keyed by `lane:contentHash`
+(write-then-move, ~500 MB byte-capped LRU; read failure ⇒ re-encode). Crop
+keys stay memory-only. **Gates:** (A) warmed profile + `setOffline(true)` +
+request log ⇒ click/text/export still pass with zero successful fetches —
+zero-cloud as a tested property, not a promise (route-interception would
+bypass the HTTP cache and false-fail; models live in CacheStorage which serves
+offline); (B) revisit the same image ⇒ import encode + first click both
+`encoded=false`, restored tensors decode a correct disc.
+
+Note: the plan named *flagship* embeddings; shipped persisting whichever lane
+is active (draft in headless, flagship on WebGPU) since both are `doc:`-keyed
+and the pack format is lane-agnostic — a revisit skips the encode either way.
 
 ---
 
