@@ -290,6 +290,32 @@ try {
     JSON.stringify({ ultraBudget, pressuredUltra }),
   )
 
+  // ── Memory safety contract: the two hardest-won 8 GB lessons, as gates ──
+  // #1 auto-loading the ~300 MB co-resident SAM3 lane thrashed the 8 GB Air
+  // into swap, so a browser that only *reports* (or under-reports, like Safari)
+  // 8 GB must never spend that download itself — flagship stays opt-in / trusted-host.
+  const eightGBDefault = resolveBudget('', browserEightGB)
+  const eightGBOptIn = resolveBudget('?flagship=1', browserEightGB)
+  check(
+    'safety: untrusted 8 GB / unknown-memory browser never auto-loads flagship SAM3',
+    eightGBDefault.flagship === false && unknownBudget.flagship === false
+      && browserEightGB.flagshipEligible === false && unknownMemory.flagshipEligible === false
+      && eightGBOptIn.flagship === true, // explicit ?flagship=1 is the only self-serve route
+    JSON.stringify({ dflt: eightGBDefault.flagship, unknown: unknownBudget.flagship, optIn: eightGBOptIn.flagship }),
+  )
+  // #2 memory pressure is a one-way ratchet: it only shrinks caps and turns off
+  // expensive automation — never re-enables escalation/WebGPU-detector or raises a ceiling.
+  const eightGBPressured = applyMemoryPressure(eightGBDefault, 2)
+  check(
+    'safety: memory pressure only tightens — caps never rise, automation only turns off',
+    eightGBPressured.autoEscalate === false && eightGBPressured.detectorWebGPU === false
+      && eightGBPressured.maxResidentHeavy <= eightGBDefault.maxResidentHeavy
+      && eightGBPressured.proxyMax <= eightGBDefault.proxyMax
+      && eightGBPressured.exportMaxMP <= eightGBDefault.exportMaxMP
+      && eightGBPressured.cropMaxSide <= eightGBDefault.cropMaxSide,
+    JSON.stringify(eightGBPressured),
+  )
+
   context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: true,
     args: ['--enable-unsafe-webgpu', '--enable-gpu'],
