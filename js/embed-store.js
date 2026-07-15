@@ -1,6 +1,6 @@
 /**
  * embed-store — OPFS persistence of image embeddings (worker/main).
- * Embeddings are expensive to recompute (flagship ~33 MB, seconds of GPU);
+ * Embeddings are expensive to recompute (SlimSAM takes a model-encode pass);
  * persist them keyed by `lane:assetKey` so a revisit skips the encode. Binary
  * pack (JSON header + concatenated tensor/gray buffers), write-then-move for
  * atomicity, byte-capped LRU (~500 MB). Any read/parse/quota failure just

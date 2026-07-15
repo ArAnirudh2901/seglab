@@ -6,24 +6,28 @@
  * worker → SlimSAM); this module owns only UI state, prompt collection,
  * overlay rendering, and the lasso clamp.
  *
- * One reference frame: the photo is downscaled once into a ≤1024 canonical
+ * One reference frame: the photo is downscaled once into a ≤768 canonical
  * canvas (#view). Prompts, masks, overlay, and the cutout all live in that
  * frame — display scaling is pure CSS, undone at the pointer.
  */
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA } from './sam-core.js'
-import { cancelBefore, clientState, encodeImage, segment, subscribe, warmUp, relievePressure } from './sam-client.js'
+import {
+    cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure,
+} from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
 import { detectCandidates } from './text-ui.js'
-import { DETECTOR_DOWNLOAD_MB, detectorCached } from './detect-engine.js'
+import { acceleratedDetectorAvailable, detectorCached, detectorDownloadMB } from './detect-engine.js'
+import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
+import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-client.js'
 
-// Session budget: profile preset + URL overrides (?flagship=0, ?profile=,
-// ?force=wasm, ?escalate=0). The capability probe picks the memory profile at
-// boot unless ?profile= forces it; provisional Standard is safe while probing.
+// Session budget: profile preset + URL overrides. The provisional budget is
+// LITE — nothing above it can be proven before the capability probe, and a
+// plain browser stays lite forever (only a trusted Phosmith hint raises it).
 let BUDGET = resolveBudget()
 let capability = null
 let pendingPhosmithResources = null
@@ -31,7 +35,7 @@ const bootProbe = probeCapability().then((cap) => {
     capability = pendingPhosmithResources
         ? withPhosmithResources(cap, pendingPhosmithResources)
         : cap
-    BUDGET = resolveBudget(location.search, capability)
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability), BUDGET.pressureLevel || 0)
     refreshChips()
     return cap
 }).catch((err) => {
@@ -39,11 +43,14 @@ const bootProbe = probeCapability().then((cap) => {
     return capability
 })
 
-// Start the model request immediately, using the conservative provisional
-// budget. The capability probe still tightens the budgets for image work, but
-// image decode must never race model compilation: imports wait for this warm
-// promise to settle before allocating their proxy frame.
-const startupWarm = warmUp({ budget: BUDGET })
+// No model loads before the user supplies an image. The warm request is
+// enqueued AFTER the import decode releases its bitmaps (heavy-job queue
+// serializes them regardless).
+let warmStarted = false
+const ensureWarm = () => {
+    warmStarted = true
+    return warmUp({ budget: BUDGET })
+}
 
 const ACCENT = '#35e0c2'
 const POS_COLOR = '#35e08a'
@@ -79,7 +86,9 @@ const state = {
     lasso: null,              // { poly, box, point, margin } from lassoToPrompts
     manual: null,             // { kind, poly?|box?|seed? } direct Photoshop-style selection
     polygonDraft: [],
-    wandTolerance: 72,
+    // Per-channel RGB distance used only by Magic and Color. 36 is a useful
+    // middle ground for photos; 72 was broad enough to merge unrelated hues.
+    wandTolerance: 36,
     textCandidates: [],       // [{ box, score, label }] proxy coords, from the detector
     textMulti: false,         // phrase implied "all/every"
     mask: null,               // refined ImageData (white-on-black), canonical size
@@ -152,15 +161,15 @@ const applyPhosmithResources = (resources = readPhosmithResources()) => {
     }
     const previous = capability
     capability = withPhosmithResources(capability, resources)
-    BUDGET = resolveBudget(location.search, capability)
+    // Pressure is a one-way ratchet: a live budget update never resets it.
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability), BUDGET.pressureLevel || 0)
     const profileRank = { lite: 0, standard: 1, pro: 2, ultra: 3 }
     const memoryReduced = previous.memoryGB > 0 && capability.memoryGB > 0
         && capability.memoryGB < previous.memoryGB
     const needsHeavyRelease = memoryReduced
         || (profileRank[capability.profile] || 0) < (profileRank[previous.profile] || 0)
-        || (previous.allowFlagship && !capability.allowFlagship)
     // A host downgrade is a real resource event, not only a UI-label change:
-    // immediately retire the optional flagship before its next GPU allocation.
+    // immediately release reloadable residents before the next allocation.
     if (needsHeavyRelease) relievePressure(3).catch(() => {})
     refreshChips()
     if (state.hasImage) {
@@ -180,30 +189,13 @@ subscribe((event) => {
         if (d.status === 'progress' && d.total) {
             const pct = Math.round((d.loaded / d.total) * 100)
             els.loadbar.style.width = `${pct}%`
-            // Flagship downloads in the background — say so without hiding
-            // that the tool is already usable on the draft lane.
-            if (d.lane === 'flagship') {
-                if (!state.running) setStatus(`Ready on SlimSAM — upgrading to SAM3 in the background, ${pct}% of ~300 MB (one-time)`)
-            } else {
-                setStatus(`Downloading model — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~14 MB)`)
-            }
+            setStatus(`Downloading SlimSAM — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~14 MB)`)
         } else if (d.status === 'done') {
             els.loadbar.style.width = '0%'
         }
         return
     }
-    if (event.type === 'lane') {
-        refreshChips()
-        if (event.label === 'sam3') {
-            setStatus('Upgraded to SAM3 — masks are sharper from here on')
-            // Prompt replay: silently re-run the current selection at
-            // flagship quality (first replay re-encodes the image).
-            if (state.hasImage && (state.clicks.length || state.box || state.lasso)) scheduleRun()
-        } else {
-            setStatus('SAM3 unavailable — continuing on SlimSAM')
-        }
-        return
-    }
+    if (event.type === 'lane') { refreshChips(); return }
     refreshChips()
     if (clientState.ready && !state.running && !state.hasImage) {
         setStatus('Model ready — import a photo to begin')
@@ -314,31 +306,18 @@ const showImage = async (source, {
     proxyBlob = null, orientation = null, raw = false, sourceBytes = source?.size || 0,
 } = {}, imageEpoch) => {
     if (!imageRequestIsCurrent(imageEpoch)) return null
-    const epoch = showPrep('Preparing the model before opening the photo…')
+    const epoch = showPrep('Building a lightweight interaction preview…')
     await bootProbe // BUDGET reflects the capability probe before we size the proxy
     if (!imageRequestIsCurrent(imageEpoch)) { hidePrep(epoch); return null }
 
-    // The model load starts at page evaluation. Waiting here is intentional:
-    // a model compilation/upload and a browser image decode are both peak
-    // allocations, and allowing them to overlap is what makes Safari reload
-    // the page for significant memory use.
-    if (!clientState.ready) {
-        setStatus('Preparing the model — photo queued safely')
-        try {
-            await startupWarm
-        } catch (err) {
-            // Preserve the preview path; a later selection will surface the
-            // retryable model error instead of discarding the user’s file.
-            console.warn('[seglab] startup model warm failed:', err?.message)
-        }
-    }
-    if (!imageRequestIsCurrent(imageEpoch)) { hidePrep(epoch); return null }
-    if (!document.hidden) await waitForCalm({ frames: 12, maxWaitMs: 6000 })
-    if (!imageRequestIsCurrent(imageEpoch)) { hidePrep(epoch); return null }
+    // A new document obsoletes every queued job and the old embeddings before
+    // any new decode starts. Model weights stay; the queue serializes the
+    // decode against any still-running kernel.
+    clearHeavyQueue()
+    if (warmStarted) releaseDocument()
 
-    // The RAW container is deliberately not inspected until the draft model
-    // has settled. Its embedded JPEG preview (not the 33 MB sensor payload)
-    // then becomes the only image decoded during interaction.
+    // A RAW container's embedded JPEG preview (not the 33 MB sensor payload)
+    // becomes the only image decoded during interaction.
     if (raw) {
         els.prepText.textContent = 'Extracting the camera preview…'
         setStatus('Reading the camera preview — original sensor data stays untouched')
@@ -367,8 +346,9 @@ const showImage = async (source, {
         orientation,
         sourceWasRaw: raw,
         sourceBytes,
+        isCurrent: () => imageRequestIsCurrent(imageEpoch),
     })
-    if (!imageRequestIsCurrent(imageEpoch)) {
+    if (!transform || !imageRequestIsCurrent(imageEpoch)) {
         // importChain guarantees no later import has started yet, so this is
         // safe and releases an abandoned proxy before the next request runs.
         releaseAsset()
@@ -386,12 +366,18 @@ const showImage = async (source, {
         ? `adaptive ${transform.proxyW}×${transform.proxyH} proxy`
         : 'native interaction frame (proxy disabled)'
     const readyStatus = `Ready — click any object · ${frameMode}`
-    setStatus(`${readyStatus} · preparing locally in the background`)
-    // The proxy is now interactive. Eager encoding happens only after an idle
-    // window and stays in the worker, so the user can continue selecting,
-    // switch tools, replace the image, or leave the tab without a UI freeze.
+    setStatus(clientState.ready ? readyStatus : `${readyStatus} · preparing the model in the background`)
+    // The proxy is on screen; ONLY NOW does SlimSAM warm (queued — it can
+    // never overlap the decode that just released its bitmaps).
     hidePrep(epoch)
-    scheduleEagerEncode(imageEpoch, state.revision, readyStatus)
+    ensureWarm().catch((err) => {
+        console.warn('[seglab] model warm failed (first selection will retry):', err?.message)
+    })
+    // Speculative encode-at-import only on trusted (non-lite) budgets; the
+    // lite policy never encodes before the user's first selection.
+    if (BUDGET.eagerEncode && BUDGET.profile !== 'lite') {
+        scheduleEagerEncode(imageEpoch, state.revision, readyStatus)
+    }
     return transform
 }
 
@@ -399,9 +385,8 @@ const loadFile = async (file) => {
     if (!file) return
     const imageEpoch = beginImageRequest()
     try {
-        // Keep the RAW as a Blob until model warm-up is complete. showImage
-        // extracts only its embedded developed JPEG preview after that point,
-        // so the raw parse can never overlap model compilation.
+        // The RAW stays a Blob; showImage extracts only its embedded
+        // developed JPEG preview, and the decode rides the heavy-job queue.
         if (isRawFile(file)) {
             console.log('[seglab][ui] raw-import-start', { name: file.name, bytes: file.size })
             return await queueImage(file, { raw: true, sourceBytes: file.size }, imageEpoch)
@@ -469,6 +454,8 @@ els.file.addEventListener('change', () => {
 els.demo.addEventListener('click', () => queueImage(buildDemoScene()))
 els.newimg.addEventListener('click', () => {
     beginImageRequest() // invalidate a queued file/idle encode before cleanup
+    clearHeavyQueue()
+    if (warmStarted) releaseDocument()
     state.hasImage = false
     hidePrep()
     clearPrompts()
@@ -493,13 +480,16 @@ window.addEventListener('paste', (e) => {
 const shedMemory = (level, { announce = true } = {}) => {
     const previous = BUDGET.pressureLevel || 0
     BUDGET = applyMemoryPressure(BUDGET, level)
+    if ((BUDGET.pressureLevel || 0) >= 2) disposeCvRefine() // idle wasm worker goes first
     if (announce && BUDGET.pressureLevel > previous) {
-        const detail = BUDGET.pressureLevel >= 3
-            ? 'exports and future imports reduced to a safe fallback budget'
-            : BUDGET.pressureLevel === 2
-                ? 'native-detail escalation and heavy caches paused'
+        if (BUDGET.pressureLevel >= 3) {
+            setStatus('Memory pressure detected — running in safe mode.')
+        } else {
+            const detail = BUDGET.pressureLevel === 2
+                ? 'wasm refinement, escalation and heavy caches paused'
                 : 'detector and extra model caches released'
-        setStatus(`Memory pressure — ${detail}`)
+            setStatus(`Memory pressure — ${detail}`)
+        }
         refreshChips()
     }
     return relievePressure(level).catch(() => [])
@@ -513,7 +503,7 @@ document.addEventListener('visibilitychange', () => {
 
 // Heap watchdog (Chrome-only; sees only this thread's JS heap, so thresholds
 // are deliberately conservative): stop escalation, then shed detector and any
-// optional flagship session long before an 8 GB Mac starts heavy swapping.
+// reloadable model state long before an 8 GB Mac starts heavy swapping.
 if (performance.memory) {
     setInterval(() => {
         if (!state.hasImage) return
@@ -1025,6 +1015,7 @@ async function runNow() {
             clampPoly: state.lasso?.poly || null,
             clampMargin: state.lasso?.margin || 0,
             revision,
+            budget: BUDGET,
         })
         if (res.stale) {
             console.log('[seglab][ui] selection-stale', { revision })
@@ -1054,6 +1045,9 @@ async function runNow() {
         }
         renderOverlay()
         refreshButtons()
+        // Optional wasm cleanup on the committed one-channel mask (lazy-loads
+        // on first use; skipped under pressure ≥ 2; failure keeps this mask).
+        if (res.usable) await maybeCvRefine(revision, clicks)
         // Show the coarse mask first, then sharpen a tiny object at native res.
         if (res.usable) await maybeEscalate(revision)
     } catch (err) {
@@ -1065,6 +1059,40 @@ async function runNow() {
         state.running = false
         if (state.runQueued) { state.runQueued = false; scheduleRun() }
     }
+}
+
+/* ─── Wasm mask cleanup (cv-refine) ──────────────────────────────────────── */
+
+// One-channel contract: the mask leaves as W*H bytes (transferred), returns
+// as W*H bytes, and only the final committed ImageData expands to RGBA.
+async function maybeCvRefine(revision, clicks) {
+    if (!state.mask || !cvRefineAvailable()) return
+    if (BUDGET.cvRefine === false || (BUDGET.pressureLevel || 0) >= 2) return
+    const { width, height } = state.mask
+    if (Math.max(width, height) > 768) return
+    const src = state.mask.data
+    const alpha = new Uint8Array(width * height)
+    for (let p = 0; p < alpha.length; p += 1) alpha[p] = src[p * 4]
+    const seeds = (clicks || []).filter((c) => c[2]).map((c) => [Math.round(c[0]), Math.round(c[1])])
+    const refined = await refineAlpha({
+        alpha, // transferred — detached after this call
+        width,
+        height,
+        seeds,
+        options: { minArea: 24, openRadius: 0, closeRadius: 0 },
+        revision,
+        budget: BUDGET,
+    })
+    if (!refined || revision !== state.revision || !state.mask) return
+    const out = new ImageData(width, height)
+    const d = out.data
+    for (let p = 0, i = 0; p < refined.length; p += 1, i += 4) {
+        const v = refined[p]
+        d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255
+    }
+    state.mask = out
+    state.maskSummary = summarizeMaskRGBA(d, width, height)
+    renderOverlay()
 }
 
 /* ─── Crop escalation (M3) ───────────────────────────────────────────────── */
@@ -1157,11 +1185,12 @@ let detectTimer = null
  *  and the first search is the slow one. Local state only — no network. */
 async function hintTextSearch() {
     if (!state.hasImage) return
-    const cached = await detectorCached()
+    const accelerated = acceleratedDetectorAvailable && BUDGET.detectorWebGPU === true && BUDGET.gpuTier === 'accelerated' && BUDGET.forceWasm !== true
+    const cached = await detectorCached({ accelerated })
     if (state.mode !== 'text') return // left Text while checking
     setStatus(cached
         ? 'Text search ready'
-        : `Text search ready — the first search downloads the detector (~${DETECTOR_DOWNLOAD_MB} MB), then it's cached`)
+        : `Text search ready — the first search downloads the detector (~${detectorDownloadMB({ accelerated })} MB), then it's cached`)
 }
 
 async function runDetect(phrase) {
@@ -1173,9 +1202,11 @@ async function runDetect(phrase) {
     }
     bumpRevision()
     const revision = state.revision
-    setStatus(await detectorCached()
+    const accelerated = acceleratedDetectorAvailable && BUDGET.detectorWebGPU === true && BUDGET.gpuTier === 'accelerated' && BUDGET.forceWasm !== true
+    const detectorMB = detectorDownloadMB({ accelerated })
+    setStatus(await detectorCached({ accelerated })
         ? `Looking for “${phrase.trim()}”…`
-        : `Downloading the detector (~${DETECTOR_DOWNLOAD_MB} MB), then looking for “${phrase.trim()}”…`)
+        : `Downloading the detector (~${detectorMB} MB), then looking for “${phrase.trim()}”…`)
     if (revision !== state.revision) return // superseded while checking the cache
     try {
         const res = await detectCandidates(phrase)
@@ -1196,7 +1227,9 @@ async function runDetect(phrase) {
     } catch (err) {
         if (revision !== state.revision) return
         console.error('[seglab] detect failed:', err)
-        setStatus(`Text detection failed: ${err?.message}`)
+        setStatus(BUDGET.profile === 'lite' && /load|memory|alloc|abort/i.test(String(err?.message))
+            ? 'Text selection is unavailable on this device’s safe memory profile.'
+            : `Text detection failed: ${err?.message}`)
     }
 }
 
@@ -1228,7 +1261,7 @@ async function selectAll() {
     try {
         let union = null
         for (const box of boxes) {
-            const res = await segment(els.view, { box, revision })
+            const res = await segment(els.view, { box, revision, budget: BUDGET })
             if (res.stale || revision !== state.revision) return
             if (!res.usable) continue
             if (!union) {
@@ -1494,9 +1527,10 @@ els.cutout.addEventListener('click', async () => {
     // in the app, and the user is waiting on a file, not the canvas.
     const epoch = showPrep(wasNative ? 'Rebuilding the cutout at full resolution…' : 'Building the cutout…')
     try {
-        // OWLv2 is unrelated to a cutout export and can hold substantial GPU
-        // memory. Release it before allocating bounded export canvases.
+        // Detector and wasm-refine workers are unrelated to a cutout export
+        // and hold memory. Release both before the bounded export canvases.
         await relievePressure(1)
+        disposeCvRefine()
         let out = null
         if (wasNative) {
             out = await exportCutoutBlob(state.mask, currentPrompts(), {
@@ -1511,7 +1545,9 @@ els.cutout.addEventListener('click', async () => {
         a.download = 'seglab-cutout.png'
         a.click()
         setTimeout(() => URL.revokeObjectURL(a.href), 5000)
-        setStatus(`Exported ${out.width}×${out.height} cutout${out.decoded ? ' · HD re-decode' : ''}`)
+        const tf = getTransform()
+        const reduced = wasNative && tf && (out.width < tf.originalW || out.height < tf.originalH)
+        setStatus(`Exported ${out.width}×${out.height} cutout${out.decoded ? ' · HD re-decode' : ''}${reduced ? ` · reduced from ${tf.originalW}×${tf.originalH} for this device’s safe memory profile` : ''}`)
     } catch (err) {
         console.error('[seglab] export failed:', err)
         setStatus(`Export failed: ${err?.message}`)
@@ -1559,6 +1595,29 @@ window.__seglab = {
     imageTransform: () => getTransform(),
     // Drive the memory-pressure ladder; returns what was freed.
     relievePressure: (level) => shedMemory(level),
+    // Engine residency snapshot (worker): { cachedImages, lane, profile, … }.
+    engineState: () => engineState(),
+    // Heavy-job queue state + recent telemetry (overlap/ordering gates).
+    queueState: () => getHeavyQueueState(),
+    queueLog: () => getHeavyQueueLog(),
+    // Direct cv-refine lane access for the wasm gates. `alpha` arrives as a
+    // plain array; returns { alpha: number[]|null } (null = unavailable/failed).
+    cvRefine: async ({ alpha, width, height, seeds = [], options = {} }) => {
+        const out = await refineAlpha({
+            alpha: Uint8Array.from(alpha), width, height, seeds, options,
+            revision: null, budget: BUDGET,
+        })
+        return { alpha: out ? Array.from(out) : null, available: cvRefineAvailable() }
+    },
+    // Developer "Release memory" action (debug only, not in normal UI).
+    releaseMemory: async () => {
+        clearHeavyQueue()
+        cancelBefore(state.revision + 1)
+        disposeCvRefine()
+        layerCache = { mask: null, fill: null }
+        if (warmStarted) await releaseDocument()
+        return shedMemory(3, { announce: false })
+    },
     // Resolves when the import-time eager encode (and its OPFS save) lands.
     // { encoded, lane } — encoded:false on a revisit ⇒ served from OPFS.
     eagerEncode: () => Promise.resolve(state.eagerEncode),
@@ -1764,8 +1823,8 @@ window.__seglab = {
         await new Promise((resolve) => requestAnimationFrame(resolve))
         return { ...window.__seglab.state(), ...(window.__seglab.maskStats() || {}) }
     },
-    // Run the OWLv2 detector; returns candidate boxes (for the WARN-level
-    // detector gate — headless model quality is not asserted hard).
+    // Run the resource-gated text detector; returns candidate boxes (for the
+    // WARN-level detector gate — headless model quality is not asserted hard).
     detect: async (phrase) => {
         await runDetect(phrase)
         return { candidates: state.textCandidates.length, boxes: state.textCandidates.map((c) => c.box), multi: state.textMulti }
@@ -1785,7 +1844,7 @@ window.__seglabReady = true
 
 // Register the SW as early as possible so it's controlling the page before any
 // model fetches start. On second+ visits the SW intercepts from the cache —
-// eliminating the ~14 MB (draft) / ~300 MB (flagship) downloads entirely.
+// eliminating repeated SlimSAM downloads entirely.
 // Only runs in secure contexts (HTTPS or localhost); file:// is silently skipped.
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js', { scope: './' })
@@ -1803,10 +1862,8 @@ if ('serviceWorker' in navigator) {
 setMode('click')
 refreshChips()
 
-// The model request began above, before any image can be selected. The probe
-// refines future image/export budgets; uploads wait on this same promise so
-// their decode can never overlap the model's peak allocation.
-bootProbe.then(() => warmUp({ budget: BUDGET }))
-    .catch((err) => setStatus(`Model load failed: ${err?.message}`))
+// Deliberately NO model warm here: nothing downloads or compiles until the
+// user has supplied an image and its bounded proxy is on screen.
+bootProbe.catch(() => {})
 
 console.log('[seglab] ready')

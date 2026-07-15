@@ -56,14 +56,14 @@ export const readPhosmithResources = () => normalizePhosmithResources(
 const lowerProfile = (profile) => ({ ultra: 'pro', pro: 'standard', standard: 'standard', lite: 'lite' }[profile] || 'standard')
 
 const profileForMemory = (memoryGB, trusted, mode) => {
-    let profile = 'standard' // unknown browser memory must be safe, not optimistic
-    // There is no safe way to keep several canvas/export copies below an
-    // 8 GB editor budget. This covers 4 GB devices and host-reported 6 GB
-    // headroom without pretending they are an 8 GB machine.
+    // Browsers round deviceMemory and cap it at 8 GB, so an untrusted report
+    // (or no report at all) can never prove more than 8 GB — force lite.
+    // Only a trusted Phosmith budget earns a larger tier.
+    if (!trusted) return 'lite'
+    let profile = 'standard'
     if (memoryGB > 0 && memoryGB < 8) profile = 'lite'
-    // Browsers cap memory at 8 GB. Only a native host can earn larger tiers.
-    else if (trusted && memoryGB >= 24) profile = 'ultra'
-    else if (trusted && memoryGB >= 12) profile = 'pro'
+    else if (memoryGB >= 24) profile = 'ultra'
+    else if (memoryGB >= 12) profile = 'pro'
     if (mode === 'conservative') profile = lowerProfile(profile)
     return profile
 }
@@ -122,9 +122,9 @@ export const classifyCapability = (input = {}) => {
         gpuPreference: 'high-performance',
         profile,
         proxyMax: proxyFor(profile, gpuTier, Number(input.textureLimit) || 0),
-        // Heavy model loading stays explicitly authorized; hardware alone does
-        // not spend a 300 MB download or reserve GPU memory in the background.
-        flagshipEligible: (profile === 'pro' || profile === 'ultra') && gpuTier === 'accelerated',
+        // Segmentation is SlimSAM-only. Kept as a stable diagnostic field for
+        // existing host integrations; it is deliberately never eligible.
+        flagshipEligible: false,
     }
 }
 

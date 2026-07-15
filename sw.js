@@ -4,8 +4,9 @@
  * Intercepts fetches for ONNX model files and the transformers.js bundle from
  * HuggingFace and jsDelivr CDNs. After the first download, every subsequent
  * request is served from the 'seglab-models-v1' Cache Storage bucket —
- * eliminating the ~14 MB (draft) and ~300 MB (flagship) downloads on every
- * visit.
+ * eliminating repeated SlimSAM downloads on every visit. It never fetches
+ * resources itself: cache entries are created only after the editor requests
+ * them, so model/Wasm/detector prefetching cannot add a startup memory peak.
  *
  * Strategy: cache-first for model blobs; network-first (passthrough) for
  * everything else. A stale model is never a problem here because the app
@@ -16,10 +17,9 @@
  * CACHE_NAME to invalidate on a future app version bump.
  */
 
-// v2: evicts the old Xenova OWLv2 fp16 blobs. The activate handler deletes any
-// seglab-models-* bucket that isn't this one, so a stale heavy detector can't
-// sit in Cache Storage and load instantly into a session we no longer build.
-const CACHE_NAME = 'seglab-models-v2'
+// v3 retires every cache bucket created while the automatic SAM3 upgrade was
+// available. Activation deletes obsolete buckets before serving future loads.
+const CACHE_NAME = 'seglab-models-v3'
 
 /**
  * URL prefixes that should be intercepted and cached.
@@ -35,7 +35,11 @@ const MODEL_ORIGINS = [
     'https://huggingface.co/resolve/',
 ]
 
-const isModelFetch = (url) => MODEL_ORIGINS.some((prefix) => url.startsWith(prefix))
+// Same-origin static wasm (cv-refine) is cached after first load — never
+// prefetched, and per-image pixels/embeddings are never stored here.
+const isWasmFetch = (url) => url.includes('/public/wasm/')
+
+const isModelFetch = (url) => MODEL_ORIGINS.some((prefix) => url.startsWith(prefix)) || isWasmFetch(url)
 
 // ── Install: take control immediately, no page refresh needed ────────────────
 self.addEventListener('install', (event) => {

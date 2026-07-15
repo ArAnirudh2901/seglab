@@ -9,7 +9,9 @@
  * to hold a full rotated canvas just to edit a portrait photo.
  */
 
-import { readImageMeta } from './image-io.js'
+import { readMeta, decodeProxy, decodeOpaque, STALE } from './decode-client.js'
+import { resizeOpts } from './decode-core.js'
+import { interactionPlan } from './proxy-plan.js'
 
 const store = {
     blob: null,        // compressed original — never full-res RGBA between operations
@@ -21,9 +23,9 @@ const store = {
     workingH: 0,
 }
 
-// Long-edge cap for the working copy: interaction-time re-decodes (detector
-// frame, escalation crops) never cost more than an ~11 MP transient.
-const WORKING_MAX_SIDE = 4096
+// Long-edge cap for the working copy comes from the budget (lite 1280): the
+// bounded re-decode source for detector frames and escalation crops.
+const workingMaxSide = (budget = {}) => budget.workingMaxSide || 1280
 
 // Safari never shipped ImageDecoder and its createImageBitmap cannot
 // scaled-decode, so every blob decode there materializes the full raster.
@@ -87,135 +89,6 @@ export const releaseAsset = () => {
     store.workingH = 0
 }
 
-/**
- * Decide whether this image actually needs a proxy. In auto mode a source at
- * or below the device cap is native-sized (`proxyActive:false`). `?proxy=off`
- * is honored only while the source is below a conservative direct-image
- * budget; larger sources immediately return to the device's safe proxy cap.
- */
-const interactionPlan = (w, h, budget = {}) => {
-    const longSide = Math.max(w, h)
-    const directSafe = (w * h) <= (budget.directMaxMP || 4) * 1e6
-        && longSide <= (budget.directMaxSide || 4096)
-    const disabled = budget.proxyMode === 'disabled'
-    const cap = disabled && directSafe
-        ? longSide
-        : (disabled ? (budget.safeProxyMax || 1024) : (budget.proxyMax || 1024))
-    const scale = Math.min(1, cap / longSide)
-    return {
-        scale,
-        proxyActive: scale < 1,
-        proxyReason: disabled && !directSafe ? 'safety' : (scale < 1 ? 'device' : 'native'),
-    }
-}
-
-const resizeOpts = (w, h, scale) => (scale < 1
-    ? { resizeWidth: Math.max(1, Math.round(w * scale)), resizeHeight: Math.max(1, Math.round(h * scale)), resizeQuality: 'high' }
-    : {})
-
-/**
- * Decode an upload directly at the interaction size when the browser exposes
- * WebCodecs ImageDecoder. Safari's createImageBitmap resize path may still
- * transiently decode a full DSLR raster; desiredWidth/desiredHeight lets its
- * native decoder choose the bounded frame first. This path matters most for a
- * normal 24–60 MP DSLR JPEG: the prior 8 MP gate sent precisely those files
- * through `createImageBitmap`, whose Safari implementation may materialize a
- * full raster before shrinking it. EXIF orientations other than 1 stay on the
- * established createImageBitmap path because this app applies their transform
- * manually and must not risk a browser-specific double rotate.
- */
-const decodeProxyBlob = async (blob, w, h, scale, orientation) => {
-    const opts = resizeOpts(w, h, scale)
-    const wantsResize = opts.resizeWidth && opts.resizeHeight
-    if (wantsResize && orientation === 1 && typeof ImageDecoder !== 'undefined' && blob.type) {
-        let decoder = null
-        try {
-            // Avoid invoking a partial WebCodecs implementation for a codec
-            // it explicitly does not support. `isTypeSupported` is optional,
-            // so old implementations still get the guarded constructor try.
-            if (typeof ImageDecoder.isTypeSupported === 'function'
-                && !(await ImageDecoder.isTypeSupported(blob.type))) {
-                throw new Error(`ImageDecoder does not support ${blob.type}`)
-            }
-            // Chromium and current Safari accept a ReadableStream here but
-            // reject Blob directly. Streaming keeps the compressed upload
-            // out of a second ArrayBuffer while the decoder builds the proxy.
-            decoder = new ImageDecoder({
-                data: blob.stream(),
-                type: blob.type,
-                preferAnimation: false,
-                // These are ImageDecoderInit members (not decode() options).
-                // Supplying them there makes the native decoder emit the
-                // bounded proxy frame instead of a full-size VideoFrame.
-                desiredWidth: opts.resizeWidth,
-                desiredHeight: opts.resizeHeight,
-            })
-            const { image } = await decoder.decode({
-                frameIndex: 0,
-                completeFramesOnly: true,
-            })
-            try {
-                // A compliant decoder has already produced the target-sized
-                // VideoFrame, so do not ask for another resample/copy. The
-                // resize fallback handles an implementation that accepted but
-                // ignored desiredWidth/desiredHeight without exposing that
-                // large frame to the editor canvas.
-                const atTarget = image.displayWidth === opts.resizeWidth
-                    && image.displayHeight === opts.resizeHeight
-                const bitmap = await createImageBitmap(image, atTarget ? {} : opts)
-                console.log('[seglab][asset] proxy-decoder', {
-                    mode: 'ImageDecoder',
-                    decoded: `${image.displayWidth}x${image.displayHeight}`,
-                    target: `${opts.resizeWidth}x${opts.resizeHeight}`,
-                    width: bitmap.width,
-                    height: bitmap.height,
-                })
-                return bitmap
-            } finally {
-                image.close()
-            }
-        } catch (err) {
-            // WebCodecs support varies by codec and Safari version. The
-            // createImageBitmap path below remains the compatible fallback.
-            console.warn('[seglab][asset] ImageDecoder proxy fallback:', err?.message)
-        } finally {
-            try { decoder?.close() } catch { /* already closed */ }
-        }
-    }
-    return createImageBitmap(blob, { imageOrientation: 'none', ...opts })
-}
-
-/**
- * Unbounded-decode hosts pay one full-raster decode for any oversized upload
- * no matter what. Pay it exactly once: keep a ≤WORKING_MAX_SIDE re-encoded
- * copy (encoded orientation, no EXIF) so detector frames and escalation crops
- * re-decode ~11 MP instead of the whole DSLR raster. Returns the proxy bitmap.
- */
-const decodeWithWorking = async (blob, meta, scale) => {
-    const full = await createImageBitmap(blob, { imageOrientation: 'none' })
-    try {
-        const ws = WORKING_MAX_SIDE / Math.max(meta.w, meta.h)
-        const wc = makeCanvas(Math.max(1, Math.round(meta.w * ws)), Math.max(1, Math.round(meta.h * ws)))
-        const wctx = wc.getContext('2d')
-        wctx.imageSmoothingEnabled = true
-        wctx.imageSmoothingQuality = 'high'
-        wctx.drawImage(full, 0, 0, wc.width, wc.height)
-        const type = blob.type === 'image/png' ? 'image/png' : 'image/jpeg'
-        const encoded = await new Promise((resolve) => wc.toBlob(resolve, type, 0.92))
-        if (encoded) {
-            store.workingBlob = encoded
-            store.workingW = wc.width
-            store.workingH = wc.height
-            console.log('[seglab][asset] working-blob', {
-                from: `${meta.w}x${meta.h}`, to: `${wc.width}x${wc.height}`, bytes: encoded.size,
-            })
-        }
-        return await createImageBitmap(full, resizeOpts(meta.w, meta.h, scale))
-    } finally {
-        full.close()
-    }
-}
-
 const putInteractionFrame = (proxyCanvas, source, orientation) => {
     const dims = displayDims(source.width, source.height, orientation)
     proxyCanvas.width = dims.w
@@ -231,11 +104,12 @@ const putInteractionFrame = (proxyCanvas, source, orientation) => {
 export const importOriginal = async (source, {
     budget = {}, proxyCanvas, proxyBlob = null, orientation: orientationOverride = null,
     sourceWasRaw = false, sourceBytes = source?.size || 0,
+    revision = null, isCurrent = null,
 } = {}) => {
     releaseAsset()
 
     if (source instanceof Blob) {
-        const meta = await readImageMeta(source)
+        const meta = await readMeta(source)
         if (meta?.w && meta?.h) {
             const orientation = validOrientation(orientationOverride ?? meta.orientation)
             const displayed = displayDims(meta.w, meta.h, orientation)
@@ -243,7 +117,7 @@ export const importOriginal = async (source, {
             // For a real proxy, a RAW's small embedded preview is the safest
             // source. A native-sized frame always uses the full preview/image.
             const proxySource = plan.proxyActive && proxyBlob ? proxyBlob : source
-            const proxyMeta = proxySource === source ? meta : await readImageMeta(proxySource)
+            const proxyMeta = proxySource === source ? meta : await readMeta(proxySource)
             const targetW = Math.min(
                 Math.max(1, Math.round(meta.w * plan.scale)),
                 proxyMeta?.w || meta.w,
@@ -261,19 +135,35 @@ export const importOriginal = async (source, {
             const decodeW = proxyMeta?.w || meta.w
             const decodeH = proxyMeta?.h || meta.h
             const decodeScale = Math.min(1, targetW / decodeW, targetH / decodeH)
+            const wMax = workingMaxSide(budget)
             const wantWorking = plan.proxyActive && unboundedDecodeHost(budget)
-            let bitmap
-            if (wantWorking && proxySource === source && Math.max(meta.w, meta.h) > WORKING_MAX_SIDE) {
-                bitmap = await decodeWithWorking(source, meta, decodeScale)
-            } else {
-                bitmap = await decodeProxyBlob(proxySource, decodeW, decodeH, decodeScale, orientation)
-                // A RAW's small embedded preview is already a bounded decode
-                // source — retain it instead of re-encoding anything.
-                if (wantWorking && proxySource !== source && (proxyMeta?.w || 0) < meta.w) {
-                    store.workingBlob = proxySource
-                    store.workingW = proxyMeta.w
-                    store.workingH = proxyMeta.h
-                }
+            // A RAW's small embedded preview is already a bounded decode
+            // source — retain it instead of re-encoding anything.
+            const rawWorking = wantWorking && proxySource !== source && (proxyMeta?.w || 0) < meta.w
+            const res = await decodeProxy({
+                blob: proxySource,
+                decodeW,
+                decodeH,
+                scale: decodeScale,
+                orientation,
+                wantWorking: wantWorking && proxySource === source && Math.max(meta.w, meta.h) > wMax,
+                workingMaxSide: wMax,
+                revision,
+                isCurrent,
+            })
+            if (res === STALE) return null
+            const { bitmap, working } = res
+            if (working) {
+                store.workingBlob = working.blob
+                store.workingW = working.w
+                store.workingH = working.h
+                console.log('[seglab][asset] working-blob', {
+                    from: `${meta.w}x${meta.h}`, to: `${working.w}x${working.h}`, bytes: working.blob.size,
+                })
+            } else if (rawWorking) {
+                store.workingBlob = proxySource
+                store.workingW = proxyMeta.w
+                store.workingH = proxyMeta.h
             }
             try {
                 putInteractionFrame(proxyCanvas, bitmap, orientation)
@@ -304,43 +194,37 @@ export const importOriginal = async (source, {
         }
 
         // Uncommon formats without a cheap header parser still avoid resident
-        // full-res pixels. The browser must decode once to reveal dimensions,
-        // then the bitmap is immediately reduced and released. `from-image`
-        // is the only reliable orientation signal for these opaque formats.
-        const bitmap = await createImageBitmap(source, { imageOrientation: 'from-image' })
+        // full-res pixels: the worker decodes once to reveal dimensions, then
+        // immediately bounds and releases the full bitmap. `from-image` is the
+        // only reliable orientation signal for these opaque formats.
+        const res = await decodeOpaque({ blob: source, budget, revision, isCurrent })
+        if (res === STALE) return null
+        const { bitmap: target, original, proxyActive } = res
         try {
-            const plan = interactionPlan(bitmap.width, bitmap.height, budget)
-            const target = plan.proxyActive
-                ? await createImageBitmap(bitmap, resizeOpts(bitmap.width, bitmap.height, plan.scale))
-                : bitmap
-            try {
-                proxyCanvas.width = target.width
-                proxyCanvas.height = target.height
-                proxyCanvas.getContext('2d').drawImage(target, 0, 0)
-            } finally {
-                if (target !== bitmap) target.close()
-            }
-            store.blob = source
-            store.transform = {
-                originalW: bitmap.width,
-                originalH: bitmap.height,
-                encodedW: bitmap.width,
-                encodedH: bitmap.height,
-                orientation: 1,
-                proxyW: proxyCanvas.width,
-                proxyH: proxyCanvas.height,
-                scale: proxyCanvas.width / bitmap.width,
-                proxyActive: plan.proxyActive,
-                proxyReason: plan.proxyReason,
-                opaqueFormat: true,
-                sourceWasRaw,
-                sourceBytes,
-            }
-            store.assetKey = `doc:${hashCanvas(proxyCanvas)}`
-            return { ...store.transform }
+            proxyCanvas.width = target.width
+            proxyCanvas.height = target.height
+            proxyCanvas.getContext('2d').drawImage(target, 0, 0)
         } finally {
-            bitmap.close()
+            target.close()
         }
+        store.blob = source
+        store.transform = {
+            originalW: original.width,
+            originalH: original.height,
+            encodedW: original.width,
+            encodedH: original.height,
+            orientation: 1,
+            proxyW: proxyCanvas.width,
+            proxyH: proxyCanvas.height,
+            scale: proxyCanvas.width / original.width,
+            proxyActive,
+            proxyReason: proxyActive ? 'device' : 'native',
+            opaqueFormat: true,
+            sourceWasRaw,
+            sourceBytes,
+        }
+        store.assetKey = `doc:${hashCanvas(proxyCanvas)}`
+        return { ...store.transform }
     }
 
     // Drawable source (demo canvas / in-memory caller). It is the only path

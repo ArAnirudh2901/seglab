@@ -1,8 +1,13 @@
 # SEGLAB — on-device segmentation
 
 Import a photo, then select anything — clicks (+/−), a box, or a rough lasso
-that snaps to the object. Everything runs in the browser (SlimSAM and OWLv2 via
-transformers.js, WebGPU with WASM fallback) — no server, no upload, zero cloud.
+that snaps to the object. Everything runs in the browser (SlimSAM plus a
+resource-gated Grounding DINO / OWLv2 detector via transformers.js, WebGPU with
+WASM fallback) — no server, no upload, zero cloud.
+
+**Privacy:** images, prompts, masks and all inference stay on this device.
+There is no upload endpoint and the offline verify phase proves selection and
+export work with the network physically cut.
 
 ## Run
 
@@ -12,92 +17,108 @@ bun run dev          # any static server works; this is python3 -m http.server
 # open http://127.0.0.1:8788
 ```
 
-First selection downloads ~14 MB of model files once (browser-cached after).
-The first **Text** search downloads the OWLv2 detector (~163 MB, q8) once; it
-runs on-device and is never uploaded.
+Nothing downloads at startup. The first image import warms SlimSAM (~14 MB,
+one-time, browser-cached). The first **Text** search uses Grounding DINO Tiny
+(~151 MB q4f16) on a confirmed accelerated WebGPU device; otherwise it uses
+the OWLv2 WASM fallback (~163 MB q8). Both run on-device and are never
+uploaded.
 
-> On 8 GB machines the detector deliberately runs on WASM, not WebGPU. OWLv2
-> infers at a fixed 960² whatever you feed it, and the fp16 WebGPU session pins
-> enough unified memory to wedge the whole host — see `detectorWebGPU` in
-> `js/policy.js`. Searches are slower there; the machine stays usable.
+## 8 GB Safe Mode (the default)
 
-## Device-adaptive images and GPU use
+Browsers privacy-round `navigator.deviceMemory` and cap it at 8 GB, so a
+plain browser tab can never prove more than 8 GB. SEGLAB therefore treats
+every browser-reported or unknown memory budget as an 8 GB machine and locks
+the **lite** profile:
 
-SEGLAB separates memory budgeting from GPU acceleration. It asks WebGPU for a
-high-performance adapter, so a browser that exposes an RTX-class GPU or Apple
-GPU runs inference there; it falls back to WASM when WebGPU is unavailable.
-Small images use a native interaction frame (no proxy). Large images retain
-only compressed source bytes and use bounded proxy, crop, and export canvases,
-so a full DSLR frame is never held resident as decoded RGBA just for editing.
+| Setting | lite value |
+| --- | --- |
+| Interaction proxy | **≤ 768 px long edge** — every import path (JPEG/PNG/WebP/AVIF/HEIF/TIFF/GIF/BMP/RAW preview/paste/drop) |
+| Model | **SlimSAM only** — the SAM3 flagship lane never loads, downloads, or upgrades |
+| Embeddings | exactly **one** resident, current image only, no OPFS/IndexedDB persistence, no speculative encode before the first selection |
+| Detector | Grounding DINO q4f16 only when accelerated WebGPU is confirmed; otherwise OWLv2 WASM/q8. Loads on a real Text query and is disposed immediately after boxes |
+| Escalation | no automatic native-crop escalation, no HD crop re-decode |
+| Export | explicit user action, capped at **4096 px / 8 MP** (a larger source exports reduced, with a status note) |
+| Working copy | ≤ 1280 px bounded re-decode source on unbounded-decode hosts |
 
-The standalone web build uses these conservative budgets:
+Safety precedence is: **hard device limit > memory pressure > URL parameter >
+feature request**. `?flagship=1` has no effect on any device: the retired
+SAM3 path cannot be re-enabled. On a locked budget, `?profile=ultra`,
+`?proxy=max`, `?proxy=off` and `?working=1` are also refused; parameters may
+only lower limits (`?proxy=512`, `?escalate=0`, `?force=wasm`).
 
-| Usable memory evidence | Profile | Proxy | Bounded export |
-| --- | --- | --- | --- |
-| Confirmed under 8 GB (including 4 GB) | Lite | 768 px | 8 MP |
-| Browser-reported 8 GB | Standard | 1024 px | 24 MP |
-| Memory unavailable to the browser | Standard-safe | 1024 px | 16 MP |
-| Trusted Phosmith 12–23 GB budget | Pro | 1280 px | 36 MP |
-| Trusted Phosmith 24 GB+ budget | Ultra | 1536 px | 64 MP |
+## DSLR upload handling
 
-Browsers intentionally round `navigator.deviceMemory` and cap it at 8 GB, and
-do not provide dependable VRAM. Therefore an ordinary tab cannot safely tell a
-16 GB M1 from a 24 GB M-series device, or confirm an RTX 4090's VRAM. It still
-uses WebGPU when available, but only a trusted host is allowed to increase
-memory allocations beyond the Standard profile.
+The original photo is retained as its **compressed Blob only** — never as a
+full-resolution `ImageData`, canvas, RGBA buffer or data URL. A dedicated
+decode worker parses the header (dimensions + EXIF from the first 512 KB) and
+decodes **straight to the bounded proxy**: `ImageDecoder` with desired output
+dimensions where the browser supports it, `createImageBitmap` resize
+otherwise. On hosts that can only full-raster-decode (Safari has no
+`ImageDecoder`), that one unavoidable decode also re-encodes a small bounded
+working copy, then the full raster is closed immediately. Crops and exports
+re-decode only the bounded region they need.
 
-### About “256 × 256” masks
+## One heavy job at a time
 
-The normal browser profile already uses a **1024 px interaction frame**; Lite
-uses 768 px, while a trusted larger-memory host can use 1280 or 1536 px. The
-`256 × 256` figure is SlimSAM's internal decoder-mask resolution, not the
-uploaded-photo or encoder resolution. The model sees the interaction frame,
-then its mask is restored to that frame and snapped to real image edges before
-display/export. `?proxy=512` is available for a deliberately lighter preview;
-increasing it beyond 1024 improves click and edge-guide precision, but cannot
-invent model detail because SlimSAM itself encodes at a 1024 px long edge.
+`js/heavy-job-queue.js` owns every memory-heavy operation — proxy decode,
+model warm, image encode, prompt decode, detector runs, wasm refinement,
+export re-decodes — at concurrency 1, so their peak allocations can never
+stack. Import decode outranks model work; user interaction outranks
+speculative prewarm; a new upload or click invalidates queued stale jobs; a
+rejected job releases ownership in `finally`.
 
-For an upright large JPEG on a browser with WebCodecs, import now asks
-`ImageDecoder` to decode directly to that bounded interaction size. The source
-remains compressed bytes until a bounded crop/export operation needs it, which
-avoids the otherwise common full-DSLR-raster spike during import.
+Model loading is **lazy**: nothing warms until the proxy is on screen, and
+the first selection encodes exactly one embedding for the current document.
 
-### Phosmith host contract
+## C++/WebAssembly mask refinement
 
-Before loading `app.js`, a Phosmith WebView can inject a usable editor budget
-(not merely installed RAM). This lets the host account for other active apps:
+`cpp/cv_refine.cpp` compiles to a compact SIMD wasm module (~12 KB, fixed
+16 MiB heap, no growth, no threads/SharedArrayBuffer) that runs seeded
+connected-component cleanup, bounded hole fill, min-area small-object removal
+and binary open/close on the **one-channel ≤768 px mask** inside its own
+worker. It lazy-loads on the first refinement, transfers buffers (never
+copies), rejects dimensions above 768 px, and on any failure the model's own
+mask is kept — no retries, no fallback CV library. WebAssembly is
+browser-native sandboxed code, not an arbitrary executable; and a worker
+isolates lifecycle/responsiveness — it does **not** add system memory budget.
+
+Build it from a clean checkout with Emscripten on PATH:
+
+```bash
+./scripts/build-cv-wasm.sh    # emits public/wasm/cv-refine.{js,wasm}
+```
+
+Browsers without wasm SIMD (or with the module unavailable) keep the existing
+JavaScript post-pipeline — feature loss is quality-polish only.
+
+## Trusted-host budgets (Phosmith)
+
+Only a trusted native host can raise the profile past lite, by injecting a
+usable editor budget before `app.js` loads:
 
 ```js
 window.__PHOSMITH_DEVICE_RESOURCES__ = {
   memoryBudgetGB: 24,       // editor headroom: 4 / 8 / 16 / 24 …
-  vramGB: 24,               // optional; useful for host telemetry
-  gpuName: 'RTX 4090',      // optional display/diagnostics label
+  vramGB: 24,               // optional
+  gpuName: 'RTX 4090',      // optional label
   mode: 'balanced',         // 'conservative' | 'balanced' | 'performance'
-  allowFlagship: true,      // explicit consent to preload the optional SAM3 lane
 }
 ```
 
-To react to an OS memory warning, replace the value and dispatch an event. The
-new budget governs subsequent imports, native re-decodes, and exports; it never
-enlarges already-allocated canvases in place. A lower budget immediately retires
-the optional flagship GPU session and its embeddings.
+12–23 GB earns **pro** (1280 px proxy, native HD export, auto escalation,
+OPFS embedding persistence), 24 GB+ earns **ultra**. These budgets can expand
+bounded proxy/export settings only; segmentation remains SlimSAM-only and
+`?flagship=1` is ignored. Live updates via the
+`phosmithresourceschange` event only shrink or grow **future** allocations;
+memory pressure is a one-way ratchet.
 
-```js
-window.__PHOSMITH_DEVICE_RESOURCES__ = { memoryBudgetGB: 8, mode: 'conservative' }
-window.dispatchEvent(new CustomEvent('phosmithresourceschange', {
-  detail: window.__PHOSMITH_DEVICE_RESOURCES__,
-}))
-```
+## About “256 × 256” masks
 
-`allowFlagship` is deliberately explicit: hardware detection alone never starts
-a ~300 MB model download or reserves that GPU memory. JPEG, PNG, WebP, AVIF/
-HEIF, TIFF, GIF, BMP, and common camera RAW containers are accepted; RAW files
-use their embedded developed JPEG preview for on-device masking.
-
-`?proxy=off` requests a native frame, but it is deliberately refused for large
-files and falls back to the selected device-safe cap instead of risking a tab
-crash. A runtime pressure ladder releases the detector, flagship embeddings,
-and then the optional flagship session before lowering future canvas limits.
+`256 × 256` is SlimSAM's internal decoder-mask resolution, not the image
+resolution. The model sees the ≤768 px interaction frame; its mask is
+restored to that frame and snapped to real image edges before display/export.
+A larger proxy cannot invent model detail because SlimSAM encodes at a
+1024 px long edge internally.
 
 ## Controls
 
@@ -106,25 +127,41 @@ and then the optional flagship session before lowering future canvas limits.
 - **Lasso** — draw a rough loop; it snaps to the object and can never bleed outside the loop
 - **Region** — draw an exact freehand mask; it selects the drawn area, not the object inside it
 - **Rect / Ellipse / Polygon** — direct marquee masks; polygon closes with double-click or `Enter`
-- **Magic / Color** — select a contiguous colour region or all matching colours; use Tolerance to tune the match
+- **Magic / Color** — select a contiguous colour region or all matching colours. Tolerance is the allowed RGB colour distance: start at **36**; lower it (16–28) for a crisp edge, raise it (45–60) only to include shadows/highlights. It never affects Text mode.
 - **Brush** — paint a mask; right-click or Alt paints an erase stroke
-- **Text** — describe an object; the first search downloads the detector (~163 MB)
-  and says so before it starts
+- **Text** — describe an object; the first search downloads a ~151 MB accelerated detector or ~163 MB portable fallback.
+  Grounding DINO/OWLv2 return candidates, so results are not a
+  guarantee that every instance in a crowded scene is found. Colour-qualified
+  prompts also rank boxes using local colour evidence. If it cannot load within
+  the safe memory profile, text
+  selection reports itself unavailable instead of retrying heavier backends
 - `Z` undo · `R` reset · **Cutout PNG** downloads the selection with transparency
 
 ## Verify (headless)
 
 ```bash
-bun verify.mjs   # drives the real app in headless Chromium, asserts on known answers
+bun verify.mjs   # policy/sizing/queue/embedding/wasm/static suites + real app in headless Chromium
 ```
+
+## Browser compatibility
+
+- **Chromium**: `ImageDecoder` bounded decode, WebGPU where exposed, wasm SIMD.
+- **Safari 16.4+**: no `ImageDecoder` → `createImageBitmap` + one-time bounded
+  working copy; wasm SIMD supported; WebGPU per OS version, WASM fallback.
+- **No SIMD / old browsers**: wasm refinement silently off; JS pipeline serves.
+- No COOP/COEP, `SharedArrayBuffer` or threads are required.
 
 ## Architecture
 
-- `js/sam-core.js` — pure prompt/mask math (no DOM, no ML deps)
-- `js/sam-engine.js` — SlimSAM inference; encode-once/decode-per-click embedding cache; WebGPU→WASM sticky fallback
-- `js/sam-worker.js` — dedicated worker so inference never blocks the UI
-- `js/sam-client.js` — main-thread API; sticky inline fallback if the worker dies
-- `js/app.js` — interface: prompts, lasso→prompt conversion + clamp, overlay, cutout
-- `js/detect-engine.js` — on-device OWLv2 text detector; disposable, device ladder from policy
+- `js/heavy-job-queue.js` — ONE memory-heavy job at a time (priorities, revisions, cancellation)
+- `js/proxy-plan.js` — the single authoritative ≤768 px proxy-sizing function
+- `js/decode-worker.js` / `decode-client.js` / `decode-core.js` — bounded image decode off the UI thread
+- `js/asset-store.js` — blob-only custody of the original; bounded crop/export re-decodes
+- `js/sam-engine.js` / `sam-worker.js` / `sam-client.js` — SlimSAM inference; encode-once/decode-per-click; one-embedding lite lifecycle
+- `js/cv-refine-worker.js` / `cv-refine-client.js` + `cpp/cv_refine.cpp` — wasm mask cleanup
+- `js/detect-engine.js` / `detect-worker.js` — disposable, resource-gated text detector
+- `js/policy.js` / `capability.js` — locked lite budgets, trusted-host tiers, pressure ladder
+- `js/app.js` — UI, prompts, overlay, export orchestration
 
-Next lanes (same `segment()` contract): SAM3/EfficientSAM3 flagship tier, text prompts.
+A future experimental scripting/plugin panel is documentation-only; no Python
+runtime (Pyodide/PyScript/etc.) and no full OpenCV.js ship in this app.

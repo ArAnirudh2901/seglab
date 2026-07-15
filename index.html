@@ -97,6 +97,9 @@
         font-size: 12px;
         white-space: nowrap;
     }
+    /* The class sets a display mode, so explicitly preserve the platform's
+       hidden contract when Text (or another non-colour mode) hides it. */
+    .tolerance[hidden] { display: none; }
     .tolerance input { accent-color: var(--accent); width: 84px; }
     .tolerance output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 20px; }
 
@@ -245,7 +248,7 @@
         <button id="mode-text" title="Describe the object in words — runs a local detector">Text</button>
     </div>
     <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
-    <label id="tolerance-wrap" class="tolerance" hidden>Tolerance <input id="tolerance" type="range" min="8" max="160" value="72"><output id="tolerance-value">72</output></label>
+    <label id="tolerance-wrap" class="tolerance" hidden title="Colour distance for Magic and Color only — it does not change Text detection">Tolerance <input id="tolerance" type="range" min="8" max="160" value="36"><output id="tolerance-value">36</output></label>
     <input id="textinput" class="textinput" type="text" placeholder="describe an object — e.g. “the red car”, “all bottles”" hidden>
     <button id="selectall" class="small" hidden title="Select every match">Select all</button>
     <div class="spacer"></div>

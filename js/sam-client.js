@@ -9,11 +9,12 @@
  *
  * Forwards the engine's broadcasts to subscribers:
  *   {type:'progress', detail:{lane, file, loaded, total, ...}}  downloads
- *   {type:'lane', label}   flagship hot-swap (app replays prompts on this)
+ *   {type:'lane', label}   retained protocol field; SlimSAM is the only lane
  *   {type:'state'}         device/lane/timing chips should re-render
  */
 
 import { summarizeMaskRGBA, validateClickMask } from './sam-core.js'
+import { enqueueHeavy, cancelHeavyBefore, STALE } from './heavy-job-queue.js'
 
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
@@ -30,7 +31,7 @@ const withTimeout = (promise, ms, label) =>
 export const clientState = {
     device: null,   // 'webgpu' | 'wasm' once known (as reported by the engine)
     mode: null,     // 'worker' | 'inline' once decided
-    lane: null,     // 'slimsam' | 'sam3' — which model served the last result
+    lane: null,     // 'slimsam' — the only interactive segmentation lane
     ready: false,
     lastRun: null,  // { encodeMs, decodeMs, postMs, encoded, score, ms, lane }
 }
@@ -101,7 +102,7 @@ const getWorker = () => {
                 workerGeneration += 1
                 console.warn('[seglab] worker crashed; restarting it fresh:', event?.message)
                 warmPromise = null
-                if (lastWarm) warmUp({ ...lastWarm, flagship: false }).catch(() => {})
+                if (lastWarm) warmUp(lastWarm).catch(() => {})
             } else {
                 console.warn('[seglab] worker crashed repeatedly; switching to inline engine:', event?.message)
                 workerGeneration += 1
@@ -140,6 +141,7 @@ const getInlineEngine = async () => {
  * stale result can never commit.
  */
 export const cancelBefore = (revision) => {
+    cancelHeavyBefore(revision) // queued-but-unstarted heavy jobs drop first
     if (worker) {
         try { worker.postMessage({ op: 'cancel', payload: { before: revision } }) } catch { /* dying worker */ }
     }
@@ -188,16 +190,20 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
         // Inline: nothing transferred, so the frame's pixels are still ours —
         // they fall out of scope with the payload.
         const det = await import('./detect-engine.js')
+        const candidates = engine.detectorCandidates()
+        if (candidates.some((candidate) => candidate.detector === 'grounding')) engine.releaseDocument()
         return withTimeout(det.detect({
             frame: payload.frame,
             labels: payload.labels,
             threshold: payload.threshold,
-            candidates: engine.detectorCandidates(),
+            candidates,
             dispose: engine.getBudget().detectorDispose === 'now',
             progress_callback: (info) => onEngineEvent({ type: 'progress', detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total } }),
         }), timeoutMs, label)
     }
     if (op === 'pressure') return { freed: await engine.relievePressure(payload?.level || 1) }
+    if (op === 'releaseDocument') { engine.releaseDocument(); return engine.getEngineState() }
+    if (op === 'state') return engine.getEngineState()
     throw new Error(`Unknown op: ${op}`)
 }
 
@@ -205,9 +211,12 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
 
 let warmPromise = null
 let lastWarm = null // remembered so a restarted worker re-warms with the same budget
-let warmUpgradePromise = null
 
 const applyWarmState = (engineState) => {
+    if (!engineState || engineState.stale) {
+        warmPromise = null // cancelled before it ran; the next caller retries
+        return clientState
+    }
     trace('warm-ready', engineState)
     clientState.device = engineState?.device || clientState.device
     clientState.lane = engineState?.lane || clientState.lane
@@ -216,29 +225,14 @@ const applyWarmState = (engineState) => {
     return clientState
 }
 
-/** Download + compile the draft lane, then the flagship in the background
- *  (idempotent). `budget` is policy.js's resolved profile budget;
- *  `flagship:false` skips the background upgrade. */
-export const warmUp = ({ flagship = true, budget = null } = {}) => {
-    if (warmPromise) {
-        // Startup intentionally begins with the conservative provisional
-        // budget. A trusted host can authorize SAM3 only after the capability
-        // probe finishes; preserve that late upgrade without restarting the
-        // already-ready draft model.
-        const needsFlagshipUpgrade = flagship && !!budget?.flagship && !lastWarm?.budget?.flagship
-        if (!needsFlagshipUpgrade) return warmPromise
-        warmUpgradePromise ??= warmPromise
-            .then(() => {
-                lastWarm = { flagship, budget }
-                return call('warm', { flagship, budget }, null, LOAD_TIMEOUT_MS, 'model upgrade')
-            })
-            .then(applyWarmState)
-        warmUpgradePromise.catch(() => { warmUpgradePromise = null })
-        return warmUpgradePromise
-    }
-    trace('warm-start', { flagship, profile: budget?.profile })
-    lastWarm = { flagship, budget }
-    warmPromise = call('warm', { flagship, budget }, null, LOAD_TIMEOUT_MS, 'model load')
+/** Download and compile SlimSAM after an interaction proxy is visible.
+ *  There is intentionally no model-upgrade branch: a second segmentation
+ *  model would violate the bounded 8 GB interaction contract. */
+export const warmUp = ({ budget = null } = {}) => {
+    if (warmPromise) return warmPromise
+    trace('warm-start', { model: 'slimsam', profile: budget?.profile })
+    lastWarm = { budget }
+    warmPromise = enqueueHeavy('model-warm', () => call('warm', { budget }, null, LOAD_TIMEOUT_MS, 'SlimSAM model load'))
         .then(applyWarmState)
     warmPromise.catch(() => { warmPromise = null })
     return warmPromise
@@ -277,7 +271,7 @@ const contentKey = (canvas) => {
  *           clampPoly?: Array<[number, number]>|null, clampMargin?: number,
  *           revision?: number }} prompts
  */
-export const segment = async (canvas, { clicks = [], box = null, clampPoly = null, clampMargin = 0, revision } = {}) => {
+export const segment = async (canvas, { clicks = [], box = null, clampPoly = null, clampMargin = 0, revision, budget = null } = {}) => {
     const startedAt = Date.now()
     if (!canvas?.width || !canvas?.height) throw new Error('Selection source has no usable dimensions')
     if ((!clicks || clicks.length === 0) && !box) throw new Error('No clicks or box to select with')
@@ -287,26 +281,28 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     const buildPayload = async () => {
         // The bitmap transfers zero-copy into the worker; the worker closes it.
         const source = await createImageBitmap(canvas)
-        return { payload: { imageKey, source, clicks, box, clampPoly, clampMargin, revision }, transfer: [source] }
+        return { payload: { imageKey, source, clicks, box, clampPoly, clampMargin, revision, budget }, transfer: [source] }
     }
 
-    let result
-    const gen = workerGeneration
-    try {
-        const { payload, transfer } = await buildPayload()
-        result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection')
-    } catch (err) {
-        console.error('[seglab][client] segment-request-failed', err)
-        // The click that DISCOVERS a dead worker must not fail: its bitmap
-        // died with the worker, so rebuild and retry once — call() routes to
-        // the restarted worker (or inline after repeated deaths).
-        if (workerGeneration === gen) throw err
-        console.warn('[seglab] retrying selection after worker crash')
-        const { payload, transfer } = await buildPayload()
-        result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection (retry)')
-    }
+    // One heavy job: a selection can never overlap a decode/refine/export.
+    const result = await enqueueHeavy('segment', async () => {
+        const gen = workerGeneration
+        try {
+            const { payload, transfer } = await buildPayload()
+            return await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection')
+        } catch (err) {
+            console.error('[seglab][client] segment-request-failed', err)
+            // The click that DISCOVERS a dead worker must not fail: its bitmap
+            // died with the worker, so rebuild and retry once — call() routes
+            // to the restarted worker (or inline after repeated deaths).
+            if (workerGeneration === gen) throw err
+            console.warn('[seglab] retrying selection after worker crash')
+            const { payload, transfer } = await buildPayload()
+            return call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection (retry)')
+        }
+    }, { priority: 'high', revision: revision ?? null })
     // A cancelled job: no mask, no state churn — the caller just drops it.
-    if (result?.stale) return { stale: true, revision: result.revision }
+    if (result === STALE || result?.stale) return { stale: true, revision: result?.revision ?? revision }
     trace('segment-result', { revision, lane: result?.lane, encoded: result?.encoded, ms: Date.now() - startedAt })
     clientState.device = result.device || clientState.device
     clientState.lane = result.lane || clientState.lane
@@ -360,8 +356,11 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
 export const encodeImage = async (canvas, { revision } = {}) => {
     if (!canvas?.width || !canvas?.height) return null
     const imageKey = contentKey(canvas)
-    const source = await createImageBitmap(canvas)
-    return call('encode', { imageKey, source, revision }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
+    const result = await enqueueHeavy('encode-prewarm', async () => {
+        const source = await createImageBitmap(canvas)
+        return call('encode', { imageKey, source, revision }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
+    }, { priority: 'idle', revision: revision ?? null })
+    return result === STALE ? { stale: true, revision } : result
 }
 
 /**
@@ -372,21 +371,39 @@ export const encodeImage = async (canvas, { revision } = {}) => {
  * or { stale:true }.
  */
 export const hdExport = async (payload, transfer) => {
-    const result = await call('hdExport', payload, transfer, INFER_TIMEOUT_MS, 'HD export')
-    if (result?.stale) return { stale: true }
+    const result = await enqueueHeavy(
+        'export-refine',
+        () => call('hdExport', payload, transfer, INFER_TIMEOUT_MS, 'HD export'),
+        { priority: 'high', revision: payload?.revision ?? null },
+    )
+    if (result === STALE || result?.stale) return { stale: true }
     const alpha = result.alpha instanceof Uint8ClampedArray ? result.alpha : new Uint8ClampedArray(result.alpha)
     return { alpha, width: result.width, height: result.height, decoded: result.decoded, lane: result.lane }
 }
 
-/** OWLv2 detection over `frame` — { data, width, height } RGB bytes, already
- *  letterboxed into the detector's square. The pixels transfer (no copy, and
- *  `frame.data` is detached here). Returns { dets:[{box,score,label}] with
- *  boxes normalized [0,1] against the square, backend }. */
-export const detectText = async (frame, labels, { threshold = 0.05 } = {}) =>
-    call('detect', { frame, labels, threshold }, [frame.data.buffer], INFER_TIMEOUT_MS, 'Text detection')
+/** Resource-gated text detection over `frame` — { data, width, height } RGB
+ *  bytes, already letterboxed into the detector's square. The pixels transfer
+ *  (no copy, and `frame.data` is detached here). Returns
+ *  { dets:[{box,score,label}] with boxes normalized [0,1] against the square,
+ *  backend }. The detector never coexists with another heavy job — it queues
+ *  like everything else. */
+export const detectText = async (frame, labels, { threshold = 0.05, revision = null } = {}) => {
+    const result = await enqueueHeavy(
+        'detect',
+        () => call('detect', { frame, labels, threshold }, [frame.data.buffer], INFER_TIMEOUT_MS, 'Text detection'),
+        { priority: 'normal', revision },
+    )
+    if (result === STALE) return { dets: [], backend: null, stale: true }
+    return result
+}
 
-/** Free heavy GPU residents under memory pressure (M4 ladder). Returns the
- *  list of what was freed. Level 1 detector · 2 +flagship embeddings · 3 +session. */
+/** Drop every embedding for the outgoing document (model weights stay). */
+export const releaseDocument = () => call('releaseDocument', {}, null, 30_000, 'release document').catch(() => null)
+
+/** Engine residency snapshot (verify/debug): { cachedImages, lane, … }. */
+export const engineState = () => call('state', {}, null, 30_000, 'engine state')
+
+/** Free reloadable residents under memory pressure. */
 export const relievePressure = async (level = 1) => {
     const res = await call('pressure', { level }, null, INFER_TIMEOUT_MS, 'relieve pressure')
     return res?.freed || []

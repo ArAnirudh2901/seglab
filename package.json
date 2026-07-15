@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "dev": "python3 -m http.server 8788 --bind 127.0.0.1",
-    "verify": "bun verify.mjs"
+    "verify": "bun verify.mjs",
+    "build:wasm": "./scripts/build-cv-wasm.sh"
   },
   "devDependencies": {
     "playwright": "^1.61.1"

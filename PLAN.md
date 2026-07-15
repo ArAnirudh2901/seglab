@@ -1,5 +1,53 @@
 # SEGLAB — Full Plan (merged with Phosmith Offline Pro)
 
+## 2026-07-15 — 8 GB client-side memory-safe architecture rewrite (SHIPPED)
+
+The upload→selection path is now hard-bounded for an 8 GB (or unproven)
+machine. Default architecture: compressed Blob → dedicated bounded decode
+worker → ≤768 px proxy → SlimSAM only → single segmentation worker → optional
+C++/wasm SIMD refinement → 1-channel Uint8 mask → UI render. All heavy
+operations serialize through one shared queue (`js/heavy-job-queue.js`).
+
+Invariant: uploading and selecting from a DSLR image never causes concurrent
+full-size decoding, heavyweight model init, model upgrades, detector loading,
+full-resolution crop escalation, or unbounded wasm allocation.
+
+Phased delivery (all landed together, each gated in `verify.mjs`):
+
+| Phase | Content | Status |
+|---|---|---|
+| M0 | Locked lite policy: 8 GB/unknown ⇒ lite; unsafe URL flags refused; SlimSAM-only segmentation | ✅ |
+| M1 | Shared heavy-job queue (concurrency 1, priorities, revision cancel) + serialized decode/model lifecycle; lazy model warm (post-proxy) | ✅ |
+| M2 | Dedicated bounded decode worker (header parse + `ImageDecoder`/`createImageBitmap` resize + working copy), transferables | ✅ |
+| M3 | One-embedding SlimSAM lifecycle: single resident entry with disposal, `releaseDocument` on import, no OPFS persistence and no pre-selection encode in lite | ✅ |
+| M4 | C++/wasm seeded cleanup, bounded hole fill, min-area removal, open/close (SIMD, fixed 16 MiB heap, 768 px cap, own worker) | ✅ |
+| M5 | Benchmarks (structured queue/decode logs) + memory-contract verify suites (policy, sizing, queue, embedding, wasm, static scans) | ✅ |
+| M6 | Optional edge-band refinement in wasm — only after profiling shows the JS guided filter is hot | ⏸ deferred |
+| M7 | Optional ROI-only GrabCut — only if measurements show need | ⏸ deferred |
+
+Notable policy pivots vs the earlier roadmap (superseding the 2026-07-12/15
+amendments below): browser-reported 8 GB now resolves **lite** (was
+standard); SAM3/flagship has been retired from the interactive editor, so no
+host hint or URL can cause a second segmentation-model download, compile,
+cache, or upgrade; OPFS embedding persistence and encode-at-import are
+trusted-host features (lite forbids both); lite export is capped 4096 px/8 MP;
+the working copy is budget-sized (lite 1280 px). Higher trusted profiles may
+raise bounded proxy/export limits but still use SlimSAM only.
+
+Worker note: workers isolate lifecycle and keep the UI thread responsive —
+they do NOT multiply the machine's memory budget. WebAssembly here is
+browser-native sandboxed code with a fixed 16 MiB linear memory, not an
+arbitrary native executable.
+
+---
+
+## Archived pre-rewrite roadmap (superseded)
+
+The remaining record preserves earlier project decisions and benchmark history.
+It is not the current architecture: any references below to SAM3/flagship,
+multiple segmentation lanes, automatic upgrades, or unrestricted native export
+were superseded by the 2026-07-15 8 GB-safe rewrite above.
+
 **Goal:** browser-only, zero-cloud, any-device segmentation that matches top-tier
 product quality (Samsung AI-Eraser / Meta demo class). Free to build and run.
 Select anything in a photo via **clicks (±) / box / lasso / text**, get a

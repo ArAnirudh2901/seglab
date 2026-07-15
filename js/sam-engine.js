@@ -1,5 +1,5 @@
 /**
- * sam-engine — two-lane on-device segmentation, worker/main agnostic
+ * sam-engine — SlimSAM on-device segmentation, worker/main agnostic
  * --------------------------------------------------------------------
  * The actual transformers.js inference. Environment-agnostic (no DOM
  * elements, no `window`): accepts ImageBitmap/canvas sources and uses
@@ -7,24 +7,16 @@
  * (sam-worker.js — the production path) or inline on the main thread
  * (sam-client.js's fallback when worker construction fails).
  *
- * TWO LANES, one contract:
- *   draft    — SlimSAM-77 (Apache-2.0, ~14 MB): loads in seconds, runs
- *              everywhere down to plain WASM. Always available first.
- *   flagship — SAM3-tracker q4f16 (SAM License, ~300 MB): Meta-demo-grade
- *              masks. WebGPU only; downloaded IN THE BACKGROUND after the
- *              draft lane is serving, hot-swapped in when ready (the 'lane'
- *              event lets the app replay current prompts at the higher
- *              quality). Browser-cached after the first download.
- *
- * Architecture — encode once, decode per interaction:
- * Both lanes split into a heavy image encoder (run ONCE per image, cached
- * per content key per lane) and a small prompt decoder (run per
- * interaction, tens of ms) — that's what makes live refinement instant.
+ * SlimSAM-77 (Apache-2.0, ~14 MB) is the sole model lane. It is lazy-loaded
+ * only after the bounded interaction proxy is visible, then encodes once per
+ * document and prompt-decodes on every interaction. A second segmentation
+ * model is deliberately absent: no upgrade/download/compile/cache may add a
+ * competing heavyweight allocation to the upload-selection path.
  *
  * Every decoded mask then goes through the shared post pipeline:
  *   lasso clamp → seeded component cleanup + hole fill (sam-core) →
  *   guided-filter edge-band refinement against the photo (edge-refine).
- * The pipeline is model-agnostic: it upgrades both lanes.
+ * The pipeline stays bounded to the active document and interaction proxy.
  */
 
 import {
@@ -48,24 +40,13 @@ const LANES = {
         model: 'Xenova/slimsam-77-uniform',
         cls: 'SamModel',
         options: {},
-        // Embeddings ~8.4 MB/image → 6 keeps a session decoder-only in ~50 MB.
-        cacheMax: 6,
-    },
-    flagship: {
-        label: 'sam3',
-        model: 'onnx-community/sam3-tracker-ONNX',
-        cls: 'Sam3TrackerModel',
-        // q4f16 = the 297 MB + 5.4 MB variant (quality-gated in the plan).
-        options: { dtype: 'q4f16' },
-        // Multi-level embeddings ~33 MB/image → keep 2 (~66 MB).
-        cacheMax: 2,
+        cacheMax: 1,
     },
 }
 
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
 const PROGRESS_THROTTLE_MS = 120
-const FLAGSHIP_SETTLE_MS = 3000 // breathing room between draft burst and the 300 MB lane
 
 const withTimeout = (promise, ms, label) =>
     new Promise((resolve, reject) => {
@@ -76,23 +57,20 @@ const withTimeout = (promise, ms, label) =>
         )
     })
 
-// Standard-equivalent default; policy.js overrides via warm({ budget }).
-// flagship stays off unless a budget opts in (?flagship=1) — see policy.js header.
+// A budget-less engine assumes the 8 GB safe profile; policy.js overrides
+// bounded sizes and optional features through warm({ budget }).
 const DEFAULT_BUDGET = {
-    profile: 'standard',
-    flagship: false,
-    draftCacheMax: 4,
-    flagshipCacheMax: 2,
+    profile: 'lite',
+    draftCacheMax: 1,
     forceWasm: false,
-    detectorWebGPU: false,   // opt-in per profile; a budget-less engine never builds the heavy detector
+    detectorWebGPU: false,
+    embedPersist: false,
 }
 
 const state = {
     device: null,            // 'webgpu' | 'wasm' once known
     forcedWasm: false,       // sticky downgrade after a WebGPU runtime failure
-    ready: false,            // draft lane serving
-    flagship: 'idle',        // 'idle' | 'loading' | 'ready' | 'failed' | 'unavailable'
-    flagshipEpoch: 0,        // invalidates a background load after memory shedding
+    ready: false,            // SlimSAM serving
     obsoleteBefore: 0,       // jobs with revision < this must not commit (cancel op)
     budget: { ...DEFAULT_BUDGET },
 }
@@ -115,13 +93,13 @@ const serialize = (fn) => {
 }
 
 let transformersPromise = null
-const bundles = { draft: null, flagship: null }
+const bundles = { draft: null }
 
 /** `${lane}:${imageKey}` → { embeddings, original_sizes, reshaped_input_sizes, gray, w, h } */
 const embedCache = new Map()
 
 // Event sink — the worker shell points this at postMessage; the inline
-// fallback points it at the client's emitter. Events: {type:'progress'|'lane'}.
+// fallback points it at the client's emitter. Events: {type:'progress'}.
 let eventSink = null
 export const setEventSink = (fn) => { eventSink = fn }
 let lastProgressAt = 0
@@ -135,28 +113,22 @@ const emitEvent = (event) => {
     try { eventSink(event) } catch { /* sink gone */ }
 }
 
-const activeLaneKey = () => (state.flagship === 'ready' ? 'flagship' : 'draft')
+const activeLaneKey = () => 'draft'
 
 export const getBudget = () => ({ ...state.budget })
 
-// OWLv2 [device,dtype] fallback ladder. WebGPU is offered ONLY on profiles with
-// the headroom for it: OWLv2 runs at a fixed 960² regardless of input canvas, so
-// on 8 GB unified memory the fp16 WebGPU session pinned the GPU near 100% and
-// wedged the whole machine — not just the tab. Small profiles therefore go
-// straight to wasm/q8 (163 MB): slower per search, but it can't hang the host.
+// Text-detector production lane. Grounding DINO Tiny is intentionally absent:
+// its current ONNX export's Gather_11 expects a rank-3 phrase-token tensor,
+// whereas transformers.js uses the standard rank-2 zero-shot representation.
+// OWLv2/WASM is slower but compatible and never enters that broken graph.
 export const detectorCandidates = () => {
-    const heavyOk = state.budget.detectorWebGPU && !state.forcedWasm && state.device === 'webgpu'
-    const list = []
-    if (heavyOk) list.push(['webgpu', 'fp16'])
-    list.push(['wasm', 'q8'])
-    return list
+    return [{ detector: 'owl', device: 'wasm', dtype: 'q8' }]
 }
 
 export const getEngineState = () => ({
     device: state.device,
     forcedWasm: state.forcedWasm,
     ready: state.ready,
-    flagship: state.flagship,
     lane: LANES[activeLaneKey()].label,
     profile: state.budget.profile,
     cachedImages: embedCache.size,
@@ -200,21 +172,18 @@ const pickDevice = async () => {
     return device
 }
 
-const loadBundle = (laneKey) => {
-    if (bundles[laneKey]) return bundles[laneKey]
-    const lane = LANES[laneKey]
-    bundles[laneKey] = (async () => {
+const loadBundle = () => {
+    if (bundles.draft) return bundles.draft
+    const lane = LANES.draft
+    bundles.draft = (async () => {
         const transformers = await loadTransformers()
         const Cls = transformers[lane.cls]
         if (!Cls) throw new Error(`${lane.cls} is missing from this transformers.js build`)
         const device = await pickDevice()
-        if (laneKey === 'flagship' && device !== 'webgpu') {
-            throw new Error('flagship lane requires WebGPU')
-        }
         const progress_callback = (info) => emitEvent({
             type: 'progress',
             detail: {
-                lane: laneKey,
+                lane: 'draft',
                 status: info?.status,
                 file: info?.file,
                 progress: info?.progress,
@@ -225,98 +194,30 @@ const loadBundle = (laneKey) => {
         const [model, processor] = await withTimeout(
             Promise.all([
                 Cls.from_pretrained(lane.model, { device, progress_callback, ...lane.options })
-                    // Draft may retry deviceless (tiny model, WASM is fine);
-                    // flagship never silently falls to WASM — 300 MB there
-                    // would be an unusable lane, not a fallback.
-                    .catch((err) => {
-                        if (laneKey === 'flagship') throw err
-                        return Cls.from_pretrained(lane.model, { progress_callback, ...lane.options })
-                    }),
+                    // SlimSAM may retry deviceless; the bounded WASM lane is
+                    // the safe fallback when WebGPU initialization fails.
+                    .catch(() => Cls.from_pretrained(lane.model, { progress_callback, ...lane.options })),
                 transformers.AutoProcessor.from_pretrained(lane.model, { progress_callback }),
             ]),
             LOAD_TIMEOUT_MS,
             `${lane.label} model load`,
         )
-        return { model, processor, transformers, laneKey }
+        return { model, processor, transformers, laneKey: 'draft' }
     })()
-    bundles[laneKey].catch(() => {
-        // Draft load failures are retryable (transient network); flagship
-        // failure handling is owned by maybeStartFlagship / segment.
-        if (laneKey === 'draft') bundles.draft = null
-    })
-    return bundles[laneKey]
+    bundles.draft.catch(() => { bundles.draft = null })
+    return bundles.draft
 }
 
-/** Kick the background flagship download once the draft lane is serving. */
-const maybeStartFlagship = () => {
-    if (state.flagship !== 'idle') return
-    state.flagship = 'loading'
-    state.flagshipEpoch += 1
-    const epoch = state.flagshipEpoch
-    trace('flagship-start', { epoch })
-    const launch = async () => {
-        try {
-            // Drain queued jobs, settle, drain again: the 300 MB lane must
-            // never stack on the import burst (the historical 8 GB stall).
-            await jobChain.catch(() => {})
-            await new Promise((resolve) => setTimeout(resolve, FLAGSHIP_SETTLE_MS))
-            await jobChain.catch(() => {})
-            if (epoch !== state.flagshipEpoch || state.flagship !== 'loading') return
-            const device = await pickDevice()
-            if (device !== 'webgpu' || state.forcedWasm) {
-                state.flagship = 'unavailable'
-                return
-            }
-            // Browsers do not expose VRAM and deviceMemory tops out at 8 GB.
-            // On the 8 GB target, unload the disposable detector before the
-            // optional 300 MB flagship allocates GPU buffers. Text detection
-            // can lazily recreate its session when needed.
-            if ((state.budget.maxResidentHeavy || 1) <= 1) {
-                try { (await import('./detect-engine.js')).disposeDetector() } catch { /* detector was not loaded */ }
-            }
-            await loadBundle('flagship')
-            // A level-3 pressure event can arrive while the model downloads or
-            // compiles. Do not resurrect its large GPU session afterwards.
-            if (epoch !== state.flagshipEpoch || state.flagship !== 'loading') {
-                bundles.flagship = null
-                return
-            }
-            state.flagship = 'ready'
-            emitEvent({ type: 'lane', lane: 'flagship', label: LANES.flagship.label })
-        } catch (err) {
-            if (epoch !== state.flagshipEpoch) return
-            console.warn('[seglab] flagship lane unavailable:', err?.message)
-            state.flagship = 'failed'
-            bundles.flagship = null
-        }
-    }
-    launch()
-}
-
-/**
- * Warm the draft lane (download + compile), then start the flagship
- * download in the background. `budget` comes from policy.js on the main
- * thread (profiles, cache caps, lane gating); `flagship:false` remains the
- * data-saver / test escape hatch on top of whatever the budget says.
- */
-export const warm = async ({ flagship = true, budget = null } = {}) => {
-    trace('warm-start', { flagship, profile: budget?.profile })
+/** Warm SlimSAM only; all other segmentation-model paths are retired. */
+export const warm = async ({ budget = null } = {}) => {
+    trace('warm-start', { model: 'slimsam', profile: budget?.profile })
     if (budget) state.budget = { ...DEFAULT_BUDGET, ...budget }
     if (state.budget.forceWasm && !state.forcedWasm) {
         state.forcedWasm = true
         state.device = 'wasm'
     }
-    await loadBundle('draft')
+    await loadBundle()
     state.ready = true
-    if (flagship && state.budget.flagship) {
-        // The draft lane may have started under the safe provisional budget
-        // before a trusted host reports its larger allocation. Re-open only
-        // that deliberately deferred optional upgrade; a real failed lane
-        // remains sticky-failed and is never retried implicitly.
-        if (state.flagship === 'unavailable') state.flagship = 'idle'
-        maybeStartFlagship()
-    }
-    else if (state.flagship === 'idle') state.flagship = 'unavailable'
     const engineState = getEngineState()
     trace('warm-ready', engineState)
     return engineState
@@ -347,9 +248,11 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false, p
         embedCache.set(cacheKey, hit)
         return { entry: hit, encoded: false }
     }
-    // M5: revisit — document embeddings persist in OPFS across sessions.
-    // Crop keys stay memory-only (per-selection rects would churn the store).
-    const persistable = !ephemeral && imageKey.startsWith('doc:')
+    // Document embeddings persist in OPFS across sessions on trusted budgets
+    // only — the lite profile forbids persistence (packing duplicates tensor
+    // buffers, an avoidable peak on the upload-selection path). Crop keys
+    // stay memory-only.
+    const persistable = !ephemeral && imageKey.startsWith('doc:') && state.budget.embedPersist === true
     if (persistable) {
         const persisted = await loadEmbedding(cacheKey, bundle.transformers.Tensor)
         if (persisted) {
@@ -405,45 +308,66 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false, p
     return { entry, encoded: true, save: persistable ? () => saveEmbedding(cacheKey, entry) : null }
 }
 
-// Insert + per-lane LRU eviction, cap owned by the session budget.
+// Release an evicted entry's tensors where the runtime exposes disposal;
+// otherwise dropping the JS references is the release.
+const releaseEmbedding = (entry) => {
+    if (!entry) return
+    try {
+        for (const t of Object.values(entry.embeddings || {})) t?.dispose?.()
+    } catch { /* runtime without dispose */ }
+    entry.gray = null
+}
+
+// Insert + LRU eviction, capped by the session budget. A cap of 1 (lite)
+// makes holding two embeddings structurally impossible: the old entry is
+// released before the new one is retained.
 const insertWithCap = (bundle, cacheKey, entry) => {
+    const cacheMax = Math.max(1, state.budget.draftCacheMax ?? LANES.draft.cacheMax)
+    if (cacheMax === 1) {
+        for (const key of [...embedCache.keys()]) {
+            if (key.startsWith(`${bundle.laneKey}:`)) {
+                releaseEmbedding(embedCache.get(key))
+                embedCache.delete(key)
+            }
+        }
+        embedCache.set(cacheKey, entry)
+        return
+    }
     embedCache.set(cacheKey, entry)
-    const cacheMax = (bundle.laneKey === 'draft'
-        ? state.budget.draftCacheMax
-        : state.budget.flagshipCacheMax) ?? LANES[bundle.laneKey].cacheMax
     let laneCount = 0
     for (const key of embedCache.keys()) if (key.startsWith(`${bundle.laneKey}:`)) laneCount += 1
     if (laneCount > cacheMax) {
         for (const key of embedCache.keys()) {
-            if (key.startsWith(`${bundle.laneKey}:`)) { embedCache.delete(key); break }
+            if (key.startsWith(`${bundle.laneKey}:`)) {
+                releaseEmbedding(embedCache.get(key))
+                embedCache.delete(key)
+                break
+            }
         }
     }
 }
 
-const purgeLane = (laneKey) => {
+/** New document: drop its one embedding; model weights stay. */
+export const releaseDocument = () => {
     for (const key of [...embedCache.keys()]) {
-        if (key.startsWith(`${laneKey}:`)) embedCache.delete(key)
+        releaseEmbedding(embedCache.get(key))
+        embedCache.delete(key)
     }
 }
 
 /**
- * Memory-pressure ladder (M4) — free heavy GPU residents worst-effort,
- * cheapest-to-reload first:
- *   1 dispose the OWLv2 detector   2 drop flagship embeddings
- *   3 drop the flagship session (reloads on demand; extends the sticky demote)
- * The detector lives in another module — dynamic import dodges a static cycle.
+ * Memory-pressure ladder — dispose the detector first, then (at level 3)
+ * release the current embedding. The detector lives in another module, so the
+ * dynamic import avoids a static cycle.
  */
 export const relievePressure = async (level = 1) => {
     const freed = []
     if (level >= 1) {
         try { (await import('./detect-engine.js')).disposeDetector(); freed.push('detector') } catch { /* no detector loaded */ }
     }
-    if (level >= 2) { purgeLane('flagship'); freed.push('flagship-embeddings') }
     if (level >= 3) {
-        state.flagshipEpoch += 1
-        state.flagship = 'unavailable'
-        bundles.flagship = null
-        freed.push('flagship-session')
+        releaseDocument()
+        freed.push('embedding')
     }
     return freed
 }
@@ -510,9 +434,16 @@ const decodeMask = async (bundle, entry, req) => {
     try {
         outputs = await withTimeout(bundle.model(decoderInputs), INFER_TIMEOUT_MS, 'mask decode')
     } catch (err) {
-        // Some SAM ONNX exports lack the input_boxes input. The box's centre
-        // point is already in the prompt, so points-only is a usable retry.
-        if (!decoderInputs.input_boxes || !/input|invalid|unknown/i.test(String(err?.message))) throw err
+        // SlimSAM's decoder export accepts the box tensor on some ORT builds
+        // but fails inside Gather_11 on others (rather than reporting an
+        // unknown input). The box's centre is already a positive point, so a
+        // points-only retry is both safe and substantially better than
+        // failing the user's selection outright. Keep unrelated decoder
+        // errors visible: only box-input validation and Gather failures take
+        // this compatibility path.
+        const message = String(err?.message || err)
+        if (!decoderInputs.input_boxes || !/\b(?:input|invalid|unknown|gather)\b/i.test(message)) throw err
+        trace('box-decoder-fallback', { reason: message.slice(0, 180) })
         delete decoderInputs.input_boxes
         outputs = await withTimeout(bundle.model(decoderInputs), INFER_TIMEOUT_MS, 'mask decode (points only)')
     }
@@ -558,9 +489,9 @@ const segmentOnce = async (req) => {
     // waited must not touch the model at all.
     if (isStale(req)) return staleResult(req)
     const t0 = Date.now()
-    const laneKey = req.lane || activeLaneKey()
+    const laneKey = 'draft'
     trace('segment-start', { laneKey, revision: req.revision, imageKey: req.imageKey })
-    const bundle = await loadBundle(laneKey)
+    const bundle = await loadBundle()
     const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
     const tEncoded = Date.now()
 
@@ -590,15 +521,17 @@ const segmentOnce = async (req) => {
 }
 
 /**
- * segmentOnce with two-level degradation, never a dead click:
- *   flagship runtime failure → sticky-demote to draft, retry;
- *   draft WebGPU failure     → sticky WASM, drop poisoned caches, retry.
+ * Segment with a single safe retry path: a WebGPU failure falls back to
+ * SlimSAM on WASM after dropping the poisoned session and embedding.
  *
  * @param {{ imageKey: string, source: ImageBitmap|OffscreenCanvas|HTMLCanvasElement|null,
  *           clicks: Array<[number, number, 0|1]>, box: number[]|null,
  *           clampPoly?: Array<[number, number]>, clampMargin?: number }} req
  */
 export const segment = async (req) => {
+    // A click can beat the queued warm: adopt the caller's budget so the
+    // implicit lazy load still runs under the session policy, never defaults.
+    if (req.budget && !state.ready) state.budget = { ...DEFAULT_BUDGET, ...req.budget }
     const laneKey = activeLaneKey()
     trace('segment-route', { laneKey, revision: req.revision })
     try {
@@ -606,18 +539,9 @@ export const segment = async (req) => {
     } catch (err) {
         console.error('[seglab][engine] segment-failed', { laneKey, revision: req.revision, err })
         if (isStale(req)) return staleResult(req) // don't demote lanes over a cancelled job
-        // Out-of-memory: free the detector + flagship embeddings before the
-        // lane demote below retries (cheapest residents go first).
+        // Out-of-memory: free the detector before rebuilding SlimSAM on WASM.
         if (/out of memory|allocation failed|\boom\b|out of device memory/i.test(String(err?.message))) {
             await relievePressure(2)
-        }
-        if (laneKey === 'flagship') {
-            console.warn('[seglab] flagship decode failed; demoting to draft lane:', err?.message)
-            state.flagship = 'failed'
-            bundles.flagship = null
-            purgeLane('flagship')
-            emitEvent({ type: 'lane', lane: 'draft', label: LANES.draft.label })
-            return segment(req) // re-enters on the draft lane (bounded: flagship is now sticky-failed)
         }
         if (state.device !== 'webgpu' || state.forcedWasm) throw err
         console.warn('[seglab] segment failed on WebGPU; retrying on WASM:', err?.message)
@@ -625,17 +549,13 @@ export const segment = async (req) => {
         state.device = 'wasm'
         state.ready = false
         bundles.draft = null
-        if (state.flagship === 'ready' || state.flagship === 'loading') {
-            state.flagship = 'failed' // flagship is WebGPU-only
-            bundles.flagship = null
-        }
-        embedCache.clear()
+        releaseDocument()
         return serialize(() => segmentOnce({ ...req, lane: 'draft' }))
     }
 }
 
 /**
- * M5 encode-at-import: warm the active lane's embedding for `imageKey` in the
+ * M5 encode-at-import: warm SlimSAM's embedding for `imageKey` in the
  * background so the first click skips straight to decode. The model encode is
  * serialized; the optional OPFS copy deliberately happens after that queue is
  * released, so a real selection never waits behind a disk write.
@@ -643,8 +563,8 @@ export const segment = async (req) => {
 export const encodeImage = async (req) => {
     const prepared = await serialize(async () => {
         if (isStale(req)) return { stale: true }
-        const laneKey = req.lane || activeLaneKey()
-        const bundle = await loadBundle(laneKey)
+        const laneKey = 'draft'
+        const bundle = await loadBundle()
         const { encoded, save } = await ensureEmbeddings(bundle, req.imageKey, req.source)
         if (isStale(req)) return { stale: true }
         return { encoded, save, lane: LANES[laneKey].label, device: state.device }
@@ -666,8 +586,8 @@ export const encodeImage = async (req) => {
  * whatever band it needs; null when the job went stale mid-kernel.
  */
 const cropSegment = async (req) => {
-    const laneKey = req.lane || activeLaneKey()
-    const bundle = await loadBundle(laneKey)
+    const laneKey = 'draft'
+    const bundle = await loadBundle()
     const { entry, encoded } = await ensureEmbeddings(bundle, req.cacheKey, req.source, {
         ephemeral: req.ephemeral, pixels: req.pixels, gray: req.gray,
     })
@@ -724,7 +644,6 @@ const hdRefineOnce = async (req) => {
                 ephemeral: true,
                 pixels, // crop readback + gray already built above — reuse
                 gray,
-                lane: req.lane,
                 revision: req.revision,
                 ...prompts,
             })
@@ -753,7 +672,7 @@ const hdRefineOnce = async (req) => {
         iou,
         revision: req.revision,
         bandPixels: refined.bandPixels,
-        lane: decoded ? LANES[req.lane || activeLaneKey()].label : null,
+        lane: decoded ? LANES.draft.label : null,
         ms: Date.now() - t0,
     }
 }
@@ -767,6 +686,6 @@ const hdRefineOnce = async (req) => {
  *           proxyMask: { data: Uint8ClampedArray|ArrayBuffer, width: number, height: number },
  *           proxySubrect: { sx: number, sy: number, sw: number, sh: number },
  *           prompts: { clicks: Array, box: number[]|null, clampPoly: Array|null, clampMargin: number },
- *           doDecode: boolean, upFactor: number, lane?: string }} req
+ *           doDecode: boolean, upFactor: number }} req
  */
 export const hdRefine = (req) => serialize(() => hdRefineOnce(req))

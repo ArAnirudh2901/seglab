@@ -4,21 +4,20 @@
  * All inference runs here so encoder and decoder passes never block the UI
  * thread. Plain request/response protocol with correlation ids:
  *
- *   in : { id, op: 'warm', payload: { flagship } }
+ *   in : { id, op: 'warm', payload: { budget } }
  *   in : { id, op: 'segment', payload: { imageKey, source: ImageBitmap
  *          (transferred), clicks, box, clampPoly, clampMargin } }
  *   out: { id, ok: true, result }   — mask buffers transferred back, zero-copy
  *   out: { id, ok: false, error }
- *   out: { type: 'progress'|'lane', ... }  — engine broadcasts (download
- *         progress, flagship hot-swap)
+ *   out: { type: 'progress', ... }  — SlimSAM download progress
  *
- * All engine logic (lanes, embedding cache, post pipeline, fallbacks) lives
+ * All engine logic (embedding cache, post pipeline, fallbacks) lives
  * in sam-engine.js so the exact same code can run inline on the main thread
  * when worker construction fails (see sam-client.js).
  */
 
 import {
-    cancelBefore, detectorCandidates, encodeImage, getBudget, getEngineState, hdRefine, relievePressure, segment, setEventSink, warm,
+    cancelBefore, detectorCandidates, encodeImage, getBudget, getEngineState, hdRefine, relievePressure, releaseDocument, segment, setEventSink, warm,
 } from './sam-engine.js'
 import { detect } from './detect-engine.js'
 
@@ -72,6 +71,12 @@ self.onmessage = async (event) => {
             return
         }
         if (op === 'detect') {
+            const candidates = detectorCandidates()
+            // The accelerated detector is a separate foundation model. Drop
+            // the image embedding before it allocates its WebGPU session so
+            // image encode and text grounding cannot peak together. Selecting
+            // a returned box re-encodes SlimSAM from the bounded proxy.
+            if (candidates.some((candidate) => candidate.detector === 'grounding')) releaseDocument()
             const progress_callback = (info) => self.postMessage({
                 type: 'progress',
                 detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total },
@@ -80,7 +85,7 @@ self.onmessage = async (event) => {
                 frame: payload.frame,
                 labels: payload.labels,
                 threshold: payload.threshold,
-                candidates: detectorCandidates(),
+                candidates,
                 dispose: getBudget().detectorDispose === 'now',
                 progress_callback,
             })
@@ -99,6 +104,11 @@ self.onmessage = async (event) => {
             return
         }
         if (op === 'state') {
+            self.postMessage({ id, ok: true, result: getEngineState() })
+            return
+        }
+        if (op === 'releaseDocument') {
+            releaseDocument()
             self.postMessage({ id, ok: true, result: getEngineState() })
             return
         }

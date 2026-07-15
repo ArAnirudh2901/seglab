@@ -1,5 +1,5 @@
 /**
- * detect-worker — disposable OWLv2 shell.
+ * detect-worker — disposable text-detector shell.
  * Text search runs here, NOT in the segmentation worker: onnxruntime-web keeps
  * ONE wasm Memory per worker and it can only grow, so a single 960² detect
  * would permanently inflate the segmentation worker's arena past what the
