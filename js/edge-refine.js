@@ -13,48 +13,75 @@
  * every decode, model-agnostic, so it upgrades every engine lane forever.
  */
 
-/** Separable Chebyshev dilate (max) or erode (min) of a 0/1 Float32 map. */
-const morph = (src, w, h, radius, isMax) => {
-    const tmp = new Float32Array(src.length)
-    const out = new Float32Array(src.length)
-    // Horizontal pass.
+/**
+ * Separable Chebyshev dilate (max) or erode (min) of a 0/1 Float32 map.
+ *
+ * This is the same rectangular morphology that OpenCV's `morphologyEx`
+ * would apply, but it uses a monotonic deque rather than scanning every
+ * pixel in every radius-sized window. It is O(pixels), not
+ * O(pixels × radius), and the caller supplies the two raster buffers so a
+ * 1024px interaction frame does not create short-lived heap spikes.
+ */
+const morph = (src, w, h, radius, isMax, tmp, out, deque) => {
+    const dominates = isMax
+        ? (a, b) => a >= b
+        : (a, b) => a <= b
+
+    // Horizontal pass. The deque holds source X coordinates whose values can
+    // still win the current [x - radius, x + radius] window.
     for (let y = 0; y < h; y += 1) {
         const row = y * w
+        let head = 0
+        let tail = 0
+        let next = 0
         for (let x = 0; x < w; x += 1) {
-            let v = isMax ? 0 : 1
-            const lo = Math.max(0, x - radius)
             const hi = Math.min(w - 1, x + radius)
-            for (let i = lo; i <= hi; i += 1) {
-                const s = src[row + i]
-                v = isMax ? (s > v ? s : v) : (s < v ? s : v)
+            while (next <= hi) {
+                const v = src[row + next]
+                while (tail > head && dominates(v, src[row + deque[tail - 1]])) tail -= 1
+                deque[tail++] = next
+                next += 1
             }
-            tmp[row + x] = v
+            const lo = Math.max(0, x - radius)
+            while (head < tail && deque[head] < lo) head += 1
+            tmp[row + x] = src[row + deque[head]]
         }
     }
-    // Vertical pass.
+
+    // Vertical pass. Reuse the same deque and write directly into `out`.
     for (let x = 0; x < w; x += 1) {
+        let head = 0
+        let tail = 0
+        let next = 0
         for (let y = 0; y < h; y += 1) {
-            let v = isMax ? 0 : 1
-            const lo = Math.max(0, y - radius)
             const hi = Math.min(h - 1, y + radius)
-            for (let i = lo; i <= hi; i += 1) {
-                const s = tmp[i * w + x]
-                v = isMax ? (s > v ? s : v) : (s < v ? s : v)
+            while (next <= hi) {
+                const v = tmp[next * w + x]
+                while (tail > head && dominates(v, tmp[deque[tail - 1] * w + x])) tail -= 1
+                deque[tail++] = next
+                next += 1
             }
-            out[y * w + x] = v
+            const lo = Math.max(0, y - radius)
+            while (head < tail && deque[head] < lo) head += 1
+            out[y * w + x] = tmp[deque[head] * w + x]
         }
     }
     return out
 }
 
 /** Integral image (summed-area table) of a Float32 map, (w+1)×(h+1). */
-const integral = (src, w, h) => {
-    const sat = new Float64Array((w + 1) * (h + 1))
+const integralInto = (src, w, h, sat) => {
+    const W = w + 1
+    // Reusing the buffer avoids allocating six >8 MB summed-area tables for
+    // every 1024px mask. The first row and every leading column must be zero
+    // because they form the virtual border of the integral image.
+    sat.fill(0, 0, W)
     for (let y = 0; y < h; y += 1) {
         let rowSum = 0
         const srcRow = y * w
-        const satRow = (y + 1) * (w + 1)
-        const satPrev = y * (w + 1)
+        const satRow = (y + 1) * W
+        const satPrev = y * W
+        sat[satRow] = 0
         for (let x = 0; x < w; x += 1) {
             rowSum += src[srcRow + x]
             sat[satRow + x + 1] = rowSum + sat[satPrev + x + 1]
@@ -92,12 +119,20 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
     const size = w * h
     if (!gray || gray.length !== size) return { bandPixels: 0 }
 
+    // Working set at 1024²: eight Float32 rasters (32 MB) plus one reusable
+    // Float64 summed-area table (8 MB). Previously each filter pass allocated
+    // another table, which could briefly push Safari/Chromium into a much
+    // larger GC peak while the segmentation model was still resident.
     const p = new Float32Array(size)
+    const morphTmp = new Float32Array(size)
+    const dil = new Float32Array(size)
+    const ero = new Float32Array(size)
+    const deque = new Int32Array(Math.max(w, h))
     for (let i = 0; i < size; i += 1) p[i] = rgba[i * 4] >= 128 ? 1 : 0
 
     // Boundary band = dilate(mask) − erode(mask).
-    const dil = morph(p, w, h, band, true)
-    const ero = morph(p, w, h, band, false)
+    morph(p, w, h, band, true, morphTmp, dil, deque)
+    morph(p, w, h, band, false, morphTmp, ero, deque)
     let bandPixels = 0
     for (let i = 0; i < size; i += 1) {
         if (dil[i] > 0.5 && ero[i] < 0.5) bandPixels += 1
@@ -105,27 +140,33 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
     if (!bandPixels) return { bandPixels: 0 }
 
     // Guided filter q = mean_a · I + mean_b over box windows of `radius`.
-    const meanI = boxMean(integral(gray, w, h), w, h, radius, new Float32Array(size))
-    const meanP = boxMean(integral(p, w, h), w, h, radius, new Float32Array(size))
-    const Ip = new Float32Array(size)
-    const II = new Float32Array(size)
+    const sat = new Float64Array((w + 1) * (h + 1))
+    const meanI = boxMean(integralInto(gray, w, h, sat), w, h, radius, new Float32Array(size))
+    const meanP = boxMean(integralInto(p, w, h, sat), w, h, radius, new Float32Array(size))
+    // `cross` and `square` become meanIp/meanII, then safely become b/meanB
+    // and remain reusable after their previous value has been consumed.
+    const cross = new Float32Array(size)
+    const square = new Float32Array(size)
     for (let i = 0; i < size; i += 1) {
-        Ip[i] = gray[i] * p[i]
-        II[i] = gray[i] * gray[i]
+        cross[i] = gray[i] * p[i]
+        square[i] = gray[i] * gray[i]
     }
-    const meanIp = boxMean(integral(Ip, w, h), w, h, radius, Ip) // reuse buffers
-    const meanII = boxMean(integral(II, w, h), w, h, radius, II)
+    const meanIp = boxMean(integralInto(cross, w, h, sat), w, h, radius, cross)
+    const meanII = boxMean(integralInto(square, w, h, sat), w, h, radius, square)
 
-    const a = new Float32Array(size)
-    const b = new Float32Array(size)
+    // `p` is no longer needed after morphology, so it becomes `a`; `cross`
+    // becomes `b` after its mean was consumed. This eliminates two more
+    // large temporary rasters without changing the guided-filter math.
+    const a = p
+    const b = cross
     for (let i = 0; i < size; i += 1) {
         const varI = meanII[i] - meanI[i] * meanI[i]
         const covIp = meanIp[i] - meanI[i] * meanP[i]
         a[i] = covIp / (varI + eps)
         b[i] = meanP[i] - a[i] * meanI[i]
     }
-    const meanA = boxMean(integral(a, w, h), w, h, radius, a)
-    const meanB = boxMean(integral(b, w, h), w, h, radius, b)
+    const meanA = boxMean(integralInto(a, w, h, sat), w, h, radius, a)
+    const meanB = boxMean(integralInto(b, w, h, sat), w, h, radius, b)
 
     for (let i = 0; i < size; i += 1) {
         if (!(dil[i] > 0.5 && ero[i] < 0.5)) continue
@@ -156,7 +197,7 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
  * bandPixels is telemetry-only and may count overlap bands twice.
  */
 export const refineMaskEdgesTiled = (rgba, w, h, gray, {
-    band = 6, radius = 8, eps = 1e-3, tileSide = 2048, overlap = 64,
+    band = 6, radius = 8, eps = 1e-3, tileSide = 1024, overlap = 64,
 } = {}) => {
     if (w <= tileSide && h <= tileSide) return refineMaskEdges(rgba, w, h, gray, { band, radius, eps })
 

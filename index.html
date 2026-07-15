@@ -52,7 +52,8 @@
     }
     .spacer { flex: 1; }
 
-    .modes { display: flex; gap: 6px; }
+    .modes { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .modes button { min-height: 36px; }
     button {
         appearance: none;
         border: 1px solid var(--line);
@@ -88,6 +89,16 @@
     }
     .textinput:focus { outline: none; border-color: var(--accent); }
     .textinput::placeholder { color: var(--dim); }
+    .tolerance {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--dim);
+        font-size: 12px;
+        white-space: nowrap;
+    }
+    .tolerance input { accent-color: var(--accent); width: 84px; }
+    .tolerance output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 20px; }
 
     main {
         flex: 1;
@@ -128,6 +139,36 @@
         cursor: crosshair;
         touch-action: none;
     }
+
+    /* Import overlay. The spinner animates transform only, so it keeps
+       spinning on the compositor even while the main thread is busy. */
+    #prep {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(10, 12, 16, 0.62);
+        backdrop-filter: blur(3px);
+        z-index: 5;
+        /* Progress must not lock the editor. A new drop, a replacement image,
+           and the header controls remain available while the worker prepares. */
+        pointer-events: none;
+    }
+    #prep[hidden] { display: none; }
+    .prep-card { text-align: center; color: var(--text); }
+    .prep-spinner {
+        width: 34px;
+        height: 34px;
+        margin: 0 auto 14px;
+        border-radius: 50%;
+        border: 3px solid var(--line);
+        border-top-color: var(--accent);
+        animation: prep-spin 0.9s linear infinite;
+    }
+    @keyframes prep-spin { to { transform: rotate(360deg); } }
+    #prep-text { font-size: 14.5px; font-weight: 600; }
+    .prep-sub { font-size: 12px; color: var(--dim); margin-top: 6px; }
 
     #dropzone {
         border: 1.5px dashed var(--line);
@@ -194,9 +235,17 @@
         <button id="mode-click" class="active" title="Click to select — left/tap = include, right/Alt = exclude">Click</button>
         <button id="mode-box" title="Drag a box around the object">Box</button>
         <button id="mode-lasso" title="Draw a rough lasso — it snaps to the object">Lasso</button>
+        <button id="mode-region" title="Draw a region — the enclosed area itself becomes the mask">Region</button>
+        <button id="mode-rect" title="Draw a rectangular marquee mask">Rect</button>
+        <button id="mode-ellipse" title="Draw an elliptical marquee mask">Ellipse</button>
+        <button id="mode-polygon" title="Click vertices; double-click or press Enter to close a polygon mask">Polygon</button>
+        <button id="mode-magic" title="Click a contiguous colour region to mask it — left/tap adds, right/Alt subtracts">Magic</button>
+        <button id="mode-color" title="Click a colour to select matching pixels across the image — left/tap adds, right/Alt subtracts">Color</button>
+        <button id="mode-brush" title="Paint the mask; right-click or Alt erases">Brush</button>
         <button id="mode-text" title="Describe the object in words — runs a local detector">Text</button>
     </div>
     <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
+    <label id="tolerance-wrap" class="tolerance" hidden>Tolerance <input id="tolerance" type="range" min="8" max="160" value="72"><output id="tolerance-value">72</output></label>
     <input id="textinput" class="textinput" type="text" placeholder="describe an object — e.g. “the red car”, “all bottles”" hidden>
     <button id="selectall" class="small" hidden title="Select every match">Select all</button>
     <div class="spacer"></div>
@@ -220,12 +269,19 @@
         <canvas id="view"></canvas>
         <canvas id="overlay"></canvas>
     </div>
-    <input id="file" type="file" accept="image/*" hidden>
+    <div id="prep" hidden>
+        <div class="prep-card">
+            <div class="prep-spinner"></div>
+            <div id="prep-text">Reading photo…</div>
+            <div class="prep-sub">Stays on your device — nothing is uploaded</div>
+        </div>
+    </div>
+    <input id="file" type="file" accept="image/*,.nef,.nrw,.cr2,.cr3,.crw,.arw,.sr2,.srf,.dng,.orf,.rw2,.raf,.pef,.srw,.raw,.rwl,.iiq,.3fr,.fff,.erf,.mrw,.mef,.mos,.dcr,.kdc,.x3f" hidden>
 </main>
 
 <footer>
     <span id="status">Idle — import a photo to begin</span>
-    <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt-click = exclude</span>
+    <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt = exclude · polygon <kbd>Enter</kbd> close</span>
     <span id="chip-mode" class="chip">engine: —</span>
     <span id="chip-device" class="chip">device: —</span>
     <span id="chip-timing" class="chip">— ms</span>

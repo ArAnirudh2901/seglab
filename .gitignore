@@ -3,3 +3,15 @@
 .cache/
 .DS_Store
 node_modules/
+# Test media dropped in for debugging (screen recordings, sample RAW/photos)
+*.mp4
+*.mov
+*.nef
+*.NEF
+*.cr2
+*.cr3
+*.arw
+*.dng
+*.raf
+*.orf
+*.rw2

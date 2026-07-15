@@ -111,11 +111,12 @@ composite → native-resolution PNG.
 the analytic disc.
 
 ### M2 — Text select, local on every device (OWLv2) ✅ `73117e6`
-`Xenova/owlv2-base-patch16-ensemble` (verified present in the pinned
-transformers.js 4.2.0 build). `text-core.js` (pure: phrase normalization with
-the "a photo of a X" template, all/every → multi-intent, NMS, mapping),
-`detect-engine.js` (pipeline-first adapter, fp16 WebGPU / q8 WASM, ALL phrases
-in one call, detection cache), `text-ui.js` (debounced input → numbered
+`onnx-community/owlv2-base-patch16-ensemble-ONNX` (the `-ONNX` suffix is part of
+the id; the Xenova export's class_head won't place on ORT-web v4). `text-core.js`
+(pure: phrase normalization with the "a photo of a X" template, all/every →
+multi-intent, NMS, mapping), `detect-engine.js` (pipeline-first adapter, q8 WASM
+— fp16 WebGPU only where `detectorWebGPU` allows it, since OWLv2's fixed 960²
+wedges 8 GB unified memory), `text-ui.js` (debounced input → numbered
 candidate chips → pick one / All N / re-phrase / Esc; state machine
 IDLE→DETECTING→CANDIDATES→SEGMENTING→READY). Chosen boxes → the SAME segment
 path as lasso (box + center point) → union via seeded hygiene. Residency:
@@ -143,6 +144,77 @@ session (extends the existing sticky demote). Memory check (Pro, 12 MP):
 ~1.0 GB steady, ~2.6 GB transient peak, serialized — fits 8 GB.
 **Gate:** `?force=wasm` completes click + text + export (the "entire pipeline
 on weak devices" proof); default run on the dev machine reports `pro`.
+
+> **Amended 2026-07-12:** flagship is now **opt-in** (`?flagship=1`), off in every
+> preset. `navigator.deviceMemory` caps at 8, so an 8 GB Air and a 64 GB Studio
+> both read 8 — the probe can't confirm the headroom a co-resident 300 MB SAM3
+> needs, and auto-loading it thrashed the 8 GB target into swap (120 s decode
+> stalls). Profile still probes `pro` (sizing tier); the draft lane keeps full
+> capability. Also added `cropMaxSide` (1536/2048/4096) to bound native crop memory.
+>
+> **Amended 2026-07-12 (residency / 8K):** custody is now **blob-only** — a file
+> upload is never held as full-res RGBA. `importOriginal` reads dims from the
+> header (`image-io.js`) and decodes **straight to the ≤proxyMax proxy** via
+> `createImageBitmap` resize (JPEG scaled-DCT decode ⇒ an 8K/48 MP frame never
+> materializes); the compressed Blob is kept and escalation/export/detector
+> re-decode only the bounded region they need (`cropMaxSide` / `exportMaxSide` /
+> `DETECTOR_INPUT`). Rotated/exotic uploads fall back to the held decode (rare).
+> HD composite dropped to one full-frame buffer. Retires `bitmapMaxMP`. This
+> supersedes the M4 line "original Blob/Bitmap/Bitmap" — it is Blob everywhere now.
+>
+> **Amended 2026-07-12 (multi-select tab-kill):** a 2nd-object selection on a
+> DSLR photo froze ~35 s then Chrome killed the tab (screen recording). Fixes:
+> worker death now RESTARTS a fresh worker (≤2, memory reclaimed) instead of
+> falling inline — inline is boot-construction-failure only; escalation fires
+> once per SETTLED selection (skip while input pending + 250 ms settle);
+> overlay mask layers cached per mask object + rAF-coalesced painting (was 3
+> canvases + readbacks per pointermove); hdRefine passes its crop pixels/gray
+> into the encode (no duplicate crop-sized buffers); pro `cropMaxSide` 4096→2048
+> (2× model input; tensor peak quadruples per doubling); Chrome heap watchdog
+> sheds escalation → residents before the OS sheds the tab.
+>
+> **Amended 2026-07-12 (RAW + adaptive proxy):** camera RAW (.nef/.cr2/.arw/
+> .dng/…) is now supported by **lifting the embedded full-res JPEG preview**
+> (`image-raw.js`): a DSLR RAW is a container of sensor mosaic + metadata + one
+> or more developed JPEG previews — for a cutout tool the preview IS the photo,
+> so TIFF-IFD pointers (or a scan fallback for CR3/RAF) locate the largest one
+> and we slice out just its bytes (a 33 MB NEF → a 3 MB JPEG, reading ~3 MB of
+> the file, zero-cloud, no demosaic). Orientation baked in for portrait RAW; the
+> JPEG then rides the existing decode-to-proxy path. True 14-bit demosaic (WASM
+> LibRaw) stays a future option. Proxy is now **capability-adaptive**: probe →
+> `proxyMax` (wasm 768 / GPU 1024 / strong-GPU+f16 1280), `?proxy=<px>|off`
+> override; honest cap — the encoder ingests 1024² so bigger only buys click/
+> overlay precision. No server side exists to prune (static app; dev-only Playwright).
+>
+> **Amended 2026-07-12 (Safari RAW tab-kill — CapCut proxy):** Safari reloaded
+> the page on RAW selection — its `createImageBitmap` doesn't scaled-decode a
+> JPEG, so "decode to proxy" still materialized the full 45 MP (~182 MB), twice
+> (import + escalation). Fix, matching the CapCut proxy-edit model: interact on a
+> lightweight proxy, relink the mask to full-res at export. `extractRawPreview`
+> now returns the full-res preview + a small `proxyBlob` (the RAW's own smaller
+> embedded preview); `importOriginal({proxyBlob})` builds the proxy from it (a
+> ~7 MB decode, 26× less), full-res kept only for export. `escalateMaxMP`
+> (12/24/30) skips interactive native-crop escalation on huge originals — the
+> Chrome-only `performance.memory` watchdog can't help Safari, so the fix is
+> structural (never decode the big frame during interaction).
+>
+> **Amended 2026-07-15 (working copy — Safari big-JPEG / detector tab-kill):**
+> Safari never shipped `ImageDecoder` (MDN BCD: `version_added:false` — the
+> bounded WebCodecs path was dead code there), so a big plain JPEG (no RAW
+> preview to dodge into) full-raster-decoded at import AND on every
+> original-res re-decode: the detector frame and each escalation crop cost a
+> ~180–240 MB transient — the reload banner. Fix: on unbounded-decode hosts
+> the ONE unavoidable import decode also re-encodes a ≤4096 `workingBlob`
+> (RAW retains its small embedded preview instead — zero extra decodes);
+> detector frames + escalation crops decode from it (~45 MB transients),
+> escalation re-enables for big files/RAW (gates evaluate the working source),
+> and export alone bypasses it (`native:true`) — native-res export truth
+> unchanged (a bounded escalation patch is interaction-only; export re-decodes
+> natively). Crop prompts now scale by the real bitmap/rect ratio (latent bug:
+> a cropMaxSide-downscaled export crop had misplaced prompts, silently saved
+> by the IoU gate); working vs native crops key separately (`:w` suffix).
+> `?working=1|0` override; gate: Phase A4b (5000 px blob upload →
+> `workingActive`, escalation `decoded=true`, export dims exact).
 
 ### M5 — Kill the waits + prove zero-cloud ✅ `8b62f07`
 Encode-at-import (eager background `encode` op — first click hits cache).

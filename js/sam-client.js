@@ -2,9 +2,10 @@
  * sam-client — main-thread API over the segmentation worker
  * -----------------------------------------------------------
  * Owns the worker lifecycle and exposes one call: segment(canvas, prompts).
- * If worker construction or the worker script itself fails (file:// pages,
- * exotic browsers), the engine runs inline on the main thread instead —
- * identical module, sticky choice, degrade-don't-die.
+ * If worker CONSTRUCTION fails (file:// pages, exotic browsers), the engine
+ * runs inline on the main thread — identical module, sticky choice. A worker
+ * that dies MID-SESSION (usually memory) is restarted fresh instead (its
+ * arenas are reclaimed); inline is the last resort after repeated deaths.
  *
  * Forwards the engine's broadcasts to subscribers:
  *   {type:'progress', detail:{lane, file, loaded, total, ...}}  downloads
@@ -37,9 +38,11 @@ export const clientState = {
 const listeners = new Set()
 export const subscribe = (cb) => { listeners.add(cb); return () => listeners.delete(cb) }
 const emit = (event) => { for (const cb of listeners) { try { cb(event) } catch { /* listener bug */ } } }
+const trace = (event, detail = {}) => console.log(`[seglab][client] ${event}`, detail)
 
 /** Engine broadcast → client event (shared by worker + inline paths). */
 const onEngineEvent = (event) => {
+    if (event?.type !== 'progress') trace('engine-event', event)
     if (event?.type === 'lane') {
         clientState.lane = event.label
         emit({ type: 'lane', label: event.label })
@@ -52,10 +55,13 @@ const onEngineEvent = (event) => {
 
 let worker = null
 let workerBroken = false
+let workerGeneration = 0 // bumped on every worker death (callers retry on change)
+const MAX_WORKER_RESTARTS = 2
 let seq = 0
 const pending = new Map() // id → {resolve, reject}
 
 const failAllPending = (reason) => {
+    trace('pending-failed', { count: pending.size, reason })
     for (const [, entry] of pending) entry.reject(new Error(reason))
     pending.clear()
 }
@@ -65,8 +71,12 @@ const getWorker = () => {
     if (worker) return worker
     try {
         worker = new Worker(new URL('./sam-worker.js', import.meta.url), { type: 'module' })
+        trace('worker-created')
         worker.onmessage = (event) => {
             const data = event.data || {}
+            if (data.type !== 'progress') {
+                trace('worker-message', { id: data.id, type: data.type, ok: data.ok, error: data.error })
+            }
             if (data.type) {
                 onEngineEvent(data)
                 return
@@ -78,20 +88,32 @@ const getWorker = () => {
             else entry.reject(new Error(data.error || 'on-device selection failed'))
         }
         worker.onerror = (event) => {
-            // A worker-level error (script load failure, unhandled throw) is
-            // not recoverable per-request: fail everything in flight and go
-            // inline for the rest of the session.
-            console.warn('[seglab] worker error; switching to inline engine:', event?.message)
+            console.error('[seglab][client] worker-error', event?.message || event)
+            // Worker died (usually memory). Terminating it is the memory
+            // reset — the OS reclaims its WASM/GPU arenas — so RESTART a
+            // fresh worker. Never fall inline mid-session: the full engine
+            // on the main thread freezes the page and doubles renderer
+            // memory (the 8 GB tab-kill path). Inline stays boot-only.
             failAllPending(event?.message || 'selection worker crashed')
             try { worker.terminate() } catch { /* already dead */ }
             worker = null
-            workerBroken = true
-            clientState.mode = 'inline'
+            if (workerGeneration < MAX_WORKER_RESTARTS) {
+                workerGeneration += 1
+                console.warn('[seglab] worker crashed; restarting it fresh:', event?.message)
+                warmPromise = null
+                if (lastWarm) warmUp({ ...lastWarm, flagship: false }).catch(() => {})
+            } else {
+                console.warn('[seglab] worker crashed repeatedly; switching to inline engine:', event?.message)
+                workerGeneration += 1
+                workerBroken = true
+                clientState.mode = 'inline'
+            }
             emit({ type: 'state' })
         }
         clientState.mode = 'worker'
         return worker
     } catch (err) {
+        console.error('[seglab][client] worker-create-failed', err)
         console.warn('[seglab] worker construction failed; using inline engine:', err?.message)
         workerBroken = true
         clientState.mode = 'inline'
@@ -129,13 +151,16 @@ export const cancelBefore = (revision) => {
 const call = async (op, payload, transfer, timeoutMs, label) => {
     const w = getWorker()
     if (w) {
-        const id = `${op}-${++seq}`
+        seq += 1
+        const id = `${op}-${seq}`
+        trace('request', { id, op, label, transferCount: transfer?.length || 0 })
         const roundtrip = new Promise((resolve, reject) => {
             pending.set(id, { resolve, reject })
             try {
                 w.postMessage({ id, op, payload }, transfer || [])
             } catch (err) {
                 pending.delete(id)
+                console.error('[seglab][client] post-failed', { id, op, err })
                 reject(err)
             }
         })
@@ -147,6 +172,7 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
             pending.delete(id)
         }
     }
+    trace('inline-request', { op, label })
     const engine = await getInlineEngine()
     if (op === 'warm') return withTimeout(engine.warm(payload || {}), timeoutMs, label)
     if (op === 'segment' || op === 'hdExport' || op === 'encode') {
@@ -159,19 +185,17 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
         }
     }
     if (op === 'detect') {
+        // Inline: nothing transferred, so the frame's pixels are still ours —
+        // they fall out of scope with the payload.
         const det = await import('./detect-engine.js')
-        try {
-            return await withTimeout(det.detect({
-                source: payload.source,
-                labels: payload.labels,
-                threshold: payload.threshold,
-                candidates: engine.detectorCandidates(),
-                dispose: engine.getBudget().detectorDispose === 'now',
-                progress_callback: (info) => onEngineEvent({ type: 'progress', detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total } }),
-            }), timeoutMs, label)
-        } finally {
-            try { payload?.source?.close?.() } catch { /* already closed */ }
-        }
+        return withTimeout(det.detect({
+            frame: payload.frame,
+            labels: payload.labels,
+            threshold: payload.threshold,
+            candidates: engine.detectorCandidates(),
+            dispose: engine.getBudget().detectorDispose === 'now',
+            progress_callback: (info) => onEngineEvent({ type: 'progress', detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total } }),
+        }), timeoutMs, label)
     }
     if (op === 'pressure') return { freed: await engine.relievePressure(payload?.level || 1) }
     throw new Error(`Unknown op: ${op}`)
@@ -180,20 +204,42 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
 /* ─── Public API ─────────────────────────────────────────────────────────── */
 
 let warmPromise = null
+let lastWarm = null // remembered so a restarted worker re-warms with the same budget
+let warmUpgradePromise = null
+
+const applyWarmState = (engineState) => {
+    trace('warm-ready', engineState)
+    clientState.device = engineState?.device || clientState.device
+    clientState.lane = engineState?.lane || clientState.lane
+    clientState.ready = true
+    emit({ type: 'state' })
+    return clientState
+}
 
 /** Download + compile the draft lane, then the flagship in the background
  *  (idempotent). `budget` is policy.js's resolved profile budget;
  *  `flagship:false` skips the background upgrade. */
 export const warmUp = ({ flagship = true, budget = null } = {}) => {
-    if (warmPromise) return warmPromise
+    if (warmPromise) {
+        // Startup intentionally begins with the conservative provisional
+        // budget. A trusted host can authorize SAM3 only after the capability
+        // probe finishes; preserve that late upgrade without restarting the
+        // already-ready draft model.
+        const needsFlagshipUpgrade = flagship && !!budget?.flagship && !lastWarm?.budget?.flagship
+        if (!needsFlagshipUpgrade) return warmPromise
+        warmUpgradePromise ??= warmPromise
+            .then(() => {
+                lastWarm = { flagship, budget }
+                return call('warm', { flagship, budget }, null, LOAD_TIMEOUT_MS, 'model upgrade')
+            })
+            .then(applyWarmState)
+        warmUpgradePromise.catch(() => { warmUpgradePromise = null })
+        return warmUpgradePromise
+    }
+    trace('warm-start', { flagship, profile: budget?.profile })
+    lastWarm = { flagship, budget }
     warmPromise = call('warm', { flagship, budget }, null, LOAD_TIMEOUT_MS, 'model load')
-        .then((engineState) => {
-            clientState.device = engineState?.device || clientState.device
-            clientState.lane = engineState?.lane || clientState.lane
-            clientState.ready = true
-            emit({ type: 'state' })
-            return clientState
-        })
+        .then(applyWarmState)
     warmPromise.catch(() => { warmPromise = null })
     return warmPromise
 }
@@ -237,6 +283,7 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     if ((!clicks || clicks.length === 0) && !box) throw new Error('No clicks or box to select with')
 
     const imageKey = contentKey(canvas)
+    trace('segment-start', { imageKey, clicks: clicks.length, box: Boolean(box), revision })
     const buildPayload = async () => {
         // The bitmap transfers zero-copy into the worker; the worker closes it.
         const source = await createImageBitmap(canvas)
@@ -244,20 +291,23 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     }
 
     let result
+    const gen = workerGeneration
     try {
         const { payload, transfer } = await buildPayload()
         result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection')
     } catch (err) {
-        // The request that DISCOVERS a broken worker must not fail the
-        // user's click: the bitmap transferred into the dead worker is gone,
-        // so rebuild it and retry — call() now routes inline.
-        if (!workerBroken) throw err
-        console.warn('[seglab] retrying selection inline after worker failure')
+        console.error('[seglab][client] segment-request-failed', err)
+        // The click that DISCOVERS a dead worker must not fail: its bitmap
+        // died with the worker, so rebuild and retry once — call() routes to
+        // the restarted worker (or inline after repeated deaths).
+        if (workerGeneration === gen) throw err
+        console.warn('[seglab] retrying selection after worker crash')
         const { payload, transfer } = await buildPayload()
-        result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection (inline retry)')
+        result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection (retry)')
     }
     // A cancelled job: no mask, no state churn — the caller just drops it.
     if (result?.stale) return { stale: true, revision: result.revision }
+    trace('segment-result', { revision, lane: result?.lane, encoded: result?.encoded, ms: Date.now() - startedAt })
     clientState.device = result.device || clientState.device
     clientState.lane = result.lane || clientState.lane
     clientState.ready = true
@@ -302,15 +352,16 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
 }
 
 /**
- * M5 encode-at-import: eagerly encode `canvas` on the active lane so the
- * first click hits the embedding cache. Resolves after the OPFS save lands
- * (best-effort). `encoded:false` ⇒ served from memory or OPFS.
+ * Idle-time image encode. `revision` lets an input event obsolete a queued
+ * prewarm before it begins; an already-running kernel still completes safely
+ * but reports stale and can never affect the UI. `encoded:false` means the
+ * embedding came from memory or OPFS.
  */
-export const encodeImage = async (canvas) => {
+export const encodeImage = async (canvas, { revision } = {}) => {
     if (!canvas?.width || !canvas?.height) return null
     const imageKey = contentKey(canvas)
     const source = await createImageBitmap(canvas)
-    return call('encode', { imageKey, source }, [source], INFER_TIMEOUT_MS, 'Encode at import')
+    return call('encode', { imageKey, source, revision }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
 }
 
 /**
@@ -327,12 +378,12 @@ export const hdExport = async (payload, transfer) => {
     return { alpha, width: result.width, height: result.height, decoded: result.decoded, lane: result.lane }
 }
 
-/** OWLv2 detection over `canvas` (already sized to the detector canvas).
- *  Returns { dets:[{box,score,label}] (canvas-pixel space), backend }. */
-export const detectText = async (canvas, labels, { threshold = 0.02 } = {}) => {
-    const source = await createImageBitmap(canvas)
-    return call('detect', { source, labels, threshold }, [source], INFER_TIMEOUT_MS, 'Text detection')
-}
+/** OWLv2 detection over `frame` — { data, width, height } RGB bytes, already
+ *  letterboxed into the detector's square. The pixels transfer (no copy, and
+ *  `frame.data` is detached here). Returns { dets:[{box,score,label}] with
+ *  boxes normalized [0,1] against the square, backend }. */
+export const detectText = async (frame, labels, { threshold = 0.05 } = {}) =>
+    call('detect', { frame, labels, threshold }, [frame.data.buffer], INFER_TIMEOUT_MS, 'Text detection')
 
 /** Free heavy GPU residents under memory pressure (M4 ladder). Returns the
  *  list of what was freed. Level 1 detector · 2 +flagship embeddings · 3 +session. */

@@ -65,6 +65,7 @@ const LANES = {
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
 const PROGRESS_THROTTLE_MS = 120
+const FLAGSHIP_SETTLE_MS = 3000 // breathing room between draft burst and the 300 MB lane
 
 const withTimeout = (promise, ms, label) =>
     new Promise((resolve, reject) => {
@@ -76,12 +77,14 @@ const withTimeout = (promise, ms, label) =>
     })
 
 // Standard-equivalent default; policy.js overrides via warm({ budget }).
+// flagship stays off unless a budget opts in (?flagship=1) — see policy.js header.
 const DEFAULT_BUDGET = {
     profile: 'standard',
-    flagship: true,
+    flagship: false,
     draftCacheMax: 4,
     flagshipCacheMax: 2,
     forceWasm: false,
+    detectorWebGPU: false,   // opt-in per profile; a budget-less engine never builds the heavy detector
 }
 
 const state = {
@@ -89,9 +92,11 @@ const state = {
     forcedWasm: false,       // sticky downgrade after a WebGPU runtime failure
     ready: false,            // draft lane serving
     flagship: 'idle',        // 'idle' | 'loading' | 'ready' | 'failed' | 'unavailable'
+    flagshipEpoch: 0,        // invalidates a background load after memory shedding
     obsoleteBefore: 0,       // jobs with revision < this must not commit (cancel op)
     budget: { ...DEFAULT_BUDGET },
 }
+const trace = (event, detail = {}) => console.log(`[seglab][engine] ${event}`, detail)
 
 /** Obsolete jobs older than `revision`: queued ones drop at dequeue,
  *  in-flight ones skip the post pipeline and report {stale:true}. */
@@ -134,13 +139,16 @@ const activeLaneKey = () => (state.flagship === 'ready' ? 'flagship' : 'draft')
 
 export const getBudget = () => ({ ...state.budget })
 
-// OWLv2 [device,dtype] fallback ladder: WebGPU first when available, WASM
-// always in reserve (headless/driver quirks reject the quantized WebGPU graph;
-// q8 also breaks on WASM — see the M2 smoke test).
+// OWLv2 [device,dtype] fallback ladder. WebGPU is offered ONLY on profiles with
+// the headroom for it: OWLv2 runs at a fixed 960² regardless of input canvas, so
+// on 8 GB unified memory the fp16 WebGPU session pinned the GPU near 100% and
+// wedged the whole machine — not just the tab. Small profiles therefore go
+// straight to wasm/q8 (163 MB): slower per search, but it can't hang the host.
 export const detectorCandidates = () => {
+    const heavyOk = state.budget.detectorWebGPU && !state.forcedWasm && state.device === 'webgpu'
     const list = []
-    if (!state.forcedWasm && state.device === 'webgpu') list.push(['webgpu', 'fp16'])
-    list.push(['wasm', 'uint8'], ['wasm', 'q4'], ['wasm', 'fp32'])
+    if (heavyOk) list.push(['webgpu', 'fp16'])
+    list.push(['wasm', 'q8'])
     return list
 }
 
@@ -155,7 +163,22 @@ export const getEngineState = () => ({
 })
 
 export const loadTransformers = () => {
-    transformersPromise ??= import(TRANSFORMERS_CDN)
+    transformersPromise ??= import(TRANSFORMERS_CDN).then((T) => {
+        // Explicitly enable the browser Cache API so model ONNX blobs are
+        // persisted in Cache Storage after the first download. The Service
+        // Worker (sw.js) provides a second, independent caching layer that
+        // also handles the ESM bundle import itself.
+        if (T.env) {
+            T.env.useBrowserCache = true
+            // Allow loading from cache even when offline.
+            T.env.allowLocalModels = false
+            // WASM threads exist only under COOP/COEP (plain hosts run 1);
+            // when isolated, leave a core for the OS instead of min(4, cores).
+            const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
+            if (T.env.backends?.onnx?.wasm) T.env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(4, cores - 1))
+        }
+        return T
+    })
     return transformersPromise
 }
 
@@ -165,8 +188,12 @@ const pickDevice = async () => {
     let device = 'wasm'
     try {
         // navigator.gpu exists in dedicated workers too (where supported).
-        if (typeof navigator !== 'undefined' && navigator.gpu && await navigator.gpu.requestAdapter()) {
-            device = 'webgpu'
+        if (typeof navigator !== 'undefined' && navigator.gpu) {
+            // Prefer the user's performance GPU (including a discrete GPU) when
+            // the browser permits it; fall back to its default adapter.
+            const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
+                || await navigator.gpu.requestAdapter()
+            if (adapter) device = 'webgpu'
         }
     } catch { /* no WebGPU */ }
     state.device = device
@@ -223,23 +250,47 @@ const loadBundle = (laneKey) => {
 /** Kick the background flagship download once the draft lane is serving. */
 const maybeStartFlagship = () => {
     if (state.flagship !== 'idle') return
-    state.flagship = 'loading';
-    (async () => {
+    state.flagship = 'loading'
+    state.flagshipEpoch += 1
+    const epoch = state.flagshipEpoch
+    trace('flagship-start', { epoch })
+    const launch = async () => {
         try {
+            // Drain queued jobs, settle, drain again: the 300 MB lane must
+            // never stack on the import burst (the historical 8 GB stall).
+            await jobChain.catch(() => {})
+            await new Promise((resolve) => setTimeout(resolve, FLAGSHIP_SETTLE_MS))
+            await jobChain.catch(() => {})
+            if (epoch !== state.flagshipEpoch || state.flagship !== 'loading') return
             const device = await pickDevice()
             if (device !== 'webgpu' || state.forcedWasm) {
                 state.flagship = 'unavailable'
                 return
             }
+            // Browsers do not expose VRAM and deviceMemory tops out at 8 GB.
+            // On the 8 GB target, unload the disposable detector before the
+            // optional 300 MB flagship allocates GPU buffers. Text detection
+            // can lazily recreate its session when needed.
+            if ((state.budget.maxResidentHeavy || 1) <= 1) {
+                try { (await import('./detect-engine.js')).disposeDetector() } catch { /* detector was not loaded */ }
+            }
             await loadBundle('flagship')
+            // A level-3 pressure event can arrive while the model downloads or
+            // compiles. Do not resurrect its large GPU session afterwards.
+            if (epoch !== state.flagshipEpoch || state.flagship !== 'loading') {
+                bundles.flagship = null
+                return
+            }
             state.flagship = 'ready'
             emitEvent({ type: 'lane', lane: 'flagship', label: LANES.flagship.label })
         } catch (err) {
+            if (epoch !== state.flagshipEpoch) return
             console.warn('[seglab] flagship lane unavailable:', err?.message)
             state.flagship = 'failed'
             bundles.flagship = null
         }
-    })()
+    }
+    launch()
 }
 
 /**
@@ -249,6 +300,7 @@ const maybeStartFlagship = () => {
  * data-saver / test escape hatch on top of whatever the budget says.
  */
 export const warm = async ({ flagship = true, budget = null } = {}) => {
+    trace('warm-start', { flagship, profile: budget?.profile })
     if (budget) state.budget = { ...DEFAULT_BUDGET, ...budget }
     if (state.budget.forceWasm && !state.forcedWasm) {
         state.forcedWasm = true
@@ -256,9 +308,18 @@ export const warm = async ({ flagship = true, budget = null } = {}) => {
     }
     await loadBundle('draft')
     state.ready = true
-    if (flagship && state.budget.flagship) maybeStartFlagship()
+    if (flagship && state.budget.flagship) {
+        // The draft lane may have started under the safe provisional budget
+        // before a trusted host reports its larger allocation. Re-open only
+        // that deliberately deferred optional upgrade; a real failed lane
+        // remains sticky-failed and is never retried implicitly.
+        if (state.flagship === 'unavailable') state.flagship = 'idle'
+        maybeStartFlagship()
+    }
     else if (state.flagship === 'idle') state.flagship = 'unavailable'
-    return getEngineState()
+    const engineState = getEngineState()
+    trace('warm-ready', engineState)
+    return engineState
 }
 
 const makeCanvas = (w, h) => {
@@ -276,10 +337,11 @@ const makeCanvas = (w, h) => {
  * `ephemeral` skips the cache insert — one-shot crop encodes (HD export)
  * must never evict a document embedding the user is actively clicking on.
  */
-const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } = {}) => {
+const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false, pixels = null, gray = null } = {}) => {
     const cacheKey = `${bundle.laneKey}:${imageKey}`
     const hit = embedCache.get(cacheKey)
     if (hit) {
+        trace('embedding-hit', { cacheKey })
         // Refresh LRU position.
         embedCache.delete(cacheKey)
         embedCache.set(cacheKey, hit)
@@ -291,26 +353,33 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } 
     if (persistable) {
         const persisted = await loadEmbedding(cacheKey, bundle.transformers.Tensor)
         if (persisted) {
+            trace('embedding-persisted-hit', { cacheKey })
             insertWithCap(bundle, cacheKey, persisted)
             return { entry: persisted, encoded: false }
         }
     }
     if (!source) throw new Error('Embedding cache miss and no image source provided')
+    trace('embedding-miss', { cacheKey, width: source.width, height: source.height, ephemeral })
     const { RawImage } = bundle.transformers
     const w = source.width
     const h = source.height
     if (!w || !h) throw new Error('Selection source has no usable dimensions')
 
     // One draw, one readback: pixels feed BOTH the model input and the
-    // grayscale guide used by edge refinement.
-    const canvas = makeCanvas(w, h)
-    canvas.getContext('2d').drawImage(source, 0, 0)
-    const pixels = canvas.getContext('2d').getImageData(0, 0, w, h)
+    // grayscale guide used by edge refinement. Callers that already hold the
+    // crop's pixels/gray (hdRefine) pass them in — no second readback.
+    if (!pixels) {
+        const canvas = makeCanvas(w, h)
+        canvas.getContext('2d').drawImage(source, 0, 0)
+        pixels = canvas.getContext('2d').getImageData(0, 0, w, h)
+    }
     const image = new RawImage(pixels.data, w, h, 4)
-    const gray = new Float32Array(w * h)
-    for (let i = 0; i < gray.length; i += 1) {
-        const j = i * 4
-        gray[i] = (0.299 * pixels.data[j] + 0.587 * pixels.data[j + 1] + 0.114 * pixels.data[j + 2]) / 255
+    if (!gray) {
+        gray = new Float32Array(w * h)
+        for (let i = 0; i < gray.length; i += 1) {
+            const j = i * 4
+            gray[i] = (0.299 * pixels.data[j] + 0.587 * pixels.data[j + 1] + 0.114 * pixels.data[j + 2]) / 255
+        }
     }
 
     const inputs = await bundle.processor(image)
@@ -329,9 +398,11 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false } 
     }
     if (ephemeral) return { entry, encoded: true }
     insertWithCap(bundle, cacheKey, entry)
-    // `saved` resolves when the OPFS write lands (best-effort false on failure);
-    // segment ignores it, the eager encode op awaits it.
-    return { entry, encoded: true, saved: persistable ? saveEmbedding(cacheKey, entry) : null }
+    // Delay the OPFS copy until the caller knows this prewarm is still useful.
+    // Packing tensors duplicates their buffers briefly, so beginning that work
+    // for a stale click would create exactly the avoidable memory peak this
+    // pipeline is designed to prevent.
+    return { entry, encoded: true, save: persistable ? () => saveEmbedding(cacheKey, entry) : null }
 }
 
 // Insert + per-lane LRU eviction, cap owned by the session budget.
@@ -369,6 +440,7 @@ export const relievePressure = async (level = 1) => {
     }
     if (level >= 2) { purgeLane('flagship'); freed.push('flagship-embeddings') }
     if (level >= 3) {
+        state.flagshipEpoch += 1
         state.flagship = 'unavailable'
         bundles.flagship = null
         freed.push('flagship-session')
@@ -487,6 +559,7 @@ const segmentOnce = async (req) => {
     if (isStale(req)) return staleResult(req)
     const t0 = Date.now()
     const laneKey = req.lane || activeLaneKey()
+    trace('segment-start', { laneKey, revision: req.revision, imageKey: req.imageKey })
     const bundle = await loadBundle(laneKey)
     const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
     const tEncoded = Date.now()
@@ -496,7 +569,7 @@ const segmentOnce = async (req) => {
 
     const refined = refineMaskEdges(dec.rgba, dec.width, dec.height, entry.gray)
 
-    return {
+    const result = {
         rgba: dec.rgba,
         rawRgba: dec.rawRgba,
         width: dec.width,
@@ -512,6 +585,8 @@ const segmentOnce = async (req) => {
         hygiene: dec.hygiene,
         bandPixels: refined.bandPixels,
     }
+    trace('segment-result', { lane: result.lane, revision: result.revision, encoded, score: result.score })
+    return result
 }
 
 /**
@@ -525,9 +600,11 @@ const segmentOnce = async (req) => {
  */
 export const segment = async (req) => {
     const laneKey = activeLaneKey()
+    trace('segment-route', { laneKey, revision: req.revision })
     try {
         return await serialize(() => segmentOnce({ ...req, lane: laneKey }))
     } catch (err) {
+        console.error('[seglab][engine] segment-failed', { laneKey, revision: req.revision, err })
         if (isStale(req)) return staleResult(req) // don't demote lanes over a cancelled job
         // Out-of-memory: free the detector + flagship embeddings before the
         // lane demote below retries (cheapest residents go first).
@@ -559,16 +636,26 @@ export const segment = async (req) => {
 
 /**
  * M5 encode-at-import: warm the active lane's embedding for `imageKey` in the
- * background so the first click skips straight to decode. Awaits the OPFS
- * save — when this resolves, the embedding is persisted (best-effort).
+ * background so the first click skips straight to decode. The model encode is
+ * serialized; the optional OPFS copy deliberately happens after that queue is
+ * released, so a real selection never waits behind a disk write.
  */
-export const encodeImage = (req) => serialize(async () => {
-    const laneKey = req.lane || activeLaneKey()
-    const bundle = await loadBundle(laneKey)
-    const { encoded, saved } = await ensureEmbeddings(bundle, req.imageKey, req.source)
-    if (saved) await saved
-    return { encoded, lane: LANES[laneKey].label, device: state.device }
-})
+export const encodeImage = async (req) => {
+    const prepared = await serialize(async () => {
+        if (isStale(req)) return { stale: true }
+        const laneKey = req.lane || activeLaneKey()
+        const bundle = await loadBundle(laneKey)
+        const { encoded, save } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+        if (isStale(req)) return { stale: true }
+        return { encoded, save, lane: LANES[laneKey].label, device: state.device }
+    })
+    if (prepared.stale || isStale(req)) return staleResult(req)
+    // `await` yields the worker event loop, so segments can enter serialize()
+    // while OPFS writes this best-effort revisit cache in the background.
+    if (prepared.save) await prepared.save()
+    if (isStale(req)) return staleResult(req)
+    return { encoded: prepared.encoded, lane: prepared.lane, device: prepared.device }
+}
 
 /**
  * Encode a crop (cached under `cacheKey`, or `ephemeral` for one-shot export
@@ -581,7 +668,9 @@ export const encodeImage = (req) => serialize(async () => {
 const cropSegment = async (req) => {
     const laneKey = req.lane || activeLaneKey()
     const bundle = await loadBundle(laneKey)
-    const { entry, encoded } = await ensureEmbeddings(bundle, req.cacheKey, req.source, { ephemeral: req.ephemeral })
+    const { entry, encoded } = await ensureEmbeddings(bundle, req.cacheKey, req.source, {
+        ephemeral: req.ephemeral, pixels: req.pixels, gray: req.gray,
+    })
     const dec = await decodeMask(bundle, entry, req)
     if (!dec) return null
     return { ...dec, gray: entry.gray, encoded, lane: LANES[laneKey].label }
@@ -633,6 +722,8 @@ const hdRefineOnce = async (req) => {
                 source: canvas,
                 cacheKey: cropKey,
                 ephemeral: true,
+                pixels, // crop readback + gray already built above — reuse
+                gray,
                 lane: req.lane,
                 revision: req.revision,
                 ...prompts,

@@ -2,6 +2,7 @@
   "name": "seglab",
   "private": true,
   "scripts": {
+    "dev": "python3 -m http.server 8788 --bind 127.0.0.1",
     "verify": "bun verify.mjs"
   },
   "devDependencies": {
