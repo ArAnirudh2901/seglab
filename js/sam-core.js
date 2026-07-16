@@ -3,8 +3,12 @@
  * ----------------------------------------------
  * Prompt/mask math for the on-device segmentation engine: mapping click/box
  * coordinates into the model's reshaped input space, building prompt tensor
- * payloads, picking the best of SAM's three candidate masks, and converting
- * a mask tensor into RGBA. Dependency-free so it can be unit-tested headless.
+ * payloads, picking the best of SAM's three candidate masks, and mask
+ * hygiene. Dependency-free so it can be unit-tested headless.
+ *
+ * MASK CONTRACT: masks are one-channel Uint8Array alpha maps (0..255,
+ * width*height bytes) everywhere. RGBA exists only at the final render
+ * boundary (alphaToImageData).
  *
  * Coordinate model: SAM resizes the source so its longest side hits the
  * model input size (1024) — `reshaped_input_sizes` is that resized [h, w].
@@ -80,25 +84,20 @@ export const pickBestMask = (scores) => {
 
 /**
  * Extract one channel of a post-processed bool mask tensor ([1, C, H, W],
- * Uint8 0/1 data) as opaque white-on-black RGBA.
+ * Uint8 0/1 data) as a one-channel alpha map.
  */
-export const maskChannelToRGBA = (maskData, width, height, channel) => {
+export const maskChannelToAlpha = (maskData, width, height, channel) => {
     const size = width * height
     const offset = channel * size
-    const rgba = new Uint8ClampedArray(size * 4)
+    const alpha = new Uint8Array(size)
     for (let i = 0; i < size; i += 1) {
-        const v = maskData[offset + i] ? 255 : 0
-        const j = i * 4
-        rgba[j] = v
-        rgba[j + 1] = v
-        rgba[j + 2] = v
-        rgba[j + 3] = 255
+        alpha[i] = maskData[offset + i] ? 255 : 0
     }
-    return rgba
+    return alpha
 }
 
-/** Coverage + bbox of a white-on-black RGBA mask (reads the R channel). */
-export const summarizeMaskRGBA = (rgba, width, height) => {
+/** Coverage + bbox of an alpha mask (≥128 counts as selected). */
+export const summarizeMaskAlpha = (alpha, width, height) => {
     let count = 0
     let minX = width
     let minY = height
@@ -107,7 +106,7 @@ export const summarizeMaskRGBA = (rgba, width, height) => {
     for (let y = 0; y < height; y += 1) {
         const row = y * width
         for (let x = 0; x < width; x += 1) {
-            if (rgba[(row + x) * 4] >= 128) {
+            if (alpha[row + x] >= 128) {
                 count += 1
                 if (x < minX) minX = x
                 if (x > maxX) maxX = x
@@ -120,6 +119,20 @@ export const summarizeMaskRGBA = (rgba, width, height) => {
         coverage: count / (width * height),
         bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null,
     }
+}
+
+/** Render-boundary expansion: alpha mask → tinted ImageData (browser only). */
+export const alphaToImageData = (alpha, width, height, tint = [255, 255, 255]) => {
+    const out = new ImageData(width, height)
+    const d = out.data
+    const [r, g, b] = tint
+    for (let p = 0, i = 0; p < alpha.length; p += 1, i += 4) {
+        d[i] = r
+        d[i + 1] = g
+        d[i + 2] = b
+        d[i + 3] = alpha[p]
+    }
+    return out
 }
 
 /**
@@ -197,16 +210,16 @@ const labelNearSeed = (labels, w, h, x, y, radius = 8) => {
  *   4. fill interior holes below ~1% of the mask area (upsample pinholes) —
  *      big legitimate gaps (background seen through a frame) stay open.
  *
- * @param {Uint8ClampedArray} rgba  white-on-black mask, modified in place
+ * @param {Uint8Array} alpha  one-channel mask, modified in place
  * @param {Array<[number, number]>} seeds  positive prompt points
  * @returns {{ kept: number, dropped: number, holesFilled: number }}
  */
-export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
+export const cleanupMaskAlpha = (alpha, w, h, seeds = []) => {
     const size = w * h
     const bin = new Uint8Array(size)
     let fgArea = 0
     for (let i = 0; i < size; i += 1) {
-        if (rgba[i * 4] >= 128) { bin[i] = 1; fgArea += 1 }
+        if (alpha[i] >= 128) { bin[i] = 1; fgArea += 1 }
     }
     if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
 
@@ -234,10 +247,7 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
         if (bin[i] && !keep.has(labels[i])) {
             bin[i] = 0
             dropped += 1
-            const j = i * 4
-            rgba[j] = 0
-            rgba[j + 1] = 0
-            rgba[j + 2] = 0
+            alpha[i] = 0
         }
     }
 
@@ -265,20 +275,17 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
         for (let i = 0; i < size; i += 1) {
             if (fillLabel.has(bg.labels[i])) {
                 holesFilled += 1
-                const j = i * 4
-                rgba[j] = 255
-                rgba[j + 1] = 255
-                rgba[j + 2] = 255
+                alpha[i] = 255
             }
         }
     }
     return { kept: keep.size, dropped, holesFilled }
 }
 
-/** Component count of a mask (verify/debug hook). */
-export const countMaskComponents = (rgba, w, h) => {
+/** Component count of an alpha mask (verify/debug hook). */
+export const countMaskComponents = (alpha, w, h) => {
     const bin = new Uint8Array(w * h)
-    for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
+    for (let i = 0; i < bin.length; i += 1) bin[i] = alpha[i] >= 128 ? 1 : 0
     return labelComponents(bin, w, h).areas.length
 }
 

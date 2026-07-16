@@ -6,18 +6,45 @@
  * worker → SlimSAM); this module owns only UI state, prompt collection,
  * overlay rendering, and the lasso clamp.
  *
- * One reference frame: the photo is downscaled once into a ≤1024 canonical
- * canvas (#view). Prompts, masks, overlay, and the cutout all live in that
- * frame — display scaling is pure CSS, undone at the pointer.
+ * One reference frame: the photo is downscaled once into a bounded canonical
+ * canvas (#view, ≤ policy.proxyMax — 768 px on the lite profile). Prompts,
+ * masks, overlay, and the cutout all live in that frame — display scaling is
+ * pure CSS, undone at the pointer.
+ *
+ * Memory safety: the device policy (js/policy.js) is resolved once at boot
+ * and rules every limit. On ≤8 GB or unknown-memory devices the lite profile
+ * is forced and URL flags cannot raise any cap. SlimSAM is the only
+ * automatic model; SAM3 exists solely behind an explicit opt-in.
  */
 
-import { countMaskComponents, lassoToPrompts } from './sam-core.js'
-import { clientState, segment, subscribe, warmUp } from './sam-client.js'
+import { alphaToImageData, countMaskComponents, lassoToPrompts } from './sam-core.js'
+import { clientState, getEngineSnapshot, resetImage, segment, startFlagship, subscribe, warmUp } from './sam-client.js'
+import { exportCutout } from './export-hd.js'
+import { resolvePolicy, effectivePolicy } from './policy.js'
+import { detectCapability, getPressureLevel, isMemoryError, onPressureChange, reportPressure, startPressureMonitor } from './capability.js'
+import { PRIORITY, cancelHeavyBefore, clearHeavyQueue, enqueueHeavy, getHeavyQueueState } from './heavy-job-queue.js'
+import { getBoundedProxySize } from './image-io.js'
+import { decodeProxy } from './decode-client.js'
+import { disposeCv, ensureGuide, isCvUsable, refine as cvRefine, resetCv } from './cv-refine-client.js'
 
-// ?flagship=0 keeps the session on the 14 MB draft lane (tests, data saver).
-const FLAGSHIP_ENABLED = new URLSearchParams(location.search).get('flagship') !== '0'
+const capability = detectCapability()
+const policy = resolvePolicy({ capability, search: location.search })
+/** Current limits with memory-pressure reductions applied. */
+const eff = () => effectivePolicy(policy, getPressureLevel())
 
-const CANON_MAX = 1024
+/** Structured memory telemetry — dev mode (?debug=1) only. */
+const memlog = (event, extra = {}) => {
+    if (!policy.debug) return
+    const entry = {
+        event,
+        pressureLevel: getPressureLevel(),
+        queueActive: getHeavyQueueState().activeLabel,
+        modelLane: clientState.lane || 'slimsam',
+        ...extra,
+    }
+    ;(window.__seglabMemLog ??= []).push(entry)
+    console.log('[seglab][memory]', JSON.stringify(entry))
+}
 const ACCENT = '#35e0c2'
 const POS_COLOR = '#35e08a'
 const NEG_COLOR = '#ff5d6c'
@@ -46,10 +73,11 @@ const state = {
     clicks: [],               // [[x, y, label], ...] canonical coords
     box: null,                // [x0, y0, x1, y1] canonical
     lasso: null,              // { poly, box, point, margin } from lassoToPrompts
-    mask: null,               // refined ImageData (white-on-black), canonical size
+    mask: null,               // refined { alpha: Uint8Array, width, height }
     maskRaw: null,            // decoder output before hygiene/refinement (E toggle)
     showRaw: false,
     maskSummary: null,
+    lastRefiner: null,        // 'wasm' | 'js' (cv worker) | 'engine-js'
     score: 0,
     drag: null,               // in-progress interaction {kind, points|start}
     runSeq: 0,                // stale-result guard
@@ -59,6 +87,21 @@ const state = {
 
 const viewCtx = els.view.getContext('2d')
 const overlayCtx = els.overlay.getContext('2d')
+
+/* ─── Document custody ───────────────────────────────────────────────────── */
+// The original image exists ONLY as this compressed Blob. Every import bumps
+// `revision`; stale heavy jobs and worker replies are dropped against it.
+const doc = { revision: 0, blob: null, meta: null }
+
+const beginDocument = (blob) => {
+    doc.revision += 1
+    doc.blob = blob
+    doc.meta = null
+    cancelHeavyBefore(doc.revision)
+    resetImage(doc.revision) // engine frees its embedding slot
+    resetCv(doc.revision) // refine worker drops its stale guide
+    return doc.revision
+}
 
 /* ─── Status / chips ─────────────────────────────────────────────────────── */
 
@@ -83,12 +126,11 @@ subscribe((event) => {
         if (d.status === 'progress' && d.total) {
             const pct = Math.round((d.loaded / d.total) * 100)
             els.loadbar.style.width = `${pct}%`
-            // Flagship downloads in the background — say so without hiding
-            // that the tool is already usable on the draft lane.
+            // Flagship progress only ever appears after the explicit opt-in.
             if (d.lane === 'flagship') {
-                if (!state.running) setStatus(`Ready on SlimSAM — upgrading to SAM3 in the background, ${pct}% of ~300 MB (one-time)`)
+                if (!state.running) setStatus(`Downloading SAM3 (your opt-in) — ${pct}% of ~300 MB (one-time)`)
             } else {
-                setStatus(`Downloading model — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~14 MB)`)
+                setStatus(`Downloading model — ${String(d.file || '').split('/').pop()} ${pct}% (one-time)`)
             }
         } else if (d.status === 'done') {
             els.loadbar.style.width = '0%'
@@ -98,7 +140,7 @@ subscribe((event) => {
     if (event.type === 'lane') {
         refreshChips()
         if (event.label === 'sam3') {
-            setStatus('Upgraded to SAM3 — masks are sharper from here on')
+            setStatus('SAM3 enabled — masks are sharper from here on')
             // Prompt replay: silently re-run the current selection at
             // flagship quality (first replay re-encodes the image).
             if (state.hasImage && (state.clicks.length || state.box || state.lasso)) scheduleRun()
@@ -115,16 +157,7 @@ subscribe((event) => {
 
 /* ─── Image import ───────────────────────────────────────────────────────── */
 
-const showImage = (bitmapOrCanvas) => {
-    const w0 = bitmapOrCanvas.width
-    const h0 = bitmapOrCanvas.height
-    const scale = Math.min(1, CANON_MAX / Math.max(w0, h0))
-    els.view.width = Math.max(1, Math.round(w0 * scale))
-    els.view.height = Math.max(1, Math.round(h0 * scale))
-    els.overlay.width = els.view.width
-    els.overlay.height = els.view.height
-    viewCtx.drawImage(bitmapOrCanvas, 0, 0, els.view.width, els.view.height)
-
+const revealEditor = () => {
     state.hasImage = true
     clearPrompts()
     els.dropzone.style.display = 'none'
@@ -132,18 +165,83 @@ const showImage = (bitmapOrCanvas) => {
     setStatus(clientState.ready
         ? 'Ready — click any object'
         : 'Preparing the model in the background — you can aim already')
-    // Start the one-time model download NOW, while the user is aiming.
-    warmUp({ flagship: FLAGSHIP_ENABLED }).catch((err) => setStatus(`Model load failed: ${err?.message}`))
+    // Warm strictly AFTER the proxy is visible — decode and model work
+    // serialize through the heavy queue, never overlapping.
+    scheduleWarm()
 }
 
-const loadFile = async (file) => {
-    if (!file || !file.type?.startsWith('image/')) return
+/** In-memory canvas sources (demo scene) — no decode, same size bound. */
+const showImage = (canvas) => {
+    beginDocument(null)
+    const { width, height } = getBoundedProxySize(canvas.width, canvas.height, eff().proxyMax)
+    els.view.width = width
+    els.view.height = height
+    els.overlay.width = width
+    els.overlay.height = height
+    viewCtx.drawImage(canvas, 0, 0, width, height)
+    doc.meta = {
+        original: { width: canvas.width, height: canvas.height, orientation: 1, format: 'canvas' },
+        proxy: { width, height, scale: width / canvas.width },
+    }
+    revealEditor()
+}
+
+/** Bounded bitmap from the decode worker — drawn once, closed immediately. */
+const showProxy = (bitmap) => {
     try {
-        // from-image: honour EXIF orientation (phone photos).
-        const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' })
-        showImage(bmp)
-        bmp.close()
+        els.view.width = bitmap.width
+        els.view.height = bitmap.height
+        els.overlay.width = bitmap.width
+        els.overlay.height = bitmap.height
+        viewCtx.drawImage(bitmap, 0, 0)
+    } finally {
+        try { bitmap.close() } catch { /* already closed */ }
+    }
+    revealEditor()
+}
+
+let warmQueued = false
+/** Warm the draft (SlimSAM) lane only — never the flagship. Queued so it
+ *  can never overlap another heavy job (e.g. an import decode). */
+const scheduleWarm = () => {
+    if (warmQueued) return
+    warmQueued = true
+    enqueueHeavy('model-warm', () => warmUp(), { priority: PRIORITY.model })
+        .then(() => memlog('warm-done'))
+        .catch((err) => {
+            warmQueued = false
+            if (!err?.stale) setStatus(`Model load failed: ${err?.message}`)
+        })
+}
+
+// RAW containers carry a decodable embedded JPEG preview (best-effort lane).
+const RAW_EXTENSIONS = /\.(cr2|cr3|nef|arw|dng|raf|orf|rw2|srw|pef)$/i
+
+const loadFile = async (file) => {
+    if (!file) return
+    if (!file.type?.startsWith('image/') && !RAW_EXTENSIONS.test(file.name || '')) return
+    const revision = beginDocument(file)
+    setStatus('Reading image…')
+    try {
+        const res = await enqueueHeavy(
+            'proxy-decode',
+            () => decodeProxy(file, eff().proxyMax, revision),
+            { priority: PRIORITY.import, revision, isCurrent: () => revision === doc.revision },
+        )
+        if (revision !== doc.revision) {
+            try { res?.bitmap?.close?.() } catch { /* already closed */ }
+            return
+        }
+        doc.meta = { original: res.original, proxy: res.proxy }
+        memlog('proxy-decoded', {
+            original: `${res.original.width}x${res.original.height}`,
+            proxy: `${res.proxy.width}x${res.proxy.height}`,
+            format: res.original.format,
+        })
+        showProxy(res.bitmap)
     } catch (err) {
+        if (err?.stale || revision !== doc.revision) return
+        if (isMemoryError(err)) reportPressure(1, 'import decode allocation failure')
         setStatus(`Could not read that image: ${err?.message}`)
     }
 }
@@ -181,6 +279,7 @@ els.pick.addEventListener('click', () => els.file.click())
 els.file.addEventListener('change', () => loadFile(els.file.files?.[0]))
 els.demo.addEventListener('click', () => showImage(buildDemoScene()))
 els.newimg.addEventListener('click', () => {
+    beginDocument(null)
     state.hasImage = false
     clearPrompts()
     els.stage.classList.remove('visible')
@@ -366,18 +465,48 @@ async function runNow() {
     if (clicks.length === 0 && !box) return
 
     const seq = ++state.runSeq
+    const docRev = doc.revision
     state.running = true
     setStatus(clientState.ready ? 'Selecting…' : 'Selecting… (first run loads the model)')
     try {
-        // The engine runs the whole post pipeline (lasso clamp → hygiene →
-        // edge refinement) off-thread and returns both masks.
-        const res = await segment(els.view, {
+        // One heavy job covers decode + refinement: SlimSAM decodes (clamp
+        // only), then the cv worker (wasm, JS fallback) runs hygiene + edge
+        // refinement. If the cv lane is gone, the engine's own JS pipeline
+        // serves — a lost refiner never costs a selection.
+        const prompts = {
             clicks,
             box,
             clampPoly: state.lasso?.poly || null,
             clampMargin: state.lasso?.margin || 0,
+        }
+        const res = await enqueueHeavy('prompt-decode', async () => {
+            const useCv = eff().wasmRefine && isCvUsable()
+            const seg = await segment(els.view, prompts, { revision: docRev, post: useCv ? 'clamp-only' : 'js' })
+            if (!useCv) return { ...seg, refiner: 'engine-js' }
+            try {
+                await ensureGuide(docRev, els.view)
+                const seeds = clicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
+                const refined = await cvRefine({
+                    revision: docRev,
+                    width: seg.width,
+                    height: seg.height,
+                    alpha: seg.alpha,
+                    alphaRaw: seg.alphaRaw,
+                    seeds,
+                })
+                return { ...seg, ...refined }
+            } catch (err) {
+                if (err?.stale) throw err
+                console.warn('[seglab] cv refinement unavailable; engine pipeline serves:', err?.message)
+                const retry = await segment(els.view, prompts, { revision: docRev, post: 'js' })
+                return { ...retry, refiner: 'engine-js' }
+            }
+        }, {
+            priority: PRIORITY.interaction,
+            revision: docRev,
+            isCurrent: () => seq === state.runSeq && docRev === doc.revision,
         })
-        if (seq !== state.runSeq) return // superseded — a newer prompt owns the state
+        if (seq !== state.runSeq || docRev !== doc.revision) return // superseded
 
         if (!res.usable) {
             state.mask = null
@@ -385,57 +514,53 @@ async function runNow() {
             state.maskSummary = null
             setStatus(`No selection — ${res.reason}. Try another click.`)
         } else {
-            state.mask = res.imageData
-            state.maskRaw = res.rawImageData
+            state.mask = { alpha: res.alpha, width: res.width, height: res.height }
+            state.maskRaw = { alpha: res.alphaRaw, width: res.width, height: res.height }
             state.maskSummary = res.summary
+            state.lastRefiner = res.refiner || null
             state.score = res.score
             setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(res.summary.coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}`)
+            memlog('selection-done', {
+                encoded: res.encoded,
+                encodeMs: res.encodeMs,
+                decodeMs: res.decodeMs,
+                refiner: res.refiner || null,
+                ms: res.ms,
+            })
         }
         renderOverlay()
         refreshButtons()
     } catch (err) {
-        if (seq !== state.runSeq) return
+        if (seq !== state.runSeq || err?.stale) return
         console.error('[seglab] selection failed:', err)
+        if (isMemoryError(err)) reportPressure(2, 'selection allocation failure')
         setStatus(`Selection failed: ${err?.message}`)
     } finally {
         state.running = false
+        // Pressure L3: hold no embedding between interactions.
+        if (eff().clearEmbeddingAfterRun) resetImage(doc.revision)
         if (state.runQueued) { state.runQueued = false; scheduleRun() }
     }
 }
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
-/** Colorize the white-on-black mask; returns {fill, ring} canvases. */
+/** Colorize the one-channel mask; returns {fill, ring} canvases. */
 const buildMaskLayers = (mask) => {
     const { width, height } = mask
-    const raw = new OffscreenCanvas(width, height)
-    const rawCtx = raw.getContext('2d')
-    rawCtx.putImageData(mask, 0, 0)
+    const fill = new OffscreenCanvas(width, height)
+    fill.getContext('2d').putImageData(alphaToImageData(mask.alpha, width, height, [53, 224, 194]), 0, 0)
 
-    // Only the white pixels, as accent color (black pixels are opaque in the
-    // ImageData, so tint via source-in on a luma→alpha copy).
-    const alpha = new OffscreenCanvas(width, height)
-    const alphaCtx = alpha.getContext('2d', { willReadFrequently: true })
-    alphaCtx.drawImage(raw, 0, 0)
-    // Convert luma → alpha and tint in one pixel pass.
-    const img = alphaCtx.getImageData(0, 0, width, height)
-    const d = img.data
-    for (let i = 0; i < d.length; i += 4) {
-        d[i + 3] = d[i] // alpha = luma
-        d[i] = 53; d[i + 1] = 224; d[i + 2] = 194 // accent RGB
-    }
-    alphaCtx.putImageData(img, 0, 0)
-
-    // Ring = 8-direction dilate of the alpha mask minus the mask itself.
+    // Ring = 8-direction dilate of the fill minus the fill itself.
     const ring = new OffscreenCanvas(width, height)
     const ringCtx = ring.getContext('2d')
     const r = Math.max(1.25, Math.min(width, height) / 480)
     for (const [dx, dy] of [[-r, 0], [r, 0], [0, -r], [0, r], [-r, -r], [r, -r], [-r, r], [r, r]]) {
-        ringCtx.drawImage(alpha, dx, dy)
+        ringCtx.drawImage(fill, dx, dy)
     }
     ringCtx.globalCompositeOperation = 'destination-out'
-    ringCtx.drawImage(alpha, 0, 0)
-    return { fill: alpha, ring }
+    ringCtx.drawImage(fill, 0, 0)
+    return { fill, ring }
 }
 
 function renderOverlay() {
@@ -512,29 +637,72 @@ function renderOverlay() {
 
 /* ─── Cutout export ──────────────────────────────────────────────────────── */
 
+/** Explicit export: bounded original re-decode (≤4096px/8MP), mask upscaled. */
+const runExport = async () => {
+    if (!state.mask) return null
+    const t0 = Date.now()
+    const res = await exportCutout({
+        doc,
+        mask: { alpha: state.mask.alpha.slice(), width: state.mask.width, height: state.mask.height },
+        policy: eff(),
+        sourceCanvas: els.view,
+    })
+    memlog('export-done', { out: `${res.width}x${res.height}`, reduced: res.reduced, durMs: Date.now() - t0 })
+    return res
+}
+
 els.cutout.addEventListener('click', async () => {
     if (!state.mask) return
-    const c = document.createElement('canvas')
-    c.width = els.view.width
-    c.height = els.view.height
-    const ctx = c.getContext('2d')
-    ctx.drawImage(els.view, 0, 0)
-    const maskCanvas = document.createElement('canvas')
-    maskCanvas.width = c.width
-    maskCanvas.height = c.height
-    // Mask luma → alpha for destination-in.
-    const md = new ImageData(new Uint8ClampedArray(state.mask.data), c.width, c.height)
-    for (let i = 0; i < md.data.length; i += 4) md.data[i + 3] = md.data[i]
-    maskCanvas.getContext('2d').putImageData(md, 0, 0)
-    ctx.globalCompositeOperation = 'destination-in'
-    ctx.drawImage(maskCanvas, 0, 0)
-    const blob = await new Promise((res) => c.toBlob(res, 'image/png'))
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = 'seglab-cutout.png'
-    a.click()
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+    els.cutout.disabled = true
+    setStatus('Exporting cutout…')
+    try {
+        const res = await runExport()
+        if (!res) return
+        const a = document.createElement('a')
+        a.href = URL.createObjectURL(res.blob)
+        a.download = 'seglab-cutout.png'
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+        setStatus(res.reduced
+            ? `Exported ${res.width}×${res.height} — reduced to fit this device's safe memory profile`
+            : `Exported ${res.width}×${res.height}`)
+    } catch (err) {
+        if (!err?.stale) setStatus(`Export failed: ${err?.message}`)
+    } finally {
+        refreshButtons()
+    }
 })
+
+/* ─── SAM3 opt-in (explicit, confirmed, never automatic) ─────────────────── */
+
+const els_sam3 = $('sam3optin')
+if (policy.allowFlagshipOptIn && typeof navigator !== 'undefined' && navigator.gpu) {
+    els_sam3.hidden = false
+    els_sam3.addEventListener('click', async () => {
+        if (!eff().allowFlagshipOptIn) { setStatus('SAM3 opt-in unavailable under memory pressure'); return }
+        const ok = window.confirm(
+            'Enable SAM3 (optional flagship model)?\n\n'
+            + '• ~300 MB one-time download + WebGPU compile\n'
+            + '• Needs more memory than the 8 GB safe profile guarantees\n'
+            + '• SlimSAM keeps working either way',
+        )
+        if (!ok) return
+        els_sam3.disabled = true
+        setStatus('Loading SAM3 — your explicit opt-in…')
+        try {
+            const engine = await enqueueHeavy('flagship-warm', () => startFlagship(), { priority: PRIORITY.model })
+            if (engine?.flagship === 'ready') {
+                els_sam3.textContent = 'SAM3 ✓'
+            } else {
+                setStatus('SAM3 unavailable on this device — continuing on SlimSAM')
+                els_sam3.disabled = false
+            }
+        } catch (err) {
+            setStatus(`SAM3 load failed: ${err?.message}`)
+            els_sam3.disabled = false
+        }
+    })
+}
 
 /* ─── Headless test hooks (verify.mjs) ───────────────────────────────────── */
 
@@ -546,9 +714,65 @@ const waitForRun = async () => {
     }
 }
 
+/** Synthetic DSLR-scale photo (red disc at 0.3w/0.5h on a gradient) — lets
+ *  the harness exercise a real multi-megapixel JPEG decode in-page. */
+const makeSyntheticPhoto = async (w, h) => {
+    const c = new OffscreenCanvas(w, h)
+    const ctx = c.getContext('2d')
+    const grad = ctx.createLinearGradient(0, 0, 0, h)
+    grad.addColorStop(0, '#3c4250')
+    grad.addColorStop(1, '#20242d')
+    ctx.fillStyle = grad
+    ctx.fillRect(0, 0, w, h)
+    ctx.fillStyle = '#d8433b'
+    ctx.beginPath()
+    ctx.arc(w * 0.3, h * 0.5, Math.min(w, h) * 0.15, 0, Math.PI * 2)
+    ctx.fill()
+    return c.convertToBlob({ type: 'image/jpeg', quality: 0.9 })
+}
+
 window.__seglab = {
     loadDemo: () => { showImage(buildDemoScene()) },
     reset: () => clearPrompts(),
+    policy: () => ({ ...eff() }),
+    capability: () => ({ ...capability }),
+    viewSize: () => ({ width: els.view.width, height: els.view.height }),
+    queueLog: () => getHeavyQueueState(),
+    docMeta: () => ({
+        revision: doc.revision,
+        hasBlob: !!doc.blob,
+        blobBytes: doc.blob?.size ?? null,
+        original: doc.meta?.original || null,
+        proxy: doc.meta?.proxy || null,
+    }),
+    importSynthetic: async (w, h) => {
+        await loadFile(await makeSyntheticPhoto(w, h))
+        return window.__seglab.docMeta()
+    },
+    // Two overlapping imports: the second must win, the first must drop.
+    importRace: async () => {
+        const [b1, b2] = await Promise.all([makeSyntheticPhoto(6000, 4000), makeSyntheticPhoto(2400, 3600)])
+        await Promise.allSettled([loadFile(b1), loadFile(b2)])
+        return { ...window.__seglab.docMeta(), view: window.__seglab.viewSize() }
+    },
+    // Test-only: a rejecting job must not stall the lane.
+    enqueueFailing: () => enqueueHeavy('test-fail', () => Promise.reject(new Error('synthetic failure')))
+        .catch((e) => String(e?.message)),
+    // Test-only: proves priority order — blocker occupies the lane while a
+    // speculative and an interaction job queue behind it.
+    queueProbe: async () => {
+        const order = []
+        const mk = (name, pri, ms) => enqueueHeavy(name, () => new Promise((res) => {
+            setTimeout(() => { order.push(name); res() }, ms)
+        }), { priority: pri })
+        const jobs = [
+            mk('probe-blocker', PRIORITY.model, 120),
+            mk('probe-spec', PRIORITY.speculative, 10),
+            mk('probe-interaction', PRIORITY.interaction, 10),
+        ]
+        await Promise.all(jobs)
+        return order
+    },
     state: () => ({
         ready: clientState.ready,
         device: clientState.device,
@@ -556,17 +780,102 @@ window.__seglab = {
         lane: clientState.lane,
         lastRun: clientState.lastRun,
         maskSummary: state.maskSummary,
+        lastRefiner: state.lastRefiner,
         score: state.score,
         clicks: state.clicks.length,
     }),
     maskStats: () => {
         if (!state.mask) return null
-        const { data, width, height } = state.mask
+        const { alpha, width, height } = state.mask
         let soft = 0
-        for (let i = 0; i < data.length; i += 4) {
-            if (data[i] > 16 && data[i] < 240) soft += 1
+        for (let i = 0; i < alpha.length; i += 1) {
+            if (alpha[i] > 16 && alpha[i] < 240) soft += 1
         }
-        return { components: countMaskComponents(data, width, height), softPixels: soft }
+        return { components: countMaskComponents(alpha, width, height), softPixels: soft }
+    },
+    engineState: () => getEngineSnapshot(),
+    exportProbe: async () => {
+        const res = await runExport()
+        return res ? { width: res.width, height: res.height, reduced: res.reduced, bytes: res.blob.size } : null
+    },
+    enableFlagship: () => enqueueHeavy('flagship-warm', () => startFlagship(), { priority: PRIORITY.model }),
+    setPressure: (level) => reportPressure(level, 'test hook'),
+    releaseMemory: () => {
+        clearHeavyQueue()
+        resetImage(doc.revision)
+        resetCv(doc.revision)
+        disposeCv()
+        state.mask = null
+        state.maskRaw = null
+        state.maskSummary = null
+        renderOverlay()
+        refreshButtons()
+        memlog('release-memory')
+        return true
+    },
+    // Test-only: drives the cv worker directly with crafted masks.
+    cvTest: async () => {
+        const W = 100
+        const results = {}
+        const mk = (n = W * W) => new Uint8Array(n)
+        const sq = (a, x0, y0, x1, y1, v = 255) => {
+            for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) a[y * W + x] = v
+        }
+        const run = (alpha, seeds, options = {}) => cvRefine({
+            revision: doc.revision, width: W, height: W, alpha, alphaRaw: mk(), seeds, options,
+        })
+        results.dimReject = await cvRefine({
+            revision: doc.revision, width: 800, height: 800,
+            alpha: new Uint8Array(800 * 800), alphaRaw: new Uint8Array(800 * 800), seeds: [],
+        }).then(() => false, () => true)
+        {
+            const a = mk()
+            sq(a, 30, 30, 69, 69) // 40×40 object
+            sq(a, 48, 48, 53, 53, 0) // interior hole
+            sq(a, 5, 5, 7, 7) // 9 px crumb < minArea 48
+            const r = await run(a, [[35, 35]])
+            results.holeFilled = r.alpha[50 * W + 50] === 255
+            results.crumbRemoved = r.alpha[6 * W + 6] === 0
+            results.objectKept = r.alpha[40 * W + 40] === 255
+            results.refiner = r.refiner
+        }
+        {
+            const a = mk()
+            sq(a, 10, 10, 29, 29) // seeded 400 px
+            sq(a, 60, 60, 79, 79) // unseeded 400 px < minArea 500
+            const r = await run(a, [[15, 15]], { minArea: 500 })
+            results.seededKept = r.alpha[15 * W + 15] === 255
+            results.unseededRemoved = r.alpha[70 * W + 70] === 0
+        }
+        {
+            const a = mk()
+            sq(a, 0, 0, W - 1, W - 1) // full frame — morphology must respect bounds
+            const r = await run(a, [[50, 50]], { closeRadius: 3, openRadius: 2 })
+            let on = 0
+            for (let i = 0; i < r.alpha.length; i += 1) if (r.alpha[i] === 255) on += 1
+            results.morphBounds = on === W * W
+        }
+        results.invalidRejected = await cvRefine({
+            revision: doc.revision, width: W, height: W, alpha: mk(10), alphaRaw: mk(10), seeds: [],
+        }).then(() => false, () => true)
+        {
+            const a = mk()
+            sq(a, 30, 30, 69, 69)
+            const input = a
+            const r = await run(a, [[35, 35]])
+            results.recoveredAfterInvalid = r.alpha[40 * W + 40] === 255
+            results.transferred = input.buffer.byteLength === 0
+        }
+        return results
+    },
+    // Test-only: prompt then instant re-import — the stale result must never
+    // commit to the replaced document.
+    staleProbe: async () => {
+        state.clicks.push([230, 256, 1])
+        scheduleRun()
+        await window.__seglab.importSynthetic(1600, 1200)
+        await waitForRun()
+        return { maskSummary: state.maskSummary, clicks: state.clicks.length }
     },
     clickAt: async (x, y, negative = false) => {
         state.clicks.push([x, y, negative ? 0 : 1])
@@ -596,4 +905,13 @@ window.__seglabReady = true
 
 setMode('click')
 refreshChips()
-console.log('[seglab] ready')
+try {
+    navigator.serviceWorker?.register('./sw.js')
+} catch { /* http/file contexts — offline reuse just stays off */ }
+startPressureMonitor()
+onPressureChange((level) => {
+    memlog('pressure-change', { level })
+    if (level >= 2) disposeCv() // wasm refinement off at L2; free its heap
+    if (level >= 3) setStatus('Memory pressure detected — running in safe mode.')
+})
+console.log(`[seglab] ready — profile ${policy.profile}, proxy ≤${policy.proxyMax}px`)

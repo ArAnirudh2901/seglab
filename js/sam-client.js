@@ -8,11 +8,9 @@
  *
  * Forwards the engine's broadcasts to subscribers:
  *   {type:'progress', detail:{lane, file, loaded, total, ...}}  downloads
- *   {type:'lane', label}   flagship hot-swap (app replays prompts on this)
+ *   {type:'lane', label}   opt-in flagship hot-swap (app replays prompts)
  *   {type:'state'}         device/lane/timing chips should re-render
  */
-
-import { summarizeMaskRGBA, validateClickMask } from './sam-core.js'
 
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
@@ -75,7 +73,11 @@ const getWorker = () => {
             if (!entry) return
             pending.delete(data.id)
             if (data.ok) entry.resolve(data.result)
-            else entry.reject(new Error(data.error || 'on-device selection failed'))
+            else {
+                const err = new Error(data.error || 'on-device selection failed')
+                if (data.stale) err.stale = true
+                entry.reject(err)
+            }
         }
         worker.onerror = (event) => {
             // A worker-level error (script load failure, unhandled throw) is
@@ -132,7 +134,10 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
         }
     }
     const engine = await getInlineEngine()
-    if (op === 'warm') return withTimeout(engine.warm(payload || {}), timeoutMs, label)
+    if (op === 'warm') return withTimeout(engine.warm(), timeoutMs, label)
+    if (op === 'flagship-start') return withTimeout(engine.startFlagship(), timeoutMs, label)
+    if (op === 'reset') return engine.resetImage(payload?.revision || 0)
+    if (op === 'state') return engine.getEngineState()
     if (op === 'segment') {
         try {
             return await withTimeout(engine.segment(payload), timeoutMs, label)
@@ -148,11 +153,11 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
 
 let warmPromise = null
 
-/** Download + compile the draft lane, then the flagship in the background
- *  (idempotent). `flagship:false` skips the background upgrade. */
-export const warmUp = ({ flagship = true } = {}) => {
+/** Download + compile the draft (SlimSAM) lane — idempotent. The flagship
+ *  lane is never touched here; see startFlagship (explicit opt-in only). */
+export const warmUp = () => {
     if (warmPromise) return warmPromise
-    warmPromise = call('warm', { flagship }, null, LOAD_TIMEOUT_MS, 'model load')
+    warmPromise = call('warm', {}, null, LOAD_TIMEOUT_MS, 'model load')
         .then((engineState) => {
             clientState.device = engineState?.device || clientState.device
             clientState.lane = engineState?.lane || clientState.lane
@@ -165,45 +170,46 @@ export const warmUp = ({ flagship = true } = {}) => {
 }
 
 /**
- * Content key for the embedding cache: dims + FNV-1a over a 16×16
- * downsample. Content-addressed so the cache never serves stale embeddings
- * for new pixels. ~1 ms — negligible next to even a cached decode.
+ * EXPLICIT OPT-IN: load the SAM3 flagship lane. Only ever called from a
+ * confirmed user gesture in the UI — never automatically, never from a URL
+ * flag. Resolves to the engine state (flagship: 'ready'|'failed'|...).
  */
-const contentKey = (canvas) => {
-    const c = document.createElement('canvas')
-    c.width = 16
-    c.height = 16
-    const ctx = c.getContext('2d', { willReadFrequently: true })
-    ctx.drawImage(canvas, 0, 0, 16, 16)
-    const px = ctx.getImageData(0, 0, 16, 16).data
-    let h = 0x811c9dc5
-    for (let i = 0; i < px.length; i += 1) {
-        h ^= px[i]
-        h = Math.imul(h, 0x01000193) >>> 0
-    }
-    return `${canvas.width}x${canvas.height}:${h.toString(16)}`
-}
+export const startFlagship = () => call('flagship-start', {}, null, LOAD_TIMEOUT_MS, 'SAM3 opt-in load')
+    .then((engineState) => {
+        clientState.device = engineState?.device || clientState.device
+        clientState.lane = engineState?.lane || clientState.lane
+        emit({ type: 'state' })
+        return engineState
+    })
+
+/** New document: raise the engine's revision floor, free the embedding slot. */
+export const resetImage = (revision) => call('reset', { revision }, null, 30_000, 'engine reset')
+    .catch(() => { /* worker may be cold — nothing to release */ })
+
+/** Engine internals snapshot (residentEmbeddings, encodeCount — verify). */
+export const getEngineSnapshot = () => call('state', {}, null, 30_000, 'engine state')
 
 /**
  * Run click/box/lasso selection fully on-device against `canvas` (the
- * canonical ≤1024 frame). All coordinates are canvas coordinates. The
- * engine returns the polished mask (clamp → hygiene → edge refinement) plus
- * the raw decoder mask for the UI's comparison toggle.
+ * bounded proxy frame). All coordinates are canvas coordinates. The engine
+ * returns the polished one-channel mask (clamp → hygiene → edge refinement)
+ * plus the raw decoder mask for the UI's comparison toggle.
  *
  * @param {HTMLCanvasElement} canvas
  * @param {{ clicks?: Array<[number, number, 0|1]>, box?: number[]|null,
  *           clampPoly?: Array<[number, number]>|null, clampMargin?: number }} prompts
+ * @param {{ revision?: number, post?: 'js'|'clamp-only' }} opts  staleness +
+ *   post-pipeline mode ('clamp-only' when a cv-refine stage follows)
  */
-export const segment = async (canvas, { clicks = [], box = null, clampPoly = null, clampMargin = 0 } = {}) => {
+export const segment = async (canvas, { clicks = [], box = null, clampPoly = null, clampMargin = 0 } = {}, { revision = 0, post = 'js' } = {}) => {
     const startedAt = Date.now()
     if (!canvas?.width || !canvas?.height) throw new Error('Selection source has no usable dimensions')
     if ((!clicks || clicks.length === 0) && !box) throw new Error('No clicks or box to select with')
 
-    const imageKey = contentKey(canvas)
     const buildPayload = async () => {
         // The bitmap transfers zero-copy into the worker; the worker closes it.
         const source = await createImageBitmap(canvas)
-        return { payload: { imageKey, source, clicks, box, clampPoly, clampMargin }, transfer: [source] }
+        return { payload: { revision, post, source, clicks, box, clampPoly, clampMargin }, transfer: [source] }
     }
 
     let result
@@ -214,7 +220,7 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
         // The request that DISCOVERS a broken worker must not fail the
         // user's click: the bitmap transferred into the dead worker is gone,
         // so rebuild it and retry — call() now routes inline.
-        if (!workerBroken) throw err
+        if (!workerBroken || err?.stale) throw err
         console.warn('[seglab] retrying selection inline after worker failure')
         const { payload, transfer } = await buildPayload()
         result = await call('segment', payload, transfer, INFER_TIMEOUT_MS, 'On-device selection (inline retry)')
@@ -222,16 +228,6 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     clientState.device = result.device || clientState.device
     clientState.lane = result.lane || clientState.lane
     clientState.ready = true
-
-    const toImageData = (buf) => new ImageData(
-        buf instanceof Uint8ClampedArray ? buf : new Uint8ClampedArray(buf),
-        result.width,
-        result.height,
-    )
-    const imageData = toImageData(result.rgba)
-    const rawImageData = toImageData(result.rawRgba)
-    const summary = summarizeMaskRGBA(imageData.data, result.width, result.height)
-    const verdict = validateClickMask(summary)
 
     clientState.lastRun = {
         encodeMs: result.encodeMs,
@@ -244,14 +240,14 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     }
     emit({ type: 'state' })
     return {
-        imageData,
-        rawImageData,
+        alpha: result.alpha,
+        alphaRaw: result.alphaRaw,
         width: result.width,
         height: result.height,
         score: result.score,
-        summary,
-        usable: verdict.usable,
-        reason: verdict.reason,
+        summary: result.summary,
+        usable: result.usable,
+        reason: result.reason,
         device: result.device,
         lane: result.lane,
         encoded: result.encoded,

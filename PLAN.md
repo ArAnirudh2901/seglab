@@ -13,28 +13,28 @@ precise, clean-edged mask, in real time.
 
 ---
 
-## Architecture (as built)
+## Architecture (as built — post memory-safety rewrite, 2026-07)
 
-One reference frame: photo → ≤1024 canonical canvas. All prompts, masks, and
-exports live there; display scaling is CSS.
+One reference frame: photo → **≤768 px proxy** (lite policy, js/policy.js).
+The original exists only as its compressed Blob; all prompts, masks, and the
+overlay live in the proxy frame; display scaling is CSS.
 
 ```
-app.js (UI: modes, prompts, overlay, replay)
-  └─ sam-client.js (worker transport, sticky inline fallback)
-      └─ sam-worker.js (dedicated worker — UI never blocks)
-          └─ sam-engine.js (TWO LANES, one segment() contract)
-              ├─ draft:    SlimSAM-77 quantized (~14 MB, Apache-2.0) — everywhere, loads in seconds
-              ├─ flagship: SAM3-tracker q4f16 (297+5.4 MB, SAM License) — WebGPU, background download, hot-swap + prompt replay
-              └─ post pipeline (model-agnostic, every decode):
-                   lasso clamp → seeded component cleanup + hole fill (sam-core.js)
-                   → guided-filter edge-band refinement (edge-refine.js)
+Compressed original Blob (asset custody in app.js `doc`)
+  → decode-worker (bounded header parse via image-io.js → resize-during-decode)
+  → ≤768px proxy canvas
+  → heavy-job-queue.js — ONE lane, concurrency 1, revision-cancelled:
+       proxy-decode → model-warm → encode/prompt-decode → cv-refine → export
+  → sam-worker (SlimSAM only by default; ONE embedding slot, tensors disposed)
+  → cv-refine-worker (C++/wasm cleanup + guided-filter edges; JS fallback)
+  → one-channel Uint8 alpha masks everywhere; RGBA only at render/export
+SAM3 flagship: DORMANT — explicit confirmed opt-in only, never automatic.
 ```
 
-**Why two lanes:** encoders are heavy, decoders are tiny. The draft lane makes the
-tool instantly usable; the flagship encodes once per image (~5.6 s, cached) and
-then every click is a ~630 ms decode. Weak devices pay in background seconds,
-not in quality ceiling. The user's clicks are *prompts*, so they replay
-losslessly when a better lane arrives.
+**Why one lane + one embedding:** on an 8 GB machine the crash mode was
+concurrent peaks (full-res decode × model warm × background SAM3 download).
+Strict serialization plus a single disposed embedding slot makes peak memory
+predictable; quality is preserved by the post pipeline, not by residency.
 
 **Why post-pipeline instead of bigger models only:** the 256² mask grid is a
 model-family limit. Hygiene + image-guided edge refinement fix artifacts that
@@ -52,6 +52,24 @@ NO encoder size fixes, and they upgrade every current and future lane.
 | 3 | Mask hygiene: keep clicked components + ≥1%-of-largest, fill pinholes | components = 1 on disc (crumbs gone) |
 | 4 | Edge-band refinement: gray guided filter, ±6 px band, soft output, E toggle | 3131 soft boundary px; post ~110 ms |
 | 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 confirmed headless; encode 5581 ms / decode 630 ms |
+
+## Memory-safety rewrite — DONE (2026-07, all gated by verify.mjs, 60+ checks green)
+
+| M | What | Proof |
+|---|------|-------|
+| M0 | Lite policy forced on ≤8GB/unknown; URL flags clamped; SAM3 de-automated (explicit `startFlagship` only); proxy 1024→768 | `?flagship=1&profile=ultra&proxy=max` inert; zero sam3 requests incl. bypass flags |
+| M1 | All runtime assets vendored (`scripts/download-models.mjs`: transformers.min.js, 4 ORT wasm, SlimSAM fp32+q8) | full selection with huggingface.co + jsdelivr route-aborted in a fresh cache-less context |
+| M2 | Shared heavy-job queue, concurrency 1, priorities, revision cancellation | log-proven: max 1 active ever; rejected job no deadlock; interaction preempts speculative |
+| M3 | Bounded decode pipeline: image-io header parsers (EXIF/ISOBMFF/TIFF+RAW preview), decode-worker, Blob-only custody | 6000×4000 → 768×512 proxy; import race: second wins; no main-thread full decode |
+| M4 | Revision protocol end-to-end; ONE embedding slot with `Tensor.dispose()`; one-channel alpha mask contract | resident=1 across N imports; import alone never encodes; stale results never commit |
+| M5 | C++/wasm cv_refine (seeded cleanup, holes, open/close; ≤768; fixed 16 MB heap) + cv worker with JS fallback | wasm suite green (dims reject, hole fill, min-area, transfer-not-copy); route-abort → JS fallback keeps selection |
+| M6 | Bounded export (≤4096px/8MP from Blob), pressure L1–L3, `[seglab][memory]` telemetry, SAM3 opt-in UX | 24 MP → 3464×2309 reduced=true; L2 kills wasm refine, selection survives; opt-in confirmed warn-only |
+| M7 | Service worker (cache-on-fetch, versioned), docs, static memory-contract suite | getImageData whitelist, no toDataURL/pyodide/opencv/WORKING_MAX_SIDE, sw precache-free |
+
+Deferred by design: crop escalation (P8) stays OFF under lite; guided filter
+in C++ (spec M6-optional) and ROI GrabCut (M7-optional) remain unimplemented
+until measurements demand them — the JS guided filter already runs in the cv
+worker off-main-thread.
 
 ---
 

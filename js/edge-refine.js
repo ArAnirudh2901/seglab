@@ -82,18 +82,18 @@ const boxMean = (sat, w, h, radius, out) => {
 }
 
 /**
- * Refine a mask's boundary band in place. `rgba` is the white-on-black mask
+ * Refine a mask's boundary band in place. `alpha` is the one-channel mask
  * (modified: band pixels become soft 0..255); `gray` is the source photo as
  * a 0..1 grayscale Float32Array of the same dimensions.
  *
  * @returns {{ bandPixels: number }} how many pixels were refined
  */
-export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 1e-3 } = {}) => {
+export const refineMaskEdges = (alpha, w, h, gray, { band = 6, radius = 8, eps = 1e-3 } = {}) => {
     const size = w * h
     if (!gray || gray.length !== size) return { bandPixels: 0 }
 
     const p = new Float32Array(size)
-    for (let i = 0; i < size; i += 1) p[i] = rgba[i * 4] >= 128 ? 1 : 0
+    for (let i = 0; i < size; i += 1) p[i] = alpha[i] >= 128 ? 1 : 0
 
     // Boundary band = dilate(mask) − erode(mask).
     const dil = morph(p, w, h, band, true)
@@ -136,10 +136,7 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
         let v = Math.round(q * 255)
         if (v < 10) v = 0
         else if (v > 245) v = 255
-        const j = i * 4
-        rgba[j] = v
-        rgba[j + 1] = v
-        rgba[j + 2] = v
+        alpha[i] = v
     }
     return { bandPixels }
 }

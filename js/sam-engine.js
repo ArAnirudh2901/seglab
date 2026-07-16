@@ -8,18 +8,21 @@
  * (sam-client.js's fallback when worker construction fails).
  *
  * TWO LANES, one contract:
- *   draft    — SlimSAM-77 (Apache-2.0, ~14 MB): loads in seconds, runs
- *              everywhere down to plain WASM. Always available first.
+ *   draft    — SlimSAM-77 (Apache-2.0): loads in seconds, runs everywhere
+ *              down to plain WASM. THE default and only automatic lane.
  *   flagship — SAM3-tracker q4f16 (SAM License, ~300 MB): Meta-demo-grade
- *              masks. WebGPU only; downloaded IN THE BACKGROUND after the
- *              draft lane is serving, hot-swapped in when ready (the 'lane'
- *              event lets the app replay current prompts at the higher
- *              quality). Browser-cached after the first download.
+ *              masks. WebGPU only, and DORMANT by default: it never loads,
+ *              warms, or downloads automatically. The only path in is
+ *              startFlagship(), reached from an explicit, confirmed user
+ *              gesture (8 GB memory-safety contract — see js/policy.js).
+ *              When it does arrive, the 'lane' event lets the app replay
+ *              current prompts at the higher quality.
  *
  * Architecture — encode once, decode per interaction:
- * Both lanes split into a heavy image encoder (run ONCE per image, cached
- * per content key per lane) and a small prompt decoder (run per
- * interaction, tens of ms) — that's what makes live refinement instant.
+ * Both lanes split into a heavy image encoder (run ONCE per image) and a
+ * small prompt decoder (run per interaction, tens of ms). The 8 GB
+ * residency contract allows exactly ONE embedding: a single slot keyed by
+ * (lane, document revision), tensors disposed on every replacement.
  *
  * Every decoded mask then goes through the shared post pipeline:
  *   lasso clamp → seeded component cleanup + hole fill (sam-core) →
@@ -30,15 +33,14 @@
 import {
     buildBoxPrompt,
     buildPointPrompt,
-    cleanupMaskRGBA,
-    maskChannelToRGBA,
+    cleanupMaskAlpha,
+    maskChannelToAlpha,
     pickBestMask,
+    summarizeMaskAlpha,
+    validateClickMask,
 } from './sam-core.js'
 import { refineMaskEdges } from './edge-refine.js'
-
-// Pinned CDN build of transformers.js (ESM single file, CORS-enabled) —
-// version-locked so a CDN-side major bump can never break the app.
-const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0'
+import { loadTransformersModule } from './asset-store.js'
 
 const LANES = {
     draft: {
@@ -46,8 +48,10 @@ const LANES = {
         model: 'Xenova/slimsam-77-uniform',
         cls: 'SamModel',
         options: {},
-        // Embeddings ~8.4 MB/image → 6 keeps a session decoder-only in ~50 MB.
-        cacheMax: 6,
+        // Pinned per device so weight filenames stay deterministic (the
+        // vendoring script mirrors exactly these): fp32 on WebGPU
+        // (vision_encoder.onnx), q8 on WASM (vision_encoder_quantized.onnx).
+        dtypeByDevice: { webgpu: 'fp32', wasm: 'q8' },
     },
     flagship: {
         label: 'sam3',
@@ -55,8 +59,6 @@ const LANES = {
         cls: 'Sam3TrackerModel',
         // q4f16 = the 297 MB + 5.4 MB variant (quality-gated in the plan).
         options: { dtype: 'q4f16' },
-        // Multi-level embeddings ~33 MB/image → keep 2 (~66 MB).
-        cacheMax: 2,
     },
 }
 
@@ -83,8 +85,37 @@ const state = {
 let transformersPromise = null
 const bundles = { draft: null, flagship: null }
 
-/** `${lane}:${imageKey}` → { embeddings, original_sizes, reshaped_input_sizes, gray, w, h } */
-const embedCache = new Map()
+// ONE embedding slot for the whole engine — the 8 GB residency contract.
+// entry = { embeddings, original_sizes, reshaped_input_sizes, gray, w, h }.
+let activeEmbedding = null // { laneKey, revision, entry }
+let currentRevision = 0
+let encodeCount = 0
+
+const disposeEmbeddingEntry = (entry) => {
+    if (!entry?.embeddings) return
+    for (const t of Object.values(entry.embeddings)) {
+        try { t?.dispose?.() } catch { /* released with the session */ }
+    }
+}
+
+const releaseEmbedding = () => {
+    const previous = activeEmbedding
+    activeEmbedding = null
+    disposeEmbeddingEntry(previous?.entry)
+}
+
+/** New document: raise the revision floor and free the embedding slot. */
+export const resetImage = (revision = 0) => {
+    if (revision) currentRevision = Math.max(currentRevision, revision)
+    releaseEmbedding()
+    return getEngineState()
+}
+
+const staleError = (label) => {
+    const err = new Error(`stale ${label} (image replaced)`)
+    err.stale = true
+    return err
+}
 
 // Event sink — the worker shell points this at postMessage; the inline
 // fallback points it at the client's emitter. Events: {type:'progress'|'lane'}.
@@ -109,11 +140,12 @@ export const getEngineState = () => ({
     ready: state.ready,
     flagship: state.flagship,
     lane: LANES[activeLaneKey()].label,
-    cachedImages: embedCache.size,
+    residentEmbeddings: activeEmbedding ? 1 : 0,
+    encodeCount,
 })
 
 const loadTransformers = () => {
-    transformersPromise ??= import(TRANSFORMERS_CDN)
+    transformersPromise ??= loadTransformersModule()
     return transformersPromise
 }
 
@@ -153,15 +185,16 @@ const loadBundle = (laneKey) => {
                 total: info?.total,
             },
         })
+        const dtypeOpts = lane.dtypeByDevice ? { dtype: lane.dtypeByDevice[device] || 'q8' } : {}
         const [model, processor] = await withTimeout(
             Promise.all([
-                Cls.from_pretrained(lane.model, { device, progress_callback, ...lane.options })
+                Cls.from_pretrained(lane.model, { device, progress_callback, ...dtypeOpts, ...lane.options })
                     // Draft may retry deviceless (tiny model, WASM is fine);
                     // flagship never silently falls to WASM — 300 MB there
                     // would be an unusable lane, not a fallback.
                     .catch((err) => {
                         if (laneKey === 'flagship') throw err
-                        return Cls.from_pretrained(lane.model, { progress_callback, ...lane.options })
+                        return Cls.from_pretrained(lane.model, { progress_callback, dtype: 'q8', ...lane.options })
                     }),
                 transformers.AutoProcessor.from_pretrained(lane.model, { progress_callback }),
             ]),
@@ -172,44 +205,46 @@ const loadBundle = (laneKey) => {
     })()
     bundles[laneKey].catch(() => {
         // Draft load failures are retryable (transient network); flagship
-        // failure handling is owned by maybeStartFlagship / segment.
+        // failure handling is owned by startFlagship / segment.
         if (laneKey === 'draft') bundles.draft = null
     })
     return bundles[laneKey]
 }
 
-/** Kick the background flagship download once the draft lane is serving. */
-const maybeStartFlagship = () => {
-    if (state.flagship !== 'idle') return
-    state.flagship = 'loading';
-    (async () => {
-        try {
-            const device = await pickDevice()
-            if (device !== 'webgpu' || state.forcedWasm) {
-                state.flagship = 'unavailable'
-                return
-            }
-            await loadBundle('flagship')
-            state.flagship = 'ready'
-            emitEvent({ type: 'lane', lane: 'flagship', label: LANES.flagship.label })
-        } catch (err) {
-            console.warn('[seglab] flagship lane unavailable:', err?.message)
-            state.flagship = 'failed'
-            bundles.flagship = null
-        }
-    })()
+/**
+ * Warm the draft lane only (download + compile). The flagship lane is NEVER
+ * touched here — no background download, no upgrade, no retry. That is the
+ * 8 GB memory-safety contract: one model resident, chosen for the device.
+ */
+export const warm = async () => {
+    await loadBundle('draft')
+    state.ready = true
+    return getEngineState()
 }
 
 /**
- * Warm the draft lane (download + compile), then start the flagship
- * download in the background (pass flagship:false to skip — used by tests
- * and as a data-saver escape hatch).
+ * EXPLICIT OPT-IN ONLY. Loads the SAM3 flagship lane and hot-swaps it in.
+ * Reached exclusively from a confirmed user gesture routed through the
+ * heavy-job queue — never from warm(), never from an import, never from a
+ * URL flag. Requires WebGPU; failure is sticky for the session.
  */
-export const warm = async ({ flagship = true } = {}) => {
-    await loadBundle('draft')
-    state.ready = true
-    if (flagship) maybeStartFlagship()
-    else if (state.flagship === 'idle') state.flagship = 'unavailable'
+export const startFlagship = async () => {
+    if (state.flagship === 'ready' || state.flagship === 'loading') return getEngineState()
+    const device = await pickDevice()
+    if (device !== 'webgpu' || state.forcedWasm) {
+        state.flagship = 'unavailable'
+        return getEngineState()
+    }
+    state.flagship = 'loading'
+    try {
+        await loadBundle('flagship')
+        state.flagship = 'ready'
+        emitEvent({ type: 'lane', lane: 'flagship', label: LANES.flagship.label })
+    } catch (err) {
+        console.warn('[seglab] flagship lane unavailable:', err?.message)
+        state.flagship = 'failed'
+        bundles.flagship = null
+    }
     return getEngineState()
 }
 
@@ -223,18 +258,18 @@ const makeCanvas = (w, h) => {
 }
 
 /**
- * Encode `source` once per lane and cache embeddings + a grayscale copy of
- * the photo (the guide image for edge refinement) under `lane:imageKey`.
+ * Encode `source` once into the single embedding slot (keyed lane+revision)
+ * plus a grayscale guide for edge refinement. A slot hit skips the encoder;
+ * a miss disposes the previous tensors, encodes, then re-checks currency —
+ * an encode that finished for a replaced image is disposed, never stored.
  */
-const ensureEmbeddings = async (bundle, imageKey, source) => {
-    const lane = LANES[bundle.laneKey]
-    const cacheKey = `${bundle.laneKey}:${imageKey}`
-    const hit = embedCache.get(cacheKey)
-    if (hit) {
-        // Refresh LRU position.
-        embedCache.delete(cacheKey)
-        embedCache.set(cacheKey, hit)
-        return { entry: hit, encoded: false }
+const ensureEmbeddings = async (bundle, revision, source) => {
+    if (
+        activeEmbedding
+        && activeEmbedding.laneKey === bundle.laneKey
+        && activeEmbedding.revision === revision
+    ) {
+        return { entry: activeEmbedding.entry, encoded: false }
     }
     if (!source) throw new Error('Embedding cache miss and no image source provided')
     const { RawImage } = bundle.transformers
@@ -242,8 +277,8 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
     const h = source.height
     if (!w || !h) throw new Error('Selection source has no usable dimensions')
 
-    // One draw, one readback: pixels feed BOTH the model input and the
-    // grayscale guide used by edge refinement.
+    // One draw, one readback (proxy-sized, ≤768): pixels feed BOTH the model
+    // input and the grayscale guide used by edge refinement.
     const canvas = makeCanvas(w, h)
     canvas.getContext('2d').drawImage(source, 0, 0)
     const pixels = canvas.getContext('2d').getImageData(0, 0, w, h)
@@ -260,6 +295,7 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
         INFER_TIMEOUT_MS,
         'image encode',
     )
+    encodeCount += 1
     const entry = {
         embeddings,
         original_sizes: inputs.original_sizes,
@@ -268,28 +304,19 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
         w,
         h,
     }
-    embedCache.set(cacheKey, entry)
-    // Per-lane LRU eviction.
-    let laneCount = 0
-    for (const key of embedCache.keys()) if (key.startsWith(`${bundle.laneKey}:`)) laneCount += 1
-    if (laneCount > lane.cacheMax) {
-        for (const key of embedCache.keys()) {
-            if (key.startsWith(`${bundle.laneKey}:`)) { embedCache.delete(key); break }
-        }
+    if (revision && revision < currentRevision) {
+        disposeEmbeddingEntry(entry)
+        throw staleError('image encode')
     }
+    releaseEmbedding()
+    activeEmbedding = { laneKey: bundle.laneKey, revision, entry }
     return { entry, encoded: true }
-}
-
-const purgeLane = (laneKey) => {
-    for (const key of [...embedCache.keys()]) {
-        if (key.startsWith(`${laneKey}:`)) embedCache.delete(key)
-    }
 }
 
 /** Zero the mask outside `poly` dilated by `margin` — the lasso guarantee:
  *  the decoder snaps the boundary INSIDE the region, the clamp owns the
  *  outside, so a lasso can never bleed onto a neighbouring object. */
-const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
+const clampAlphaToPolygon = (alpha, w, h, poly, margin) => {
     const canvas = makeCanvas(w, h)
     const ctx = canvas.getContext('2d', { willReadFrequently: true })
     ctx.beginPath()
@@ -303,12 +330,8 @@ const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
     ctx.fill()
     ctx.stroke()
     const region = ctx.getImageData(0, 0, w, h).data
-    for (let i = 0; i < region.length; i += 4) {
-        if (region[i + 3] === 0) {
-            rgba[i] = 0
-            rgba[i + 1] = 0
-            rgba[i + 2] = 0
-        }
+    for (let i = 0; i < alpha.length; i += 1) {
+        if (region[i * 4 + 3] === 0) alpha[i] = 0
     }
 }
 
@@ -317,7 +340,7 @@ const segmentOnce = async (req) => {
     const laneKey = req.lane || activeLaneKey()
     const bundle = await loadBundle(laneKey)
     const { Tensor } = bundle.transformers
-    const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+    const { entry, encoded } = await ensureEmbeddings(bundle, req.revision || 0, req.source)
     const tEncoded = Date.now()
 
     const { clicks, box } = req
@@ -361,24 +384,38 @@ const segmentOnce = async (req) => {
     const best = pickBestMask(scores)
     const [, , mh, mw] = masks[0].dims
     if (!mw || !mh) throw new Error('Decoder returned a malformed mask')
-    const rawRgba = maskChannelToRGBA(masks[0].data, mw, mh, best)
+    if (req.revision && req.revision < currentRevision) throw staleError('mask decode')
+    const alphaRaw = maskChannelToAlpha(masks[0].data, mw, mh, best)
     const tDecoded = Date.now()
 
-    // Shared post pipeline: clamp → hygiene → edge refinement. `rawRgba`
-    // survives untouched for the UI's raw-vs-refined comparison toggle.
-    const rgba = rawRgba.slice()
+    // Post pipeline: clamp → hygiene → edge refinement. `alphaRaw` survives
+    // untouched for the UI's raw-vs-refined comparison toggle. post:
+    // 'clamp-only' hands hygiene/refinement to the cv-refine worker (the
+    // caller composes the two inside one heavy job); 'js' runs it all here.
+    const alpha = alphaRaw.slice()
     if (Array.isArray(req.clampPoly) && req.clampPoly.length >= 3) {
-        clampRGBAToPolygon(rgba, mw, mh, req.clampPoly, req.clampMargin || 8)
+        clampAlphaToPolygon(alpha, mw, mh, req.clampPoly, req.clampMargin || 8)
     }
-    const seeds = effectiveClicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
-    const hygiene = cleanupMaskRGBA(rgba, mw, mh, seeds)
-    const refined = refineMaskEdges(rgba, mw, mh, entry.gray)
+    let hygiene = null
+    let refined = { bandPixels: 0 }
+    let summary = null
+    let verdict = { usable: true, reason: null }
+    if (req.post !== 'clamp-only') {
+        const seeds = effectiveClicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
+        hygiene = cleanupMaskAlpha(alpha, mw, mh, seeds)
+        refined = refineMaskEdges(alpha, mw, mh, entry.gray)
+        summary = summarizeMaskAlpha(alpha, mw, mh)
+        verdict = validateClickMask(summary)
+    }
 
     return {
-        rgba,
-        rawRgba,
+        alpha,
+        alphaRaw,
         width: mw,
         height: mh,
+        summary,
+        usable: verdict.usable,
+        reason: verdict.reason,
         score: Number(scores[best]) || 0,
         device: state.device,
         lane: LANES[laneKey].label,
@@ -396,7 +433,7 @@ const segmentOnce = async (req) => {
  *   flagship runtime failure → sticky-demote to draft, retry;
  *   draft WebGPU failure     → sticky WASM, drop poisoned caches, retry.
  *
- * @param {{ imageKey: string, source: ImageBitmap|OffscreenCanvas|HTMLCanvasElement|null,
+ * @param {{ revision: number, source: ImageBitmap|OffscreenCanvas|HTMLCanvasElement|null,
  *           clicks: Array<[number, number, 0|1]>, box: number[]|null,
  *           clampPoly?: Array<[number, number]>, clampMargin?: number }} req
  */
@@ -405,11 +442,12 @@ export const segment = async (req) => {
     try {
         return await segmentOnce({ ...req, lane: laneKey })
     } catch (err) {
+        if (err?.stale) throw err // superseded, not broken — no demotion
         if (laneKey === 'flagship') {
             console.warn('[seglab] flagship decode failed; demoting to draft lane:', err?.message)
             state.flagship = 'failed'
             bundles.flagship = null
-            purgeLane('flagship')
+            releaseEmbedding()
             emitEvent({ type: 'lane', lane: 'draft', label: LANES.draft.label })
             return segment(req) // re-enters on the draft lane (bounded: flagship is now sticky-failed)
         }
@@ -423,7 +461,7 @@ export const segment = async (req) => {
             state.flagship = 'failed' // flagship is WebGPU-only
             bundles.flagship = null
         }
-        embedCache.clear()
+        releaseEmbedding()
         return segmentOnce({ ...req, lane: 'draft' })
     }
 }
