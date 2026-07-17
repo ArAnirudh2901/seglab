@@ -105,11 +105,16 @@ const FRAME = 900 * 620
 const HOST_PRO = { memoryBudgetGB: 16, vramGB: 12 }
 const HOST_ULTRA = { memoryBudgetGB: 24, vramGB: 24, gpuName: 'RTX 4090' }
 
-const newAppPage = async (context, query, longSide, { host = null } = {}) => {
+let pageSeq = 0
+const newAppPage = async (context, query, longSide, { host = null, restore = false } = {}) => {
   const page = await context.newPage()
+  const tag = `p${++pageSeq}`
+  // Synthetic phases must not inherit a session an earlier phase persisted.
+  // Phase P opts back in — it is the gate that exercises restore.
+  if (!restore) await page.addInitScript(() => { window.__seglabNoRestore = true })
   page.on('console', (msg) => {
     const text = msg.text()
-    if (text.startsWith('[seglab]') || msg.type() === 'error') log(`browser: ${text.slice(0, 180)}`)
+    if (text.startsWith('[seglab]') || msg.type() === 'error') log(`browser[${tag}]: ${text.slice(0, 180)}`)
   })
   page.on('pageerror', (err) => log(`pageerror: ${String(err).slice(0, 180)}`))
   page.setDefaultTimeout(TIMEOUT_MS)
@@ -562,12 +567,15 @@ try {
     args: ['--enable-unsafe-webgpu', '--enable-gpu'],
   })
 
-  // Cold embed store for the persistence phases.
+  // Cold embed store + session for the persistence phases. A stale session
+  // would otherwise auto-restore into every later page load.
   const pageZ = await context.newPage()
   await pageZ.goto(`http://127.0.0.1:${port}/`)
-  await pageZ.evaluate(() => navigator.storage.getDirectory()
-    .then((r) => r.removeEntry('seglab-embeds', { recursive: true }))
-    .catch(() => {}))
+  await pageZ.evaluate(async () => {
+    const root = await navigator.storage.getDirectory()
+    await root.removeEntry('seglab-embeds', { recursive: true }).catch(() => {})
+    await root.removeEntry('seglab-session', { recursive: true }).catch(() => {})
+  })
   await pageZ.close()
 
   // Phosmith live-update contract (no model, no image).
@@ -1192,6 +1200,52 @@ try {
     }
   } else {
     log('skip phase V — run `bun run models` to vendor assets for the offline gate')
+  }
+
+  /* ─── Phase P: work survives a power cut. The record must be durable while
+         the page is still open — a real cut fires no unload, so anything saved
+         only on pagehide would be lost. Reopen must bring the work back. */
+  {
+    // Drop any session an earlier phase persisted BEFORE pageP boots: it would
+    // otherwise auto-restore, and saves are suppressed while a restore is in
+    // flight (so the click below would never reach disk).
+    const pageClr = await newAppPage(context, '?flagship=0', null)
+    await pageClr.evaluate(() => window.__seglab.clearSession())
+    await pageClr.close()
+
+    const pageP = await newAppPage(context, '?flagship=0', null, { restore: true })
+    await pageP.evaluate((side) => window.__seglab.loadDemoBlob(side), 1400)
+    const gP = await pageP.evaluate(() => window.__seglab.demoGeometry())
+    const before = await pageP.evaluate(
+      ({ x, y }) => window.__seglab.clickAt(x, y),
+      { x: gP.disc.x * gP.proxyScale, y: gP.disc.y * gP.proxyScale },
+    )
+    // Poll for the MASK to land, not just the import-time record — the click's
+    // save is debounced. Still no unload of any kind has fired.
+    let durable = null
+    for (let i = 0; i < 30 && !durable?.mask; i += 1) {
+      durable = await pageP.evaluate(() => window.__seglab.sessionSaved())
+      if (!durable?.mask) await pageP.waitForTimeout(500)
+    }
+    check(
+      'persistence: session is durable while the page is still open (no unload fired)',
+      durable?.mask === true,
+      `saved mask=${durable?.mask} at ${durable?.w}×${durable?.h}`,
+    )
+    // Simulate the cut: abandon the page without letting it save anything more.
+    await pageP.close()
+
+    const pageQ = await newAppPage(context, '?flagship=0', null, { restore: true })
+    await pageQ.waitForFunction(() => window.__seglab.state()?.hasImage === true, null, { timeout: 30_000 }).catch(() => {})
+    const after = await pageQ.evaluate(() => ({ ...window.__seglab.state(), ...(window.__seglab.maskStats() || {}) }))
+    const cov = (n) => (n?.maskSummary?.coverage ?? n?.coverage ?? 0)
+    check(
+      'persistence: reopen restores the document + committed selection',
+      after.hasImage === true && cov(after) > 0,
+      `hasImage=${after.hasImage}, coverage ${(cov(after) * 100).toFixed(1)}% (was ${(cov(before) * 100).toFixed(1)}%)`,
+    )
+    await pageQ.evaluate(() => window.__seglab.clearSession())
+    await pageQ.close()
   }
 
 } catch (err) {

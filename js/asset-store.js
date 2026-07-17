@@ -382,6 +382,9 @@ export const importOriginal = async (source, {
 }
 
 export const hasOriginal = () => !!(store.blob || store.drawable)
+
+/** Compressed original bytes for session persistence; null for demo drawables. */
+export const getOriginalBlob = () => store.blob
 export const getTransform = () => (store.transform ? { ...store.transform } : null)
 export const getAssetKey = () => store.assetKey
 

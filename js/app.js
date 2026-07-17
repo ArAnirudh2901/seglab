@@ -17,7 +17,8 @@ import {
 } from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
-import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
+import { importOriginal, hasOriginal, getTransform, releaseAsset, getOriginalBlob, getAssetKey } from './asset-store.js'
+import { saveSession, loadSession, clearSession } from './session-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
@@ -408,6 +409,9 @@ const showImage = async (source, {
         : ''
     const readyStatus = `Ready — click any object · ${frameMode}${displayNote}`
     setStatus(clientState.ready ? readyStatus : `${readyStatus} · preparing the model in the background`)
+    // Persist the document now: until the first commit the whole import would
+    // otherwise be lost to a power cut.
+    persistSession({ immediate: true })
     // The proxy is on screen; ONLY NOW does SlimSAM warm (queued — it can
     // never overlap the decode that just released its bitmaps).
     hidePrep(epoch)
@@ -653,6 +657,7 @@ function clearPrompts() {
     bumpRevision() // orphan + cancel any in-flight result
     renderOverlay()
     refreshButtons()
+    persistSession() // a cleared selection is work too — never resurrect it
 }
 
 const undoPrompt = () => {
@@ -676,6 +681,7 @@ const undoPrompt = () => {
         recomposeBase()
     }
     bumpRevision()
+    persistSession()
     if (state.clicks.length === 0 && !state.box && !state.lasso && !state.manual) {
         recomposeMask()
         renderOverlay()
@@ -785,6 +791,69 @@ const pushBaseOp = (op, imageData, kind, { dilate = 0 } = {}) => {
     recomposeBase()
 }
 
+/* ─── Crash-safe session persistence ─────────────────────────────────────── */
+// A power cut fires no pagehide/beforeunload, so saving on unload saves
+// nothing. Every commit writes durably (debounced, atomic) instead.
+let restoring = false
+let sessionName = 'restored'
+
+const persistSession = ({ immediate = false } = {}) => {
+    // A restore's own import must not write its null mask over the saved work.
+    if (restoring) return
+    saveSession(() => {
+        if (!state.hasImage) return null
+        const blob = getOriginalBlob()
+        if (!blob) return null // resident drawable (demo) — nothing to re-import from
+        return {
+            blob,
+            assetKey: getAssetKey(),
+            w: els.view.width,
+            h: els.view.height,
+            mime: blob.type,
+            name: sessionName,
+            // Composed truth (base ∪ live) — a lone click never reaches baseOps.
+            mask: state.mask ? maskToChannel(state.mask) : null,
+        }
+    }, { delay: immediate ? 0 : 600 })
+}
+
+/** Reopen the last session. Returns true if a document was restored. */
+const restoreSession = async () => {
+    const saved = await loadSession()
+    if (!saved?.blob) return false
+    restoring = true
+    try {
+        sessionName = saved.name
+        // Claim an epoch: a user drop (or a test's own import) landing mid-restore
+        // supersedes us, and we must not write the old ops over their document.
+        const epoch = beginImageRequest()
+        await queueImage(new File([saved.blob], saved.name, { type: saved.blob.type }), { sourceBytes: saved.blob.size }, epoch)
+        if (!imageRequestIsCurrent(epoch) || !state.hasImage) return false
+        // An op stack only composes at the proxy size it was captured at; a
+        // different budget on this run means the geometry no longer lines up.
+        const sameFrame = els.view.width === saved.w && els.view.height === saved.h
+        if (sameFrame && saved.mask) {
+            state.baseOps = []
+            state.baseFloor = saved.mask
+            recomposeBase()
+            recomposeMask()
+            renderOverlay()
+            refreshButtons()
+            const pct = ((state.maskSummary?.coverage || 0) * 100).toFixed(1)
+            setStatus(`Restored your last session — selection ${pct}% of frame`)
+        } else {
+            setStatus(sameFrame ? 'Restored your last image' : 'Restored your last image — selection dropped (frame size changed)')
+        }
+        console.log('[seglab][ui] session-restored', { sameFrame, mask: !!saved.mask, savedAt: saved.savedAt })
+        return true
+    } catch (err) {
+        console.warn('[seglab] session restore failed:', err?.message)
+        return false
+    } finally {
+        restoring = false
+    }
+}
+
 /** Rebuild the composed truth (state.mask/maskSummary) from base ∪ live. */
 const recomposeMask = () => {
     if (state.liveMask) {
@@ -796,6 +865,7 @@ const recomposeMask = () => {
     }
     state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw) : null
     state.maskSummary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height) : null
+    persistSession() // debounced + snapshot-at-write: a drag costs one save
 }
 
 const clearLive = () => {
@@ -1861,6 +1931,7 @@ window.__seglab = {
         mode: clientState.mode,
         lane: clientState.lane,
         lastRun: clientState.lastRun,
+        hasImage: state.hasImage,
         maskSummary: state.maskSummary,
         score: state.score,
         clicks: state.clicks.length,
@@ -2051,8 +2122,22 @@ window.__seglab = {
         const s = window.__seglab.state()
         return { ...s, ...(window.__seglab.maskStats() || {}) }
     },
+    // Crash/power-cut persistence (verify.mjs): a real cut fires no unload, so
+    // the gate reloads without one and asserts the work came back.
+    restoreSession,
+    clearSession,
+    sessionSaved: async () => {
+        const s = await loadSession()
+        return s ? { mask: !!s.mask, w: s.w, h: s.h } : null
+    },
 }
 window.__seglabReady = true
+
+// Reopen the last session on load. A power cut leaves the record behind; this
+// is what brings the work back. Never blocks readiness — a failed restore just
+// leaves the dropzone up. __seglabNoRestore lets verify's synthetic phases opt
+// out, so a session from one phase cannot import itself into the next.
+if (!window.__seglabNoRestore) restoreSession().catch(() => {})
 
 /* ─── Service Worker registration (model cache) ─────────────────────────── */
 
