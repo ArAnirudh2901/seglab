@@ -30,10 +30,10 @@ import {
 } from './sam-core.js'
 import { refineMaskEdges, refineMaskEdgesTiled } from './edge-refine.js'
 import { loadEmbedding, saveEmbedding } from './embed-store.js'
+import { loadTransformersModule } from './model-assets.js'
 
-// Pinned CDN build of transformers.js (ESM single file, CORS-enabled) —
-// version-locked so a CDN-side major bump can never break the app.
-const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0'
+// transformers.js resolution (vendored copy first, pinned CDN as fallback) and
+// all env wiring lives in model-assets.js — see loadTransformers() below.
 
 const LANES = {
     draft: {
@@ -136,23 +136,13 @@ export const getEngineState = () => ({
     cachedImages: embedCache.size,
 })
 
+/**
+ * Load transformers.js, assets resolved vendored-first (model-assets.js).
+ * Cache Storage alone is not an offline story: evictable, empty in a fresh
+ * profile. download-models.mjs is what removes the network dependency.
+ */
 export const loadTransformers = () => {
-    transformersPromise ??= import(TRANSFORMERS_CDN).then((T) => {
-        // Explicitly enable the browser Cache API so model ONNX blobs are
-        // persisted in Cache Storage after the first download. The Service
-        // Worker (sw.js) provides a second, independent caching layer that
-        // also handles the ESM bundle import itself.
-        if (T.env) {
-            T.env.useBrowserCache = true
-            // Allow loading from cache even when offline.
-            T.env.allowLocalModels = false
-            // WASM threads exist only under COOP/COEP (plain hosts run 1);
-            // when isolated, leave a core for the OS instead of min(4, cores).
-            const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
-            if (T.env.backends?.onnx?.wasm) T.env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(4, cores - 1))
-        }
-        return T
-    })
+    transformersPromise ??= loadTransformersModule()
     return transformersPromise
 }
 

@@ -1149,6 +1149,51 @@ try {
   }
   await pageO.close()
 
+  /* ─── Phase V: vendored assets serve a cold start with no network.
+         Phase O proves zero-cloud inference, but only once the profile has
+         cached the weights. This is the stronger claim: fresh cache-less
+         browser, both CDNs blocked, selection still works. Skipped when
+         nothing is vendored. */
+  if (existsSync(path.join(ROOT, 'models', 'manifest.json'))) {
+    const browserV = await chromium.launch({ headless: true, args: ['--enable-unsafe-webgpu', '--enable-gpu'] })
+    try {
+      const ctxV = await browserV.newContext() // fresh: no profile, no Cache Storage
+      const blocked = []
+      const localHits = []
+      await ctxV.route(/https:\/\/(huggingface\.co|cdn(-lfs[a-z0-9-]*)?\.(jsdelivr\.net|huggingface\.co))\//, (r) => {
+        blocked.push(r.request().url())
+        r.abort()
+      })
+      const pageV = await newAppPage(ctxV, '?flagship=0', 1400)
+      pageV.on('request', (req) => {
+        const u = req.url()
+        if (u.includes('/models/') || u.includes('/lib/')) localHits.push(u)
+      })
+      const gV = await pageV.evaluate(() => window.__seglab.demoGeometry())
+      const sV = await pageV.evaluate(
+        ({ x, y }) => window.__seglab.clickAt(x, y),
+        { x: gV.disc.x * gV.proxyScale, y: gV.disc.y * gV.proxyScale },
+      )
+      const exV = await pageV.evaluate(() => window.__seglab.exportCutout())
+      check(
+        'vendored: cold cache-less start selects + exports with both CDNs blocked',
+        !!sV?.maskSummary && sV.lastRun?.lane === 'slimsam' && exV?.coverage > 0,
+        `coverage ${((sV?.maskSummary?.coverage || 0) * 100).toFixed(1)}%, export ${exV?.w}×${exV?.h}, `
+          + `${blocked.length} CDN requests aborted`,
+      )
+      check(
+        'vendored: weights + runtime served from local models/ and lib/',
+        localHits.some((u) => u.endsWith('.onnx')) && localHits.some((u) => u.includes('transformers.min.js')),
+        `${localHits.length} local fetches incl. ${localHits.filter((u) => u.endsWith('.onnx')).length} onnx`,
+      )
+      await pageV.close()
+    } finally {
+      await browserV.close().catch(() => {})
+    }
+  } else {
+    log('skip phase V — run `bun run models` to vendor assets for the offline gate')
+  }
+
 } catch (err) {
   console.error(`[verify] ✗ ${err?.message || err}`)
   console.error(err?.stack || '')

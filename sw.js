@@ -39,7 +39,19 @@ const MODEL_ORIGINS = [
 // prefetched, and per-image pixels/embeddings are never stored here.
 const isWasmFetch = (url) => url.includes('/public/wasm/')
 
-const isModelFetch = (url) => MODEL_ORIGINS.some((prefix) => url.startsWith(prefix)) || isWasmFetch(url)
+// Same-origin vendored assets (download-models.mjs → lib/ + models/).
+// Cached on first fetch like the CDN copies, so a deployed install pays the
+// weight download once rather than per visit.
+const isVendoredFetch = (url) => {
+    try {
+        const { origin, pathname } = new URL(url)
+        return origin === self.location.origin
+            && (pathname.startsWith('/models/') || pathname.startsWith('/lib/'))
+    } catch { return false }
+}
+
+const isModelFetch = (url) =>
+    MODEL_ORIGINS.some((prefix) => url.startsWith(prefix)) || isWasmFetch(url) || isVendoredFetch(url)
 
 // ── Install: take control immediately, no page refresh needed ────────────────
 self.addEventListener('install', (event) => {

@@ -13,12 +13,32 @@ export work with the network physically cut.
 
 ```bash
 cd ~/seglab
+bun run models       # one-time: vendors ~90 MB (transformers.js, ORT wasm, SlimSAM)
 bun run dev          # any static server works; this is python3 -m http.server
 # open http://127.0.0.1:8788
 ```
 
-Nothing downloads at startup. The first image import warms SlimSAM (~14 MB,
-one-time, browser-cached). The first **Text** search uses Grounding DINO Tiny
+`bun run models` is what makes the app **work with no internet**. It vendors
+the transformers.js bundle, the ORT wasm pair and the SlimSAM weights under
+`lib/` and `models/` (both gitignored); the app prefers those and only falls
+back to the pinned CDNs for anything unvendored. After it has run, import,
+click/box/lasso selection and export need no network at all — a fresh,
+cache-less browser profile with huggingface.co and jsdelivr blocked still
+works, and `bun verify.mjs` gates exactly that.
+
+Text-select (OWLv2, 163 MB) is **not** vendored by default because the feature
+is optional and disposable at runtime. To make it offline too:
+
+```bash
+bun run models:all   # core + OWLv2 detector (~253 MB total)
+```
+
+Skipping `bun run models` is still fine — the app then loads from the pinned
+CDNs on first use and caches into Cache Storage, which survives reloads but is
+evictable and empty in a fresh profile. Vendoring is the durable answer.
+
+Nothing downloads at startup. Unvendored, the first image import warms SlimSAM
+(~14 MB, one-time, browser-cached). The first **Text** search uses Grounding DINO Tiny
 (~151 MB q4f16) on a confirmed accelerated WebGPU device; otherwise it uses
 the OWLv2 WASM fallback (~163 MB q8). Both run on-device and are never
 uploaded.

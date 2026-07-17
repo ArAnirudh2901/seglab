@@ -4,6 +4,8 @@
   "scripts": {
     "dev": "python3 -m http.server 8788 --bind 127.0.0.1",
     "verify": "bun verify.mjs",
+    "models": "node scripts/download-models.mjs",
+    "models:all": "node scripts/download-models.mjs --detector",
     "build:wasm": "./scripts/build-cv-wasm.sh"
   },
   "devDependencies": {

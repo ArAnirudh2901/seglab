@@ -11,6 +11,7 @@
  * production ladder until the upstream export and pipeline agree.
  */
 import { loadTransformers } from './sam-engine.js'
+import { isVendored } from './model-assets.js'
 
 const DETECTORS = Object.freeze({
     owl: {
@@ -39,8 +40,10 @@ export const DETECTOR_DOWNLOAD_MB = detectorDownloadMB()
  *  so the main thread can't just ask `detectorLoaded()`; Cache Storage is the
  *  shared fact, and it survives reloads. */
 export const detectorCached = async ({ accelerated = false } = {}) => {
-    if (typeof caches === 'undefined') return false
     const detector = DETECTORS.owl
+    // Vendored (--detector) serves from disk: no download, true even cache-less.
+    if (await isVendored(detector.model)) return true
+    if (typeof caches === 'undefined') return false
     try {
         for (const name of await caches.keys()) {
             const hits = await (await caches.open(name)).keys()
@@ -57,6 +60,8 @@ export const detectorCached = async ({ accelerated = false } = {}) => {
 const HUB_FILES = ['config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json']
 export const prefetchDetectorWeights = async ({ accelerated = false } = {}) => {
     const detector = DETECTORS.owl
+    // detectorCached() short-circuits on the manifest, so a --detector
+    // checkout never touches huggingface.co.
     if (await detectorCached({ accelerated })) return true
     await Promise.allSettled([...HUB_FILES, `onnx/${detector.weightFile}`].map((f) => fetch(`https://huggingface.co/${detector.model}/resolve/main/${f}`)))
     return detectorCached({ accelerated })

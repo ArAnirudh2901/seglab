@@ -3,6 +3,10 @@
 .cache/
 .DS_Store
 node_modules/
+# Vendored runtime assets from `bun run models` — transformers.js, ORT wasm,
+# weights (~90 MB core, +163 MB with --detector).
+lib/
+models/
 # Pinned LibRaw source cache for scripts/build-libraw-wasm.sh (refetched on demand).
 # The built artifact (public/wasm/raw-develop.*) IS committed, like cv-refine.
 build/
