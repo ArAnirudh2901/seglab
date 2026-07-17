@@ -11,7 +11,7 @@
  * out: { type:'error', requestId, revision, error }
  */
 
-const MAX_SIDE = 768
+const MAX_SIDE = 1024
 
 let modulePromise = null
 const getModule = () => {

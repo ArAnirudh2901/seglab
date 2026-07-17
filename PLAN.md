@@ -1,9 +1,66 @@
 # SEGLAB — Full Plan (merged with Phosmith Offline Pro)
 
-## 2026-07-15 — 8 GB client-side memory-safe architecture rewrite (SHIPPED)
+## 2026-07-16 — on-device RAW develop: LibRaw wasm fallback for preview-less RAW (SHIPPED)
 
-The upload→selection path is now hard-bounded for an 8 GB (or unproven)
-machine. Default architecture: compressed Blob → dedicated bounded decode
+Closes the last gap in RAW support. The fast path (`image-raw.js`) still lifts
+the camera's embedded JPEG preview for essentially every modern RAW with no
+sensor decode. The **rare RAW with no usable embedded preview** — which used to
+hard-fail with "export a JPEG/TIFF" — now falls back to an on-device develop:
+**LibRaw 0.22.2** compiled to WebAssembly with Emscripten (`cpp/raw_develop.cpp`
+→ `public/wasm/raw-develop.wasm`, ~1.0 MB). The worker demosaics the sensor and
+**libjpeg re-encodes in-worker**, so only a compact JPEG Blob rejoins the normal
+decode-to-proxy path — a full-res RGBA frame never crosses threads.
+
+Memory-safe by construction, respecting every locked-budget rule:
+- `half_size` demosaic (a ≤1024 px masking proxy never needs more; ~4× smaller).
+- Megapixel cap checked **before `unpack()`** (lite 40 · std 60 · pro 80 · ultra
+  100), so an image-bomb sensor is refused before LibRaw allocates it.
+- Lazy (~1 MB module fetched only when a preview-less RAW opens; never at boot,
+  never precached in `sw.js`) and the worker is **terminated after each develop**
+  because wasm memory only grows — termination returns it to the OS.
+- Off at memory pressure ≥ 2; SIMD-only build; failure surfaces the old error.
+
+Library choice, fact-checked against the source: RawSpeed (decoder only, no
+demosaic; speed-first, OOM-prone) and rawpy/imagecodecs (Python — no runtime,
+backend rejected twice) don't fit a zero-cloud browser. LibRaw is the only
+option that does and is itself hardened against giant/malicious allocations.
+
+Gates: static (artifacts exist; lazy+disposed+pressure-gated wiring; JPEG-Blob
+handoff, no RGBA across threads; `half_size` present) run always; a fixture-gated
+browser phase (`RAW_FIXTURE=…`) drives the real worker→wasm→LibRaw→libjpeg chain
+and asserts a decodable JPEG at the sensor's developed dimensions.
+
+## 2026-07-16 — crisp preview: proxy → 1024 + display decoupled from the model (SHIPPED)
+
+Two changes, both verify-green, that make a 45 MP DSLR photo look sharp on an
+unproven-memory browser without weakening the memory contract:
+
+1. **Interaction proxy 768 → 1024.** 1024 is SlimSAM's own internal encode
+   edge, so the model now sees its exact native frame (below it the encoder
+   upscales for no memory saving). cv-refine cap 768 → 1024, wasm heap
+   16 → 32 MiB (rebuilt). The memory-pressure floor still drops the proxy to
+   768. No device size is hard-coded anywhere — budgets are framed by trust,
+   not by a RAM number, and the device chip no longer prints one.
+
+2. **Display decoupled from the model buffer.** The on-screen photo (`#photo`)
+   is a separate crisp GPU-resident frame layered over the hidden ≤1024 model
+   buffer (`#view`, which still drives stage layout); the mask overlay stays on
+   the ≤1024 buffer. Display is sized bounded-safe per host: Chromium
+   scale-decodes the full frame cheaply; Safari uses the largest safe embedded/
+   working blob. `?display=native` opts into one full-res decode for a true
+   ~4 K preview (the user's chosen tradeoff over the RAW tab-kill risk);
+   `?display=off`/`<px>` tune it. Display-only, so honored even when locked.
+
+Gates: policy `?display` parsing; live `#photo` out-resolves `#view` while
+`#overlay` tracks `#view`; all lite proxy assertions updated 768 → 1024.
+Manually confirmed on real Google Chrome with the 45 MP NEF (2048 default /
+4096 native, mask aligned).
+
+## 2026-07-15 — client-side memory-safe architecture rewrite (SHIPPED)
+
+The upload→selection path is now hard-bounded for any machine whose memory
+headroom cannot be verified — which is every plain browser tab. Default
+architecture: compressed Blob → dedicated bounded decode
 worker → ≤768 px proxy → SlimSAM only → single segmentation worker → optional
 C++/wasm SIMD refinement → 1-channel Uint8 mask → UI render. All heavy
 operations serialize through one shared queue (`js/heavy-job-queue.js`).
@@ -16,7 +73,7 @@ Phased delivery (all landed together, each gated in `verify.mjs`):
 
 | Phase | Content | Status |
 |---|---|---|
-| M0 | Locked lite policy: 8 GB/unknown ⇒ lite; unsafe URL flags refused; SlimSAM-only segmentation | ✅ |
+| M0 | Locked lite policy: browser-reported/unknown memory ⇒ lite; unsafe URL flags refused; SlimSAM-only segmentation | ✅ |
 | M1 | Shared heavy-job queue (concurrency 1, priorities, revision cancel) + serialized decode/model lifecycle; lazy model warm (post-proxy) | ✅ |
 | M2 | Dedicated bounded decode worker (header parse + `ImageDecoder`/`createImageBitmap` resize + working copy), transferables | ✅ |
 | M3 | One-embedding SlimSAM lifecycle: single resident entry with disposal, `releaseDocument` on import, no OPFS persistence and no pre-selection encode in lite | ✅ |
@@ -26,7 +83,7 @@ Phased delivery (all landed together, each gated in `verify.mjs`):
 | M7 | Optional ROI-only GrabCut — only if measurements show need | ⏸ deferred |
 
 Notable policy pivots vs the earlier roadmap (superseding the 2026-07-12/15
-amendments below): browser-reported 8 GB now resolves **lite** (was
+amendments below): browser-reported memory now resolves **lite** (was
 standard); SAM3/flagship has been retired from the interactive editor, so no
 host hint or URL can cause a second segmentation-model download, compile,
 cache, or upgrade; OPFS embedding persistence and encode-at-import are
@@ -228,8 +285,9 @@ on weak devices" proof); default run on the dev machine reports `pro`.
 > so TIFF-IFD pointers (or a scan fallback for CR3/RAF) locate the largest one
 > and we slice out just its bytes (a 33 MB NEF → a 3 MB JPEG, reading ~3 MB of
 > the file, zero-cloud, no demosaic). Orientation baked in for portrait RAW; the
-> JPEG then rides the existing decode-to-proxy path. True 14-bit demosaic (WASM
-> LibRaw) stays a future option. Proxy is now **capability-adaptive**: probe →
+> JPEG then rides the existing decode-to-proxy path. On-device demosaic (WASM
+> LibRaw) SHIPPED 2026-07-16 as the preview-less fallback — see the top entry.
+> Proxy is now **capability-adaptive**: probe →
 > `proxyMax` (wasm 768 / GPU 1024 / strong-GPU+f16 1280), `?proxy=<px>|off`
 > override; honest cap — the encoder ingests 1024² so bigger only buys click/
 > overlay precision. No server side exists to prune (static app; dev-only Playwright).

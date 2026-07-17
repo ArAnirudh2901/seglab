@@ -7,7 +7,7 @@
 
 import { enqueueHeavy, STALE } from './heavy-job-queue.js'
 
-const MAX_SIDE = 768
+const MAX_SIDE = 1024
 const REFINE_TIMEOUT_MS = 15_000
 
 // Wasm SIMD feature probe (the build is SIMD-only; unsupported hosts keep

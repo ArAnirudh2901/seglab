@@ -11,7 +11,7 @@
 
 import { readMeta, decodeProxy, decodeOpaque, STALE } from './decode-client.js'
 import { resizeOpts } from './decode-core.js'
-import { interactionPlan } from './proxy-plan.js'
+import { interactionPlan, displayPlan } from './proxy-plan.js'
 
 const store = {
     blob: null,        // compressed original — never full-res RGBA between operations
@@ -96,13 +96,86 @@ const putInteractionFrame = (proxyCanvas, source, orientation) => {
     drawOriented(proxyCanvas, source, orientation)
 }
 
+const copyCanvas = (dst, src) => {
+    dst.width = src.width
+    dst.height = src.height
+    dst.getContext('2d').drawImage(src, 0, 0)
+}
+
+// Viewport signal for the display formula: what the screen can physically
+// show. displayPlan clamps DPR and adds the zoom slack.
+const currentViewport = () => {
+    if (typeof window === 'undefined') return { w: 0, h: 0, dpr: 1 }
+    const vv = window.visualViewport
+    return {
+        w: Math.round(vv?.width || window.innerWidth || 0),
+        h: Math.round(vv?.height || window.innerHeight || 0),
+        dpr: window.devicePixelRatio || 1,
+    }
+}
+
+const displayPlanFor = (srcW, srcH, budget = {}) => displayPlan({
+    srcW,
+    srcH,
+    budget,
+    viewport: currentViewport(),
+    textureLimit: budget.textureLimit || 0,
+})
+
+/**
+ * Draw a crisp display bitmap into `displayCanvas`, staying bounded-safe. A
+ * bounded-decode host (ImageDecoder) scale-decodes the full frame cheaply; an
+ * unbounded host decodes the largest source whose one-shot full raster fits
+ * the decode budget (displayPlan.allowFullDecode) — preferring the ORIGINAL —
+ * or, with displayMode 'native', pays one uncapped full-res decode. On any
+ * miss the model proxy (`proxyCanvas`, already oriented) is shown, so the
+ * preview never regresses.
+ */
+const renderDisplayFrame = async (displayCanvas, proxyCanvas, {
+    budget, fullBlob, fullW, fullH, safeBlob, safeW, safeH, orientation, revision, isCurrent,
+}) => {
+    let src = fullBlob
+    let sW = fullW
+    let sH = fullH
+    let plan = displayPlanFor(sW, sH, budget)
+    if (!plan.side) { copyCanvas(displayCanvas, proxyCanvas); return }
+    const boundedHost = typeof ImageDecoder !== 'undefined'
+
+    if (!boundedHost && !plan.allowFullDecode) {
+        // The original's one-shot raster exceeds the decode budget here: fall
+        // back to the largest bounded source (RAW preview / working copy) that
+        // fits; otherwise the proxy stays the preview.
+        const safePlan = (safeBlob && safeW) ? displayPlanFor(safeW, safeH, budget) : null
+        if (safePlan?.allowFullDecode && safePlan.side) {
+            src = safeBlob; sW = safeW; sH = safeH; plan = safePlan
+        } else { copyCanvas(displayCanvas, proxyCanvas); return }
+    }
+    if (!src) { copyCanvas(displayCanvas, proxyCanvas); return }
+
+    const scale = Math.min(1, plan.side / Math.max(sW, sH))
+    // Skip the decode when the display would not out-resolve the proxy already shown.
+    if (Math.round(Math.max(sW, sH) * scale) <= Math.max(proxyCanvas.width, proxyCanvas.height)) {
+        copyCanvas(displayCanvas, proxyCanvas)
+        return
+    }
+    try {
+        const res = await decodeProxy({ blob: src, decodeW: sW, decodeH: sH, scale, orientation, revision, isCurrent })
+        if (res === STALE) return // a newer import owns the canvases now
+        if (!res?.bitmap) { copyCanvas(displayCanvas, proxyCanvas); return }
+        try { putInteractionFrame(displayCanvas, res.bitmap, orientation) } finally { res.bitmap.close() }
+    } catch (err) {
+        console.warn('[seglab][asset] display decode fell back to proxy:', err?.message)
+        copyCanvas(displayCanvas, proxyCanvas)
+    }
+}
+
 /**
  * Take custody of a new original and draw its interaction frame into
  * `proxyCanvas`. Blob inputs remain Blob-only even when portrait-oriented;
  * `orientation` lets RAW container metadata override a preview JPEG's EXIF.
  */
 export const importOriginal = async (source, {
-    budget = {}, proxyCanvas, proxyBlob = null, orientation: orientationOverride = null,
+    budget = {}, proxyCanvas, displayCanvas = null, proxyBlob = null, orientation: orientationOverride = null,
     sourceWasRaw = false, sourceBytes = source?.size || 0,
     revision = null, isCurrent = null,
 } = {}) => {
@@ -140,19 +213,28 @@ export const importOriginal = async (source, {
             // A RAW's small embedded preview is already a bounded decode
             // source — retain it instead of re-encoding anything.
             const rawWorking = wantWorking && proxySource !== source && (proxyMeta?.w || 0) < meta.w
+            const payFullDecode = wantWorking && proxySource === source && Math.max(meta.w, meta.h) > wMax
+            // The import is about to pay the one full-raster decode anyway —
+            // harvest the on-screen frame from it so the display never costs a
+            // second one.
+            const displayTarget = displayCanvas ? displayPlanFor(displayed.w, displayed.h, budget) : { side: 0 }
+            const harvestSide = payFullDecode && displayTarget.side > Math.max(targetW, targetH)
+                ? displayTarget.side
+                : 0
             const res = await decodeProxy({
                 blob: proxySource,
                 decodeW,
                 decodeH,
                 scale: decodeScale,
                 orientation,
-                wantWorking: wantWorking && proxySource === source && Math.max(meta.w, meta.h) > wMax,
+                wantWorking: payFullDecode,
                 workingMaxSide: wMax,
+                displaySide: harvestSide,
                 revision,
                 isCurrent,
             })
             if (res === STALE) return null
-            const { bitmap, working } = res
+            const { bitmap, working, display } = res
             if (working) {
                 store.workingBlob = working.blob
                 store.workingW = working.w
@@ -190,6 +272,24 @@ export const importOriginal = async (source, {
             }
             store.assetKey = `doc:${hashCanvas(proxyCanvas)}`
             console.log('[seglab][asset] import-ready', { proxy: `${proxyCanvas.width}x${proxyCanvas.height}`, proxyActive: plan.proxyActive, working: !!store.workingBlob })
+            if (display && displayCanvas) {
+                // Harvested from the single import decode — no second decode.
+                try { putInteractionFrame(displayCanvas, display, orientation) } finally { display.close() }
+                console.log('[seglab][asset] display-ready', { display: `${displayCanvas.width}x${displayCanvas.height}`, mode: budget.displayMode || 'auto', harvested: true })
+            } else if (displayCanvas) {
+                if (display) display.close()
+                // Safe display source on unbounded hosts: the RAW's own smaller
+                // embedded preview, else the bounded working copy.
+                const safe = (proxySource !== source)
+                    ? { blob: proxySource, w: proxyMeta?.w || 0, h: proxyMeta?.h || 0 }
+                    : (store.workingBlob ? { blob: store.workingBlob, w: store.workingW, h: store.workingH } : { blob: null, w: 0, h: 0 })
+                await renderDisplayFrame(displayCanvas, proxyCanvas, {
+                    budget, fullBlob: source, fullW: meta.w, fullH: meta.h,
+                    safeBlob: safe.blob, safeW: safe.w, safeH: safe.h,
+                    orientation, revision, isCurrent,
+                })
+                console.log('[seglab][asset] display-ready', { display: `${displayCanvas.width}x${displayCanvas.height}`, mode: budget.displayMode || 'auto' })
+            } else if (display) display.close()
             return { ...store.transform }
         }
 
@@ -224,6 +324,7 @@ export const importOriginal = async (source, {
             sourceBytes,
         }
         store.assetKey = `doc:${hashCanvas(proxyCanvas)}`
+        if (displayCanvas) copyCanvas(displayCanvas, proxyCanvas)
         return { ...store.transform }
     }
 
@@ -259,6 +360,24 @@ export const importOriginal = async (source, {
         sourceBytes: 0,
     }
     store.assetKey = `doc:${hashCanvas(proxyCanvas)}`
+    if (displayCanvas) {
+        // The caller already owns full-res pixels — draw them into the display
+        // at a bounded size (no decode). Falls back to the proxy when disabled.
+        const dPlan = displayPlanFor(originalW, originalH, budget)
+        if (!dPlan.side) {
+            copyCanvas(displayCanvas, proxyCanvas)
+        } else if (dPlan.side >= Math.max(originalW, originalH)) {
+            copyCanvas(displayCanvas, source)
+        } else {
+            const s = Math.min(1, dPlan.side / Math.max(originalW, originalH))
+            displayCanvas.width = Math.max(1, Math.round(originalW * s))
+            displayCanvas.height = Math.max(1, Math.round(originalH * s))
+            const dctx = displayCanvas.getContext('2d')
+            dctx.imageSmoothingEnabled = true
+            dctx.imageSmoothingQuality = 'high'
+            dctx.drawImage(source, 0, 0, displayCanvas.width, displayCanvas.height)
+        }
+    }
     return { ...store.transform }
 }
 

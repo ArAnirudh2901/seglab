@@ -2,8 +2,8 @@
  * detect-worker — disposable text-detector shell.
  * Text search runs here, NOT in the segmentation worker: onnxruntime-web keeps
  * ONE wasm Memory per worker and it can only grow, so a single 960² detect
- * would permanently inflate the segmentation worker's arena past what the
- * 8 GB target survives. sam-client terminates this worker after the dispose
+ * would permanently inflate the segmentation worker's arena for the rest of
+ * the session. sam-client terminates this worker after the dispose
  * policy's window — termination is the only true free. Weights persist in the
  * SW cache, so a respawn pays a session build, never a download.
  */

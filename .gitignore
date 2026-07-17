@@ -3,6 +3,9 @@
 .cache/
 .DS_Store
 node_modules/
+# Pinned LibRaw source cache for scripts/build-libraw-wasm.sh (refetched on demand).
+# The built artifact (public/wasm/raw-develop.*) IS committed, like cv-refine.
+build/
 # Test media dropped in for debugging (screen recordings, sample RAW/photos)
 *.mp4
 *.mov

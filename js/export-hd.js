@@ -113,8 +113,8 @@ const scaleCropPrompts = (p, ds) => (Math.abs(ds - 1) < 1e-6 ? p : {
 // the mask AND clears everything outside it — no separate mask frame. `alpha`
 // is cloned, never mutated (a reused patch must survive a second export).
 // Both long edge AND total pixel count cap the exported frame. A 8192×8192
-// canvas is 256 MB before its source/mask/PNG buffers, which is unnecessarily
-// risky on an 8 GB machine even though its long edge is within the 8K limit.
+// canvas is 256 MB before its source/mask/PNG buffers — an unnecessary spike
+// no matter the host, even though its long edge is within the 8K limit.
 const compositeCropAlpha = async (alpha, width, height, rect, tf, decoded, { exportMaxSide = 0, exportMaxMP = 0 } = {}) => {
     const sideScale = exportMaxSide ? exportMaxSide / Math.max(tf.originalW, tf.originalH) : 1
     const pixelScale = exportMaxMP ? Math.sqrt((exportMaxMP * 1e6) / (tf.originalW * tf.originalH)) : 1

@@ -94,7 +94,7 @@ const getWorker = () => {
             // reset — the OS reclaims its WASM/GPU arenas — so RESTART a
             // fresh worker. Never fall inline mid-session: the full engine
             // on the main thread freezes the page and doubles renderer
-            // memory (the 8 GB tab-kill path). Inline stays boot-only.
+            // memory (the proven tab-kill path). Inline stays boot-only.
             failAllPending(event?.message || 'selection worker crashed')
             try { worker.terminate() } catch { /* already dead */ }
             worker = null
@@ -227,7 +227,7 @@ const applyWarmState = (engineState) => {
 
 /** Download and compile SlimSAM after an interaction proxy is visible.
  *  There is intentionally no model-upgrade branch: a second segmentation
- *  model would violate the bounded 8 GB interaction contract. */
+ *  model would violate the bounded interaction-memory contract. */
 export const warmUp = ({ budget = null } = {}) => {
     if (warmPromise) return warmPromise
     trace('warm-start', { model: 'slimsam', profile: budget?.profile })
@@ -353,12 +353,12 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
  * but reports stale and can never affect the UI. `encoded:false` means the
  * embedding came from memory or OPFS.
  */
-export const encodeImage = async (canvas, { revision } = {}) => {
+export const encodeImage = async (canvas, { revision, prime = false } = {}) => {
     if (!canvas?.width || !canvas?.height) return null
     const imageKey = contentKey(canvas)
     const result = await enqueueHeavy('encode-prewarm', async () => {
         const source = await createImageBitmap(canvas)
-        return call('encode', { imageKey, source, revision }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
+        return call('encode', { imageKey, source, revision, prime }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
     }, { priority: 'idle', revision: revision ?? null })
     return result === STALE ? { stale: true, revision } : result
 }

@@ -11,7 +11,7 @@
  * frame — display scaling is pure CSS, undone at the pointer.
  */
 
-import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA } from './sam-core.js'
+import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
 import {
     cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure,
 } from './sam-client.js'
@@ -19,6 +19,7 @@ import { applyMemoryPressure, resolveBudget } from './policy.js'
 import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset } from './asset-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
+import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
 import { detectCandidates } from './text-ui.js'
 import { acceleratedDetectorAvailable, detectorCached, detectorDownloadMB } from './detect-engine.js'
@@ -59,7 +60,7 @@ const NEG_COLOR = '#ff5d6c'
 const $ = (id) => document.getElementById(id)
 const els = {
     main: $('main'), dropzone: $('dropzone'), stage: $('stage'),
-    view: $('view'), overlay: $('overlay'), file: $('file'),
+    photo: $('photo'), view: $('view'), overlay: $('overlay'), file: $('file'),
     pick: $('pick'), demo: $('demo'), newimg: $('newimg'),
     status: $('status'), loadbar: $('loadbar'),
     prep: $('prep'), prepText: $('prep-text'),
@@ -91,10 +92,18 @@ const state = {
     wandTolerance: 36,
     textCandidates: [],       // [{ box, score, label }] proxy coords, from the detector
     textMulti: false,         // phrase implied "all/every"
-    mask: null,               // refined ImageData (white-on-black), canonical size
-    maskRaw: null,            // decoder output before hygiene/refinement (E toggle)
+    mask: null,               // DERIVED: baseMask ∪ liveMask — the composed selection
+    maskRaw: null,            // baseMask ∪ live raw decoder mask (E toggle)
     showRaw: false,
-    maskSummary: null,
+    maskSummary: null,        // summary of the composed mask
+    // Committed-selection stack: every finished object/manual op lands here so
+    // a new click can never unselect earlier regions. Z peels one op.
+    baseMask: null,           // ImageData replay of baseFloor+baseOps
+    baseOps: [],              // [{op:'add'|'sub', chan:Uint8Array, kind}]
+    baseFloor: null,          // flattened overflow of the op stack (Uint8Array)
+    liveMask: null,           // the object the current clicks/box/lasso describe
+    liveRaw: null,
+    liveSummary: null,
     score: 0,
     drag: null,               // in-progress interaction {kind, points|start}
     brush: null,              // transient canvas-backed stroke; committed on pointerup
@@ -138,10 +147,12 @@ const refreshChips = () => {
     els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}`
     const profile = BUDGET.profile || 'standard'
     const gpu = capability?.gpuTier || 'probing'
-    const memory = capability?.memoryGB
-        ? `${capability.memoryGB} GB${capability.memorySource === 'phosmith' ? ' host' : ''}`
-        : 'safe default'
-    els.chipDevice.textContent = `device: ${clientState.device || '—'} · ${profile} · ${gpu} · ${memory}`
+    // Only a trusted host budget is shown as a memory figure; a browser's
+    // deviceMemory report is unverifiable, so it never appears as a number.
+    const memory = (capability?.memorySource === 'phosmith' && capability.memoryGB)
+        ? ` · ${capability.memoryGB} GB host`
+        : ''
+    els.chipDevice.textContent = `device: ${clientState.device || '—'} · ${profile} · ${gpu}${memory}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
     const run = clientState.lastRun
     els.chipTiming.textContent = run
@@ -196,6 +207,14 @@ subscribe((event) => {
         return
     }
     if (event.type === 'lane') { refreshChips(); return }
+    if (event.type === 'stage') {
+        const d = event.detail || {}
+        if (state.running && d.revision === state.revision) {
+            if (d.stage === 'encode') setStatus('Selecting… analyzing the photo (one-time per image)')
+            else if (d.stage === 'decode') setStatus(d.encoded ? 'Selecting… tracing the object' : 'Selecting… tracing the object (photo already prepared)')
+        }
+        return
+    }
     refreshChips()
     if (clientState.ready && !state.running && !state.hasImage) {
         setStatus('Model ready — import a photo to begin')
@@ -276,15 +295,18 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
         if (!current() || document.hidden) return null
         // Do not stack the proxy encoder immediately behind the model's own
         // compilation/upload burst. If frames do not settle, defer safely to
-        // the first selection instead of forcing an unsafe memory peak.
-        const calm = await waitForCalm({ frames: 12, maxWaitMs: 6000 })
+        // the first selection instead of forcing an unsafe memory peak. The
+        // baseline profile waits longer for the same reason.
+        const lite = BUDGET.profile === 'lite'
+        const calm = await waitForCalm(lite ? { frames: 16, maxWaitMs: 10000 } : { frames: 12, maxWaitMs: 6000 })
         if (!current()) return null
         if (!calm) {
             state.encodePending = true
             console.warn('[seglab] idle encode deferred — device did not settle after model warm')
             return null
         }
-        const result = await encodeImage(els.view, { revision })
+        // prime: one throwaway decode initializes the decoder session too.
+        const result = await encodeImage(els.view, { revision, prime: true })
         if (!current() || result?.stale) return null
         state.encodePending = false
         if (!state.running) setStatus(`${readyStatus} · prepared locally`)
@@ -327,21 +349,36 @@ const showImage = async (source, {
             proxyMinEdge: Math.max(768, BUDGET.proxyMax || 1024),
         })
         if (!imageRequestIsCurrent(imageEpoch)) { hidePrep(epoch); return null }
-        if (!preview) throw new Error('No readable JPEG preview is embedded in this RAW. Export a JPEG/TIFF and try again.')
-        console.log('[seglab][ui] raw-import-ready', {
-            full: `${preview.width}x${preview.height}`,
-            hasProxy: Boolean(preview.proxyBlob),
-            orientation: preview.orientation,
-        })
-        source = preview.blob
-        proxyBlob = preview.proxyBlob
-        orientation = preview.orientation
+        if (preview) {
+            console.log('[seglab][ui] raw-import-ready', {
+                full: `${preview.width}x${preview.height}`,
+                hasProxy: Boolean(preview.proxyBlob),
+                orientation: preview.orientation,
+            })
+            source = preview.blob
+            proxyBlob = preview.proxyBlob
+            orientation = preview.orientation
+        } else {
+            // No embedded preview — develop the sensor on-device with LibRaw
+            // (rare fallback; worker disposed after use). Still no cloud, no
+            // Python: only a compact developed JPEG crosses back.
+            els.prepText.textContent = 'Developing the RAW on-device…'
+            setStatus('No embedded preview — developing the sensor on-device (this stays local)')
+            const developed = await developRaw(source, { budget: BUDGET })
+            if (!imageRequestIsCurrent(imageEpoch)) { hidePrep(epoch); return null }
+            if (!developed) throw new Error('No readable JPEG preview is embedded in this RAW, and on-device develop was unavailable. Export a JPEG/TIFF and try again.')
+            console.log('[seglab][ui] raw-develop-ready', { full: `${developed.width}x${developed.height}` })
+            source = developed.blob
+            proxyBlob = null
+            orientation = 1 // LibRaw already applies the camera's flip
+        }
     }
 
     els.prepText.textContent = 'Building a lightweight interaction preview…'
     const transform = await importOriginal(source, {
         budget: BUDGET,
         proxyCanvas: els.view,
+        displayCanvas: els.photo,
         proxyBlob,
         orientation,
         sourceWasRaw: raw,
@@ -365,7 +402,11 @@ const showImage = async (source, {
     const frameMode = transform.proxyActive
         ? `adaptive ${transform.proxyW}×${transform.proxyH} proxy`
         : 'native interaction frame (proxy disabled)'
-    const readyStatus = `Ready — click any object · ${frameMode}`
+    // The display frame is decoupled from the model proxy — show its real size.
+    const displayNote = (els.photo.width > transform.proxyW)
+        ? ` · ${els.photo.width}×${els.photo.height} preview`
+        : ''
+    const readyStatus = `Ready — click any object · ${frameMode}${displayNote}`
     setStatus(clientState.ready ? readyStatus : `${readyStatus} · preparing the model in the background`)
     // The proxy is on screen; ONLY NOW does SlimSAM warm (queued — it can
     // never overlap the decode that just released its bitmaps).
@@ -373,9 +414,10 @@ const showImage = async (source, {
     ensureWarm().catch((err) => {
         console.warn('[seglab] model warm failed (first selection will retry):', err?.message)
     })
-    // Speculative encode-at-import only on trusted (non-lite) budgets; the
-    // lite policy never encodes before the user's first selection.
-    if (BUDGET.eagerEncode && BUDGET.profile !== 'lite') {
+    // Speculative encode-at-import: bounded (one embedding, calm-gated) so
+    // even the baseline profile pays the encode before the first click. The
+    // pressure ratchet turns it back off.
+    if (BUDGET.eagerEncode) {
         scheduleEagerEncode(imageEpoch, state.revision, readyStatus)
     }
     return transform
@@ -503,7 +545,7 @@ document.addEventListener('visibilitychange', () => {
 
 // Heap watchdog (Chrome-only; sees only this thread's JS heap, so thresholds
 // are deliberately conservative): stop escalation, then shed detector and any
-// reloadable model state long before an 8 GB Mac starts heavy swapping.
+// reloadable model state long before the host starts heavy swapping.
 if (performance.memory) {
     setInterval(() => {
         if (!state.hasImage) return
@@ -516,6 +558,24 @@ if (performance.memory) {
             shedMemory(1)
         }
     }, 5000)
+} else {
+    // No heap signal (Safari): timer drift is the live pressure sentinel.
+    // A visible tab whose 1 s tick lands seconds late is swapping/starved —
+    // generalizes the one-shot rAF-gap check inside waitForCalm.
+    let lastTick = performance.now()
+    let stalls = 0
+    setInterval(() => {
+        const now = performance.now()
+        const drift = now - lastTick - 1000
+        lastTick = now
+        if (!state.hasImage || document.hidden) { stalls = 0; return }
+        if (drift > 2500) {
+            stalls += 1
+            shedMemory(stalls >= 2 ? 2 : 1, { announce: stalls >= 2 })
+        } else if (drift < 250) {
+            stalls = 0
+        }
+    }, 1000)
 }
 
 /* ─── Modes ──────────────────────────────────────────────────────────────── */
@@ -565,7 +625,7 @@ els.signtoggle.addEventListener('click', () => {
 /* ─── Prompt state ───────────────────────────────────────────────────────── */
 
 const refreshButtons = () => {
-    const any = state.clicks.length > 0 || state.box || state.lasso || state.manual
+    const any = state.clicks.length > 0 || state.box || state.lasso || state.manual || state.baseOps.length > 0
     els.undo.disabled = !any
     els.reset.disabled = !any
     els.cutout.disabled = !state.mask
@@ -581,6 +641,10 @@ function clearPrompts() {
     state.mask = null
     state.maskRaw = null
     state.maskSummary = null
+    state.baseMask = null
+    state.baseOps = []
+    state.baseFloor = null
+    clearLive()
     state.score = 0
     state.drag = null
     state.brush = null
@@ -592,18 +656,31 @@ function clearPrompts() {
 }
 
 const undoPrompt = () => {
-    if (state.manual) state.manual = null
-    else if (state.clicks.length > 0) state.clicks.pop()
-    else if (state.box) state.box = null
-    else if (state.lasso) state.lasso = null
+    if (state.manual) {
+        // A manual gesture is the top op on the stack — peel it with its marker.
+        state.manual = null
+        if (state.baseOps.length) { state.baseOps.pop(); recomposeBase() }
+    } else if (state.clicks.length > 1) {
+        state.clicks.pop()
+    } else if (state.clicks.length === 1) {
+        state.clicks = []
+        clearLive() // discard the live object; committed regions survive
+    } else if (state.box) {
+        state.box = null
+        clearLive()
+    } else if (state.lasso) {
+        state.lasso = null
+        clearLive()
+    } else if (state.baseOps.length) {
+        state.baseOps.pop()
+        recomposeBase()
+    }
     bumpRevision()
     if (state.clicks.length === 0 && !state.box && !state.lasso && !state.manual) {
-        state.mask = null
-        state.maskRaw = null
-        state.maskSummary = null
+        recomposeMask()
         renderOverlay()
         refreshButtons()
-        setStatus('Cleared')
+        setStatus(state.mask ? 'Removed last step' : 'Cleared')
         return
     }
     scheduleRun()
@@ -661,11 +738,9 @@ const ellipseMask = ([x0, y0, x1, y1]) => manualMask((ctx) => {
     ctx.fill()
 })
 
-// Combine a freshly-drawn region with the mask already down. This is what makes
-// the predictive modes (magic/color/region/rect/ellipse/polygon) accumulate:
-// include (left/tap) unions the region in, exclude (right/Alt or the sign
-// toggle) carves it out. First commit onto an empty canvas just lands as-is.
-const applyMaskCombine = (base, patch, negative) => {
+// Union two white-on-black masks per-pixel max, so the refined soft boundary
+// band survives composition (a hard 0/255 write would harden every edge).
+const softUnion = (base, patch) => {
     const w = patch.width
     const h = patch.height
     const out = base && base.width === w && base.height === h
@@ -674,11 +749,59 @@ const applyMaskCombine = (base, patch, negative) => {
     const o = out.data
     const p = patch.data
     for (let i = 0; i < p.length; i += 4) {
-        if (p[i] < 128) continue // pixel not part of this region
-        const v = negative ? 0 : 255
-        o[i] = v; o[i + 1] = v; o[i + 2] = v; o[i + 3] = v
+        if (p[i] > o[i]) { o[i] = p[i]; o[i + 1] = p[i + 1]; o[i + 2] = p[i + 2] }
+        o[i + 3] = 255
     }
     return out
+}
+
+// ~0.8 MB per op at the 1024 proxy; beyond the cap the oldest op flattens
+// into the floor so undo depth stays bounded.
+const MAX_BASE_OPS = 12
+
+const recomposeBase = () => {
+    const W = els.view.width
+    const H = els.view.height
+    if (!state.baseOps.length && !state.baseFloor) { state.baseMask = null; return }
+    const res = composeChannels(state.baseOps, W, H, state.baseFloor)
+    state.baseMask = res ? new ImageData(res.rgba, W, H) : null
+}
+
+const pushBaseOp = (op, imageData, kind, { dilate = 0 } = {}) => {
+    // A decode-based subtract grows a little so removing an object never
+    // leaves a residue ring where two decodes disagree by a pixel. Manual
+    // geometry (rect/region/…) stays exact.
+    const chan = dilate
+        ? dilateChannel(maskToChannel(imageData), imageData.width, imageData.height, dilate)
+        : maskToChannel(imageData)
+    state.baseOps.push({ op, chan, kind })
+    if (state.baseOps.length > MAX_BASE_OPS) {
+        const oldest = state.baseOps.shift()
+        const floor = state.baseFloor || new Uint8Array(els.view.width * els.view.height)
+        if (oldest.op === 'sub') { for (let i = 0; i < floor.length; i += 1) if (oldest.chan[i] >= 128) floor[i] = 0 }
+        else { for (let i = 0; i < floor.length; i += 1) if (oldest.chan[i] > floor[i]) floor[i] = oldest.chan[i] }
+        state.baseFloor = floor
+    }
+    recomposeBase()
+}
+
+/** Rebuild the composed truth (state.mask/maskSummary) from base ∪ live. */
+const recomposeMask = () => {
+    if (state.liveMask) {
+        state.mask = softUnion(state.baseMask, state.liveMask)
+    } else if (state.baseMask) {
+        state.mask = new ImageData(new Uint8ClampedArray(state.baseMask.data), state.baseMask.width, state.baseMask.height)
+    } else {
+        state.mask = null
+    }
+    state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw) : null
+    state.maskSummary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height) : null
+}
+
+const clearLive = () => {
+    state.liveMask = null
+    state.liveRaw = null
+    state.liveSummary = null
 }
 
 const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
@@ -686,20 +809,21 @@ const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
     // must never wipe an existing selection.
     if (!summarizeMaskRGBA(imageData.data, imageData.width, imageData.height).bbox) return
     const hadMask = !!(state.maskSummary && state.maskSummary.bbox)
-    const combined = applyMaskCombine(state.mask, imageData, negative)
-    const summary = summarizeMaskRGBA(combined.data, combined.width, combined.height)
+    // A live SAM object is part of the visible selection — keep it.
+    if (state.liveMask) pushBaseOp('add', state.liveMask, 'click')
+    pushBaseOp(negative ? 'sub' : 'add', imageData, kind)
     state.clicks = []
     state.box = null
     state.lasso = null
     state.textCandidates = []
-    state.manual = summary.bbox ? { kind, ...geometry } : null
-    state.mask = summary.bbox ? combined : null
-    state.maskRaw = null
-    state.maskSummary = summary.bbox ? summary : null
+    clearLive()
+    state.manual = state.baseMask ? { kind, ...geometry } : null
+    recomposeMask()
     state.score = 0
     state.showRaw = false
     bumpRevision()
     logCommit(state.revision, 'manual')
+    const summary = state.maskSummary || { coverage: 0, bbox: null }
     const op = !hadMask ? 'set' : negative ? 'subtract' : 'add'
     console.log('[seglab][ui] manual-mask', { kind, op, revision: state.revision, coverage: summary.coverage })
     setStatus(summary.bbox
@@ -784,10 +908,15 @@ const commitBrushMask = () => {
     state.box = null
     state.lasso = null
     state.textCandidates = []
+    // The stroke canvas was seeded from the composed mask, so it already IS
+    // the final whole-selection result: flatten the stack to this one op.
+    state.baseOps = []
+    state.baseFloor = null
+    state.baseMask = null
+    clearLive()
+    if (summary.bbox) pushBaseOp('add', imageData, 'brush')
     state.manual = summary.bbox ? { kind: 'brush' } : null
-    state.mask = summary.bbox ? imageData : null
-    state.maskRaw = null
-    state.maskSummary = summary.bbox ? summary : null
+    recomposeMask()
     state.score = 0
     state.showRaw = false
     bumpRevision()
@@ -931,11 +1060,7 @@ els.overlay.addEventListener('pointerup', (e) => {
     const [x, y] = toCanvas(e)
 
     if (drag.kind === 'tap' && !drag.moved) {
-        const label = drag.negative || state.sign === 0 ? 0 : 1
-        state.manual = null
-        state.clicks.push([x, y, label])
-        bumpRevision()
-        scheduleRun()
+        applyClickPrompt(x, y, drag.negative || state.sign === 0 ? 0 : 1)
     } else if (drag.kind === 'box') {
         const [sx, sy] = drag.start
         // Discard degenerate boxes (a stray click instead of a drag).
@@ -982,6 +1107,39 @@ els.overlay.addEventListener('dblclick', (e) => {
 })
 
 /* ─── Segmentation pipeline ──────────────────────────────────────────────── */
+
+/** One Click-mode tap (pointerup and the headless clickAt hook). */
+function applyClickPrompt(x, y, label) {
+    state.manual = null
+    if (label === 1) {
+        if (state.liveMask && !pointInMask(state.liveMask, x, y)) {
+            // A click OUTSIDE the live object selects a NEW object: commit the
+            // finished one so it can never be unselected by later clicks.
+            pushBaseOp('add', state.liveMask, 'click')
+            clearLive()
+            state.clicks = [[x, y, 1]]
+        } else {
+            state.clicks.push([x, y, 1])
+        }
+        bumpRevision()
+        scheduleRun()
+        return
+    }
+    // Exclude: a committed region (not the live object) carves out whole;
+    // anything near the live object is a negative refinement point.
+    const insideLive = state.liveMask && pointInMask(state.liveMask, x, y)
+    if (!insideLive && state.baseMask && pointInMask(state.baseMask, x, y)) {
+        void runObjectSubtract(x, y)
+        return
+    }
+    if (state.clicks.length || state.box || state.lasso) {
+        state.clicks.push([x, y, 0])
+        bumpRevision()
+        scheduleRun()
+        return
+    }
+    setStatus('Nothing to exclude here — click an object first')
+}
 
 let debounceTimer = null
 let debounceArmed = false // a run is scheduled but not yet started (waitForRun must see this)
@@ -1032,16 +1190,18 @@ async function runNow() {
         console.log('[seglab][ui] selection-result', { revision, usable: res.usable, lane: res.lane, score: res.score, encoded: res.encoded })
         if (res.encoded) state.encodePending = false // paid; the cache serves the rest
         if (!res.usable) {
-            state.mask = null
-            state.maskRaw = null
-            state.maskSummary = null
+            // Only the live object misses; committed regions survive.
+            clearLive()
+            recomposeMask()
             setStatus(`No selection — ${res.reason}. Try another click.`)
         } else {
-            state.mask = res.imageData
-            state.maskRaw = res.rawImageData
-            state.maskSummary = res.summary
+            state.liveMask = res.imageData
+            state.liveRaw = res.rawImageData
+            state.liveSummary = res.summary
+            recomposeMask()
             state.score = res.score
-            setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(res.summary.coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}`)
+            const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
+            setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}`)
         }
         renderOverlay()
         refreshButtons()
@@ -1061,16 +1221,53 @@ async function runNow() {
     }
 }
 
+/** Exclude-click on a committed region: one ephemeral single-point decode
+ *  identifies that object, then it subtracts from the base stack. Never
+ *  becomes the live object; refinement/escalation don't apply. */
+async function runObjectSubtract(x, y) {
+    if (state.running) { setStatus('Busy — try the exclude click again in a moment'); return }
+    bumpRevision()
+    const revision = state.revision
+    state.running = true
+    setStatus('Removing object from selection…')
+    try {
+        const res = await segment(els.view, { clicks: [[x, y, 1]], revision, budget: BUDGET })
+        if (res.stale || revision !== state.revision) { logCommit(revision, 'stale'); return }
+        if (!res.usable) {
+            logCommit(revision, 'unusable')
+            setStatus(`Nothing removed — ${res.reason}`)
+            return
+        }
+        pushBaseOp('sub', res.imageData, 'click-exclude', { dilate: 2 })
+        recomposeMask()
+        logCommit(revision, 'committed')
+        setStatus(state.maskSummary?.bbox
+            ? `Removed object · ${(state.maskSummary.coverage * 100).toFixed(1)}% of frame`
+            : 'Selection cleared')
+        renderOverlay()
+        refreshButtons()
+    } catch (err) {
+        logCommit(revision, 'error')
+        if (revision === state.revision) {
+            console.error('[seglab] exclude failed:', err)
+            setStatus(`Exclude failed: ${err?.message}`)
+        }
+    } finally {
+        state.running = false
+        if (state.runQueued) { state.runQueued = false; scheduleRun() }
+    }
+}
+
 /* ─── Wasm mask cleanup (cv-refine) ──────────────────────────────────────── */
 
 // One-channel contract: the mask leaves as W*H bytes (transferred), returns
 // as W*H bytes, and only the final committed ImageData expands to RGBA.
 async function maybeCvRefine(revision, clicks) {
-    if (!state.mask || !cvRefineAvailable()) return
+    if (!state.liveMask || !cvRefineAvailable()) return
     if (BUDGET.cvRefine === false || (BUDGET.pressureLevel || 0) >= 2) return
-    const { width, height } = state.mask
-    if (Math.max(width, height) > 768) return
-    const src = state.mask.data
+    const { width, height } = state.liveMask
+    if (Math.max(width, height) > 1024) return
+    const src = state.liveMask.data
     const alpha = new Uint8Array(width * height)
     for (let p = 0; p < alpha.length; p += 1) alpha[p] = src[p * 4]
     const seeds = (clicks || []).filter((c) => c[2]).map((c) => [Math.round(c[0]), Math.round(c[1])])
@@ -1083,15 +1280,16 @@ async function maybeCvRefine(revision, clicks) {
         revision,
         budget: BUDGET,
     })
-    if (!refined || revision !== state.revision || !state.mask) return
+    if (!refined || revision !== state.revision || !state.liveMask) return
     const out = new ImageData(width, height)
     const d = out.data
     for (let p = 0, i = 0; p < refined.length; p += 1, i += 4) {
         const v = refined[p]
         d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255
     }
-    state.mask = out
-    state.maskSummary = summarizeMaskRGBA(d, width, height)
+    state.liveMask = out
+    state.liveSummary = summarizeMaskRGBA(d, width, height)
+    recomposeMask()
     renderOverlay()
 }
 
@@ -1123,7 +1321,8 @@ const shouldEscalate = (summary) => {
 }
 
 async function maybeEscalate(revision) {
-    if (!shouldEscalate(state.maskSummary)) return
+    // The tiny-bbox test must see the live object, not the composed union.
+    if (!state.liveMask || !shouldEscalate(state.liveSummary)) return
     // One escalation per SETTLED selection: skip while more input is pending,
     // and let a click-burst supersede us before the heavy crop pipeline starts.
     if (state.runQueued || debounceArmed) return
@@ -1135,7 +1334,7 @@ async function maybeEscalate(revision) {
     const previous = els.status.textContent
     setStatus('Sharpening detail from the full-resolution photo…')
     try {
-        const crop = await escalateCrop(state.mask, currentPrompts(), { budget: BUDGET, revision })
+        const crop = await escalateCrop(state.liveMask, currentPrompts(), { budget: BUDGET, revision })
         if (!crop || revision !== state.revision) { setStatus(previous); return } // rejected or superseded
         mergeCropIntoProxy(crop)
         renderOverlay()
@@ -1161,7 +1360,7 @@ function mergeCropIntoProxy({ alpha, width, height, proxySubrect }) {
     lctx.drawImage(cropCanvas, 0, 0, width, height, sx, sy, sw, sh)
     const down = lctx.getImageData(0, 0, W, H).data
 
-    const merged = new Uint8ClampedArray(state.mask.data)
+    const merged = new Uint8ClampedArray(state.liveMask.data)
     const x0 = Math.max(0, Math.floor(sx))
     const y0 = Math.max(0, Math.floor(sy))
     const x1 = Math.min(W, Math.ceil(sx + sw))
@@ -1173,8 +1372,9 @@ function mergeCropIntoProxy({ alpha, width, height, proxySubrect }) {
             merged[i] = v; merged[i + 1] = v; merged[i + 2] = v; merged[i + 3] = 255
         }
     }
-    state.mask = new ImageData(merged, W, H)
-    state.maskSummary = summarizeMaskRGBA(merged, W, H)
+    state.liveMask = new ImageData(merged, W, H)
+    state.liveSummary = summarizeMaskRGBA(merged, W, H)
+    recomposeMask()
 }
 
 /* ─── Text select ────────────────────────────────────────────────────────── */
@@ -1273,9 +1473,10 @@ async function selectAll() {
             }
         }
         if (!union) { setStatus('No objects selected'); return }
-        state.mask = union
-        state.maskRaw = new ImageData(new Uint8ClampedArray(union.data), union.width, union.height)
-        state.maskSummary = summarizeMaskRGBA(union.data, union.width, union.height)
+        // The multi-instance union commits as one op; Z removes it whole.
+        pushBaseOp('add', union, 'text')
+        clearLive()
+        recomposeMask()
         state.box = null
         setStatus(`Selected ${boxes.length} objects`)
         renderOverlay()
@@ -1582,6 +1783,20 @@ window.__seglab = {
     reset: () => clearPrompts(),
     revision: () => state.revision,
     commitLog,
+    // Drive the LibRaw develop fallback directly (verify.mjs). Fetches a RAW at
+    // `url`, develops the sensor on-device (no MP cap for the test), and returns
+    // the developed JPEG's dimensions + a decode check — proving the whole
+    // File → worker → wasm → libjpeg → Blob chain end to end.
+    developRawUrl: async (url) => {
+        const bytes = await (await fetch(url)).arrayBuffer()
+        const file = new File([bytes], 'fixture.raw', { type: 'application/octet-stream' })
+        const out = await developRaw(file, { budget: { ...BUDGET, rawDevelop: true, rawDevelopMaxMP: 0 } })
+        if (!out) return { ok: false }
+        const bmp = await createImageBitmap(out.blob)
+        const res = { ok: true, w: out.width, h: out.height, jpegBytes: out.blob.size, decodedW: bmp.width, decodedH: bmp.height }
+        bmp.close()
+        return res
+    },
     // Boot capability probe result { webgpu, fallback, f16, deviceMemoryGB,
     // profile } — awaits the probe so it is never null.
     capability: async () => { await bootProbe; return capability },
@@ -1649,6 +1864,7 @@ window.__seglab = {
         maskSummary: state.maskSummary,
         score: state.score,
         clicks: state.clicks.length,
+        baseOps: state.baseOps.length,
         revision: state.revision,
         candidates: state.textCandidates.length,
         manual: state.manual?.kind || null,
@@ -1757,9 +1973,7 @@ window.__seglab = {
         return { ...out, radialErr: maxErr / s, centerOpaque: alphaAt(cx, cy) >= 128 }
     },
     clickAt: async (x, y, negative = false) => {
-        state.clicks.push([x, y, negative ? 0 : 1])
-        bumpRevision() // mirror the real pointerup path
-        scheduleRun()
+        applyClickPrompt(x, y, negative ? 0 : 1) // the real pointerup path
         await waitForRun()
         return window.__seglab.state()
     },

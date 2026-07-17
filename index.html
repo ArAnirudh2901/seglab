@@ -134,6 +134,15 @@
         user-select: none;
         -webkit-user-select: none;
     }
+    /* #view (the ≤1024 buffer the model/magic/color/brush read from) drives the
+       stage layout as before, but is fully covered by #photo — the crisp display
+       frame — which is layered over it and under #overlay in the same box. */
+    #photo {
+        position: absolute;
+        inset: 0;
+        width: 100% !important;
+        height: 100% !important;
+    }
     #overlay {
         position: absolute;
         inset: 0;
@@ -270,6 +279,7 @@
     </div>
     <div id="stage">
         <canvas id="view"></canvas>
+        <canvas id="photo"></canvas>
         <canvas id="overlay"></canvas>
     </div>
     <div id="prep" hidden>

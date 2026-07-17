@@ -45,3 +45,42 @@ export const interactionPlan = (w, h, budget = {}) => {
         proxyReason: disabled && !directSafe ? 'safety' : (proxyActive ? 'device' : 'native'),
     }
 }
+
+/**
+ * Ceiling (in megapixels) on the one-shot full-raster decode an unbounded
+ * host (no ImageDecoder — Safari) may pay for the display frame. Reuses the
+ * budget's already-trusted one-shot crop size; the pressure ratchet lowers
+ * it. Pixel budgets only — never a RAM figure.
+ */
+export const decodeBudgetMP = (budget = {}) => {
+    const base = budget.escalateMaxMP || 8
+    const level = budget.pressureLevel || 0
+    if (level >= 3) return 2
+    if (level >= 2) return 4
+    if (level >= 1) return Math.min(base, 6)
+    return base
+}
+
+/**
+ * Display long edge for ANY source (JPEG/PNG/HEIC, RAW embedded preview,
+ * LibRaw-developed). The screen is the anchor: the preview never needs more
+ * pixels than the viewport can show (plus zoom slack), never exceeds the
+ * profile ceiling or the GPU texture limit, and never upscales the source.
+ * `allowFullDecode` gates whether an unbounded host may decode the full
+ * raster once to build it.
+ */
+export const displayPlan = ({ srcW, srcH, budget = {}, viewport = {}, textureLimit = 0 }) => {
+    if (budget.displayMode === 'off') return { side: 0, allowFullDecode: false }
+    const srcLong = Math.max(srcW || 0, srcH || 0)
+    const texCap = textureLimit > 0 ? textureLimit : Infinity
+    if (budget.displayMode === 'native') {
+        return { side: Math.min(srcLong, texCap), allowFullDecode: true } // explicit opt-in
+    }
+    const dpr = Math.min(viewport.dpr || 1, 3) // clamp odd hosts
+    const ZOOM_SLACK = 1.5                     // pinch-zoom headroom
+    const viewportLong = Math.max(viewport.w || 0, viewport.h || 0) || 1280
+    const need = Math.round(viewportLong * dpr * ZOOM_SLACK)
+    const side = Math.min(need, budget.displayMax || 2048, texCap, srcLong)
+    const allowFullDecode = ((srcW * srcH) / 1e6) <= decodeBudgetMP(budget)
+    return { side, allowFullDecode }
+}

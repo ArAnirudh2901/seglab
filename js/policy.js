@@ -3,7 +3,7 @@
  * One budget object gates proxy size, residency, cache caps, escalation,
  * HD export. Profiles scale HOW MUCH hardware a feature gets, never WHETHER.
  *
- * 8 GB safety lock: a plain browser cannot prove more than 8 GB
+ * Memory-trust lock: a plain browser cannot verify its real memory headroom
  * (`navigator.deviceMemory` is privacy-rounded and capped), so any budget not
  * backed by a trusted Phosmith host hint is FORCED to the `lite` profile and
  * URL parameters cannot raise its limits. Precedence:
@@ -16,8 +16,15 @@
 const PRESETS = {
     lite: {
         profile: 'lite',
-        proxyMax: 768,
+        proxyMax: 1024,          // = SlimSAM's own internal encode edge; below it
+                                 // the model upscales (softer input) for no memory
+                                 // saving. The pressure floor drops it.
         proxyMode: 'auto',
+        // On-screen preview frame, decoupled from the model proxy: a GPU-resident
+        // display bitmap (not RGBA/tensor) so the photo looks crisp while the
+        // model keeps its bounded ≤proxyMax buffer. Sized bounded-safe per host.
+        displayMax: 2048,
+        displayMode: 'auto',     // 'auto' safe | 'native' opts into a full-res decode
         directMaxMP: 2,
         directMaxSide: 2048,
         cropMaxSide: 1280,
@@ -31,11 +38,17 @@ const PRESETS = {
         // Only enables the 151 MB Grounding DINO q4f16 attempt after the
         // accelerator/f16 gate in sam-engine. OWLv2 still stays on WASM.
         detectorWebGPU: true,
+        // SAM stays on WASM here: the WebGPU compile/upload burst is a memory
+        // event on the unverified baseline (like OWLv2's lesson).
+        samWebGPU: false,
         autoEscalate: false,
         hdExportDecode: false,
         detectorDispose: 'now',
-        eagerEncode: false,      // no speculative encode before the first selection
+        eagerEncode: true,       // bounded: one embedding, calm-gated, wasm lane
         cvRefine: true,          // wasm mask cleanup (skipped at pressure ≥ 2)
+        rawDevelop: true,        // LibRaw develop for preview-less RAW; lazy,
+                                 // disposed after use, off at pressure ≥ 2
+        rawDevelopMaxMP: 40,     // refuse larger sensors here (bounds the peak)
         embedPersist: false,     // OPFS embedding persistence off (packing peaks)
         workingMaxSide: 1280,    // bounded re-decode copy cap (Safari-shaped hosts)
         pressureLevel: 0,
@@ -44,6 +57,8 @@ const PRESETS = {
         profile: 'standard',
         proxyMax: 1024,
         proxyMode: 'auto',
+        displayMax: 2560,
+        displayMode: 'auto',
         directMaxMP: 4,
         directMaxSide: 4096,
         cropMaxSide: 2048,
@@ -55,11 +70,14 @@ const PRESETS = {
         maxResidentHeavy: 1,
         flagship: false,
         detectorWebGPU: true,
+        samWebGPU: true,
         autoEscalate: true,
         hdExportDecode: true,
         detectorDispose: 'idle',
         eagerEncode: true,
         cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 60,
         embedPersist: true,
         workingMaxSide: 4096,
         pressureLevel: 0,
@@ -68,6 +86,8 @@ const PRESETS = {
         profile: 'pro',
         proxyMax: 1280,
         proxyMode: 'auto',
+        displayMax: 3200,
+        displayMode: 'auto',
         directMaxMP: 6,
         directMaxSide: 6144,
         cropMaxSide: 3072,
@@ -79,11 +99,14 @@ const PRESETS = {
         maxResidentHeavy: 2,
         flagship: false,         // retired: SlimSAM is the only segmentation lane
         detectorWebGPU: true,
+        samWebGPU: true,
         autoEscalate: true,
         hdExportDecode: true,
         detectorDispose: 'idle',
         eagerEncode: true,
         cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 80,
         embedPersist: true,
         workingMaxSide: 4096,
         pressureLevel: 0,
@@ -92,6 +115,8 @@ const PRESETS = {
         profile: 'ultra',
         proxyMax: 1536,
         proxyMode: 'auto',
+        displayMax: 4096,
+        displayMode: 'auto',
         directMaxMP: 8,
         directMaxSide: 8192,
         cropMaxSide: 4096,
@@ -103,11 +128,14 @@ const PRESETS = {
         maxResidentHeavy: 2,
         flagship: false,
         detectorWebGPU: true,
+        samWebGPU: true,
         autoEscalate: true,
         hdExportDecode: true,
         detectorDispose: 'idle',
         eagerEncode: true,
         cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 100,
         embedPersist: true,
         workingMaxSide: 4096,
         pressureLevel: 0,
@@ -115,7 +143,7 @@ const PRESETS = {
 }
 
 /** True when nothing above `lite` can be proven: no capability yet, or the
- *  memory evidence is browser-reported/unknown (both untrusted ≤ 8 GB). */
+ *  memory evidence is browser-reported/unknown (both unverifiable). */
 export const isMemoryLocked = (probed = null) => {
     if (typeof probed === 'string') return false // explicit caller/test profile
     if (!probed || typeof probed !== 'object') return true
@@ -124,7 +152,7 @@ export const isMemoryLocked = (probed = null) => {
 
 /**
  * Session budget: preset + capability probe + URL overrides. On a memory-
- * locked device (8 GB, unknown, or no probe yet) the profile is `lite` and
+ * locked device (unverified memory, or no probe yet) the profile is `lite` and
  * URL parameters may only LOWER limits — `?flagship=1`, `?proxy=max`,
  * `?proxy=off`, `?profile=ultra`, `?working=1` are all refused there.
  * `probed` is the boot capability object or a bare profile string (tests).
@@ -149,6 +177,7 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.resourceMode = cap.resourceMode || 'balanced'
         budget.hostManaged = !!cap.hostManaged
         budget.flagshipEligible = !!cap.flagshipEligible
+        budget.textureLimit = cap.textureLimit || 0
     }
     budget.memoryLocked = locked
     if (cap?.memorySource === 'unknown') budget.memoryUncertain = true
@@ -186,6 +215,16 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     // trusted budgets (verify uses it); ?working=0 disables anywhere.
     if (params.get('working') === '0') budget.workingMode = 'off'
     else if (!locked && params.get('working') === '1') budget.workingMode = 'force'
+
+    // On-screen preview quality (display only — never touches the segmentation
+    // memory contract, so it is honored even on a locked budget). `native` opts
+    // into a one-time full-res decode for a crisp preview on unbounded-decode
+    // hosts (Safari); `off` pins the preview to the model proxy; a number caps
+    // the display long edge lower.
+    const dq = params.get('display')
+    if (dq === 'native') budget.displayMode = 'native'
+    else if (dq === 'off') budget.displayMode = 'off'
+    else if (dq && Number(dq) >= 256) budget.displayMax = Math.min(4096, Math.round(Number(dq)))
     return budget
 }
 
@@ -205,19 +244,23 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.draftCacheMax = Math.min(next.draftCacheMax || 1, 1)
         next.flagshipCacheMax = 0
         next.detectorWebGPU = false
+        next.samWebGPU = false
         next.eagerEncode = false
     }
     if (nextLevel >= 2) {
         next.cropMaxSide = Math.min(next.cropMaxSide || 1280, 1280)
         next.escalateMaxMP = Math.min(next.escalateMaxMP || 8, 8)
+        next.displayMax = Math.min(next.displayMax || 1600, 1600)
         next.hdExportDecode = false
         next.cvRefine = false
+        next.rawDevelop = false
     }
     if (nextLevel >= 3) {
         const exportCap = next.profile === 'lite' ? 4 : (next.profile === 'standard' ? 16 : 24)
         next.exportMaxMP = Math.min(next.exportMaxMP || exportCap, exportCap)
         next.exportMaxSide = Math.min(next.exportMaxSide || 4096, next.profile === 'lite' ? 4096 : 6144)
         next.proxyMax = Math.min(next.proxyMax || 768, 768)
+        next.displayMax = Math.min(next.displayMax || 1280, 1280)
         if (next.safeProxyMax) next.safeProxyMax = Math.min(next.safeProxyMax, 768)
     }
     return next

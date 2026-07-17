@@ -69,13 +69,52 @@ export const buildBoxPrompt = (box, srcW, srcH, reshaped) => {
     }
 }
 
-/** Index of the best of SAM's three candidate masks (argmax IoU score). */
-export const pickBestMask = (scores) => {
-    let best = 0
-    for (let i = 1; i < scores.length; i += 1) {
-        if (scores[i] > scores[best]) best = i
+/**
+ * A candidate covering ≥ this much of the frame is SAM's whole-scene guess,
+ * not an object: past 90% there is no background left to cut a subject out
+ * of. Sits above the largest plausible real subject — even a frame-filling
+ * close-up tops out near 85% — so genuine big-subject selections are never
+ * second-guessed.
+ */
+export const RUNAWAY_COVERAGE = 0.9
+
+/**
+ * Index of the best of SAM's three candidate masks.
+ *
+ * SAM emits its candidates as granularity levels (subpart → part → whole) and
+ * scores each one independently, so a plain argmax is only trustworthy when
+ * the prompt says which level was meant. Under an ambiguous prompt — a single
+ * positive click, no box — clicking one object in a field of near-identical
+ * objects lets the whole-scene candidate outscore the object actually pointed
+ * at, and the argmax winner comes back as the entire photo. In that case take
+ * the best-scoring candidate that still leaves a background behind. If every
+ * candidate is a runaway the subject may genuinely fill the frame, so the
+ * argmax winner stands.
+ */
+export const pickBestMask = (scores, { coverages = null, ambiguous = false } = {}) => {
+    const byScore = Array.from(scores.keys()).sort((a, b) => scores[b] - scores[a])
+    if (!ambiguous || !coverages) return byScore[0]
+    // An empty candidate is a miss, never an improvement on a runaway.
+    const scoped = byScore.find((i) => coverages[i] > 0 && coverages[i] < RUNAWAY_COVERAGE)
+    return scoped === undefined ? byScore[0] : scoped
+}
+
+/**
+ * Fraction of each candidate channel that is selected, sharing the one pass
+ * over the bool mask tensor ([1, C, H, W], Uint8 0/1) that every candidate
+ * lives in. Feeds pickBestMask's runaway test before a channel is expanded
+ * to RGBA — only the winner ever pays for that.
+ */
+export const maskChannelCoverages = (maskData, width, height, channels) => {
+    const size = width * height
+    const out = new Array(channels)
+    for (let c = 0; c < channels; c += 1) {
+        const offset = c * size
+        let count = 0
+        for (let i = 0; i < size; i += 1) if (maskData[offset + i]) count += 1
+        out[c] = count / size
     }
-    return best
+    return out
 }
 
 /**
@@ -120,6 +159,80 @@ export const summarizeMaskRGBA = (rgba, width, height) => {
         coverage: count / (width * height),
         bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null,
     }
+}
+
+/* ─── Committed-selection composition (click-union model) ─────────────────── */
+
+/** 1-channel copy of a white-on-black RGBA mask. Keeps the full 8-bit value —
+ *  the refined boundary band is soft alpha, and committing an object must not
+ *  harden its edges. */
+export const maskToChannel = (imageData) => {
+    const { data, width, height } = imageData
+    const chan = new Uint8Array(width * height)
+    for (let i = 0; i < chan.length; i += 1) chan[i] = data[i * 4]
+    return chan
+}
+
+/**
+ * Replay an ordered op stack ({op:'add'|'sub', chan}) into a white-on-black
+ * RGBA mask. Adds union per-pixel max (soft edges survive); subs zero where
+ * the sub channel is selected. `floor` is an optional pre-flattened starting
+ * channel. Returns null when nothing selected (callers keep the fast path).
+ */
+export const composeChannels = (ops, width, height, floor = null) => {
+    const size = width * height
+    const acc = floor ? Uint8Array.from(floor) : new Uint8Array(size)
+    for (const { op, chan } of ops) {
+        if (!chan || chan.length !== size) continue
+        if (op === 'sub') { for (let i = 0; i < size; i += 1) if (chan[i] >= 128) acc[i] = 0 }
+        else { for (let i = 0; i < size; i += 1) if (chan[i] > acc[i]) acc[i] = chan[i] }
+    }
+    let any = false
+    const rgba = new Uint8ClampedArray(size * 4)
+    for (let i = 0; i < size; i += 1) {
+        const v = acc[i]
+        if (v >= 128) any = true
+        const j = i * 4
+        rgba[j] = v; rgba[j + 1] = v; rgba[j + 2] = v; rgba[j + 3] = 255
+    }
+    return any ? { rgba, width, height } : null
+}
+
+/**
+ * Dilate a 1-channel mask by `radius` px (chebyshev). Subtract ops grow by a
+ * safety margin so removing an object never leaves a boundary-residue ring
+ * where two decodes of the same object disagree by a pixel.
+ */
+export const dilateChannel = (chan, width, height, radius = 2) => {
+    if (!radius) return chan
+    const out = new Uint8Array(chan.length)
+    for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+            if (!chan[y * width + x]) continue
+            const x0 = Math.max(0, x - radius)
+            const x1 = Math.min(width - 1, x + radius)
+            const y0 = Math.max(0, y - radius)
+            const y1 = Math.min(height - 1, y + radius)
+            for (let yy = y0; yy <= y1; yy += 1) out.fill(255, yy * width + x0, yy * width + x1 + 1)
+        }
+    }
+    return out
+}
+
+/** True when (x, y) — or any pixel within `tolerance` px — is selected. */
+export const pointInMask = (imageData, x, y, tolerance = 3) => {
+    if (!imageData) return false
+    const { data, width, height } = imageData
+    const x0 = Math.max(0, Math.round(x) - tolerance)
+    const x1 = Math.min(width - 1, Math.round(x) + tolerance)
+    const y0 = Math.max(0, Math.round(y) - tolerance)
+    const y1 = Math.min(height - 1, Math.round(y) + tolerance)
+    for (let yy = y0; yy <= y1; yy += 1) {
+        for (let xx = x0; xx <= x1; xx += 1) {
+            if (data[(yy * width + xx) * 4] >= 128) return true
+        }
+    }
+    return false
 }
 
 /**

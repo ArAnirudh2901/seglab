@@ -11,8 +11,12 @@
  * is parsed by its IFD preview pointers; other containers (CR3/RAF) fall back to
  * a bounded, validated JPEG scan.
  *
- * NOT a raw developer: the preview is the camera's 8-bit rendering, not a fresh
- * 14-bit demosaic. Right for masking; a WASM-LibRaw path is the future upgrade.
+ * This is the FAST PATH and covers essentially every modern RAW: not a raw
+ * developer — the preview is the camera's 8-bit rendering, not a fresh demosaic
+ * — which is exactly right for masking. When a file carries NO usable embedded
+ * preview, extractRawPreview returns null and the import falls back to on-device
+ * LibRaw develop (raw-develop-client.js → raw-develop.wasm): still no Python, no
+ * server, and only a compact developed JPEG rejoins this same decode path.
  */
 
 import { readImageMeta } from './image-io.js'

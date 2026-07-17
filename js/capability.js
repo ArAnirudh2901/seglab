@@ -2,11 +2,11 @@
  * capability — device and resource-budget probe (main thread).
  *
  * A browser can request a high-performance WebGPU adapter, but it deliberately
- * cannot expose reliable VRAM and `navigator.deviceMemory` is privacy-rounded
- * and capped at 8 GB. Consequently a plain browser build NEVER treats an 8 GB
- * report as evidence of 16/24/64 GB headroom. Phosmith may supply a trusted
- * usable-memory budget before this module runs through
- * `window.__PHOSMITH_DEVICE_RESOURCES__`; see README for the small contract.
+ * cannot expose reliable VRAM, and browser memory reports are privacy-rounded
+ * and unverifiable. Consequently a plain browser build never sizes budgets
+ * from a browser memory report — only from a resource budget it can trust.
+ * Phosmith may supply a trusted usable-memory budget before this module runs
+ * through `window.__PHOSMITH_DEVICE_RESOURCES__`; see README for the contract.
  *
  * Memory sizing and GPU acceleration are intentionally separate: RAM/VRAM
  * decides canvas/cache/export limits, while WebGPU decides how inference runs.
@@ -55,15 +55,18 @@ export const readPhosmithResources = () => normalizePhosmithResources(
 
 const lowerProfile = (profile) => ({ ultra: 'pro', pro: 'standard', standard: 'standard', lite: 'lite' }[profile] || 'standard')
 
+// Trusted-host tier ladder (usable editor budget the host vouches for, not
+// installed RAM). Unverified budgets never enter it.
+const TIER_MIN_GB = { standard: 8, pro: 12, ultra: 24 }
+
 const profileForMemory = (memoryGB, trusted, mode) => {
-    // Browsers round deviceMemory and cap it at 8 GB, so an untrusted report
-    // (or no report at all) can never prove more than 8 GB — force lite.
-    // Only a trusted Phosmith budget earns a larger tier.
+    // Browser memory reports are unverifiable, so they never pick a tier —
+    // an untrusted budget always resolves to the conservative baseline.
     if (!trusted) return 'lite'
     let profile = 'standard'
-    if (memoryGB > 0 && memoryGB < 8) profile = 'lite'
-    else if (memoryGB >= 24) profile = 'ultra'
-    else if (memoryGB >= 12) profile = 'pro'
+    if (memoryGB > 0 && memoryGB < TIER_MIN_GB.standard) profile = 'lite'
+    else if (memoryGB >= TIER_MIN_GB.ultra) profile = 'ultra'
+    else if (memoryGB >= TIER_MIN_GB.pro) profile = 'pro'
     if (mode === 'conservative') profile = lowerProfile(profile)
     return profile
 }
@@ -76,9 +79,11 @@ const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit })
 }
 
 const proxyFor = (profile, gpuTier, textureLimit) => {
-    // The encoder itself accepts 1024². Bigger values improve only interaction
-    // precision and crop guidance, so GPU strength earns a bounded increase.
-    let size = ({ lite: 768, standard: 1024, pro: 1280, ultra: 1536 }[profile] || 1024)
+    // SlimSAM resizes every input to a 1024 long edge, so 1024 is the baseline
+    // that feeds the model its exact native frame (and a crisp preview) at no
+    // extra model cost. Bigger values improve only interaction/preview
+    // precision, so GPU strength earns a bounded increase above that.
+    let size = ({ lite: 1024, standard: 1024, pro: 1280, ultra: 1536 }[profile] || 1024)
     if (gpuTier === 'none') size = Math.min(size, profile === 'ultra' ? 1280 : 1024)
     if (gpuTier === 'basic') size = Math.min(size, profile === 'ultra' ? 1280 : 1152)
     if (textureLimit && textureLimit < 4096) size = Math.min(size, 768)
@@ -93,7 +98,8 @@ const proxyFor = (profile, gpuTier, textureLimit) => {
  */
 export const classifyCapability = (input = {}) => {
     const host = normalizePhosmithResources(input.hostResources)
-    const browserMemoryGB = safeGB(input.browserMemoryGB ?? input.deviceMemoryGB, 8)
+    // Telemetry only — never trusted for tier selection, so no special cap.
+    const browserMemoryGB = safeGB(input.browserMemoryGB ?? input.deviceMemoryGB, 1024)
     const memoryGB = host?.memoryGB || browserMemoryGB
     const memorySource = host?.memoryGB ? 'phosmith' : (browserMemoryGB ? 'browser' : 'unknown')
     const resourceMode = host?.mode || 'balanced'

@@ -9,7 +9,7 @@
  *   T  — pure logic (text-core, edge-refine, capability, policy, sizing)
  *   Q  — heavy-job queue contracts (node-side, no browser)
  *   S  — memory-contract static source scans
- *   A  — lite (memory-locked) browser phases: 768 proxy, unsafe-flag lockout,
+ *   A  — lite (memory-locked) browser phases: 1024 proxy, unsafe-flag lockout,
  *        one embedding, no OPFS persistence, revision/cancel, export caps,
  *        wasm cv-refine gates, decode/model serialization
  *   H  — trusted-host (Phosmith pro) phases: HD export, escalation, working
@@ -29,7 +29,10 @@ import {
 import { classifyCapability } from './js/capability.js'
 import { refineMaskEdges } from './js/edge-refine.js'
 import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
-import { getBoundedProxySize } from './js/proxy-plan.js'
+import { getBoundedProxySize, displayPlan, decodeBudgetMP } from './js/proxy-plan.js'
+import {
+  composeChannels, maskChannelCoverages, maskToChannel, pickBestMask, pointInMask, RUNAWAY_COVERAGE,
+} from './js/sam-core.js'
 import { enqueueHeavy, cancelHeavyBefore, STALE, getHeavyQueueState } from './js/heavy-job-queue.js'
 import { extractRawPreview } from './js/image-raw.js'
 
@@ -67,6 +70,13 @@ const MIME = {
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost')
+    // Serve the optional RAW fixture to the browser suite (the develop worker
+    // fetches it same-origin instead of shuttling megabytes over evaluate()).
+    if (url.pathname === '/__raw_fixture' && RAW_FIXTURE && existsSync(RAW_FIXTURE)) {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+      res.end(await readFile(RAW_FIXTURE))
+      return
+    }
     const rel = url.pathname === '/' ? '/index.html' : url.pathname
     const file = path.join(ROOT, path.normalize(rel))
     if (!file.startsWith(ROOT) || !existsSync(file)) {
@@ -200,7 +210,7 @@ try {
     `band=${edgeResult.bandPixels}, soft=${soft}`,
   )
 
-  /* ── Policy: the 8 GB safety lock ── */
+  /* ── Policy: the memory-trust lock ── */
   const gpu = { webgpu: true, f16: true, textureLimit: 16384, storageBufferLimit: 256 * 1024 * 1024 }
   const fourGB = classifyCapability({ ...gpu, browserMemoryGB: 4 })
   const browserEightGB = classifyCapability({ ...gpu, browserMemoryGB: 8 })
@@ -208,9 +218,9 @@ try {
   const phosmith16GB = classifyCapability({ ...gpu, browserMemoryGB: 8, hostResources: HOST_PRO })
   const phosmith24GB = classifyCapability({ ...gpu, browserMemoryGB: 8, hostResources: HOST_ULTRA })
   check(
-    'capability: browser-reported 8 GB, 4 GB and unknown memory ALL classify lite',
+    'capability: browser-reported and unknown memory NEVER raise the profile — all lite',
     browserEightGB.profile === 'lite' && fourGB.profile === 'lite' && unknownMemory.profile === 'lite'
-      && browserEightGB.proxyMax === 768 && unknownMemory.proxyMax === 768,
+      && browserEightGB.proxyMax === 1024 && unknownMemory.proxyMax === 1024,
     JSON.stringify({ eight: browserEightGB.profile, four: fourGB.profile, unknown: unknownMemory.profile }),
   )
   check(
@@ -224,10 +234,10 @@ try {
   const unknownBudget = resolveBudget('', unknownMemory)
   const provisional = resolveBudget('', null)
   check(
-    'policy: 8 GB / unknown / no-probe all resolve to the locked lite budget',
+    'policy: browser-reported / unknown / no-probe all resolve to the locked lite budget',
     liteDefault.profile === 'lite' && unknownBudget.profile === 'lite' && provisional.profile === 'lite'
       && liteDefault.memoryLocked && unknownBudget.memoryLocked && provisional.memoryLocked
-      && liteDefault.proxyMax === 768,
+      && liteDefault.proxyMax === 1024,
     JSON.stringify({ lite: liteDefault.profile, unknown: unknownBudget.profile, provisional: provisional.profile }),
   )
   check(
@@ -235,11 +245,17 @@ try {
     liteDefault.draftCacheMax === 1 && liteDefault.flagshipCacheMax === 0
       && liteDefault.maxResidentHeavy === 1 && liteDefault.flagship === false
       && liteDefault.detectorWebGPU === true && liteDefault.autoEscalate === false
-      && liteDefault.hdExportDecode === false && liteDefault.eagerEncode === false
+      && liteDefault.hdExportDecode === false && liteDefault.eagerEncode === true
       && liteDefault.embedPersist === false && liteDefault.exportMaxSide === 4096
       && liteDefault.exportMaxMP === 8 && liteDefault.cropMaxSide === 1280
       && liteDefault.detectorDispose === 'now',
     JSON.stringify(liteDefault),
+  )
+  check(
+    'policy: SAM stays on WASM for the unverified baseline (the OWLv2 lesson applied to SlimSAM)',
+    liteDefault.samWebGPU === false && PROFILE_PRESETS.standard.samWebGPU === true
+      && resolveBudget('', unknownMemory).samWebGPU === false,
+    JSON.stringify({ lite: liteDefault.samWebGPU, standard: PROFILE_PRESETS.standard.samWebGPU }),
   )
   const flagged = resolveBudget('?flagship=1', browserEightGB)
   const ultraReq = resolveBudget('?profile=ultra', browserEightGB)
@@ -247,15 +263,15 @@ try {
   const proxyOff = resolveBudget('?proxy=off', unknownMemory)
   const workingForce = resolveBudget('?working=1', browserEightGB)
   check(
-    'safety: ?flagship=1 cannot enable SAM3 on an 8 GB/unknown budget',
+    'safety: ?flagship=1 cannot enable SAM3 on an unverified budget',
     flagged.flagship === false && resolveBudget('?flagship=1', unknownMemory).flagship === false,
     `flagship=${flagged.flagship}`,
   )
   check(
-    'safety: ?profile=ultra / ?proxy=max / ?proxy=off cannot raise the 768 px cap',
-    ultraReq.profile === 'lite' && ultraReq.proxyMax === 768
-      && proxyMax.proxyMax === 768 && proxyMax.proxyMode === 'auto'
-      && proxyOff.proxyMax === 768 && proxyOff.proxyMode === 'auto',
+    'safety: ?profile=ultra / ?proxy=max / ?proxy=off cannot raise the 1024 px cap',
+    ultraReq.profile === 'lite' && ultraReq.proxyMax === 1024
+      && proxyMax.proxyMax === 1024 && proxyMax.proxyMode === 'auto'
+      && proxyOff.proxyMax === 1024 && proxyOff.proxyMode === 'auto',
     JSON.stringify({ ultra: ultraReq.proxyMax, max: proxyMax.proxyMax, off: proxyOff.proxyMax }),
   )
   check(
@@ -270,6 +286,15 @@ try {
     PROFILE_PRESETS.lite.workingMaxSide <= 1280 && liteDefault.workingMaxSide <= 1280,
     `workingMaxSide=${PROFILE_PRESETS.lite.workingMaxSide}`,
   )
+  const dispNative = resolveBudget('?display=native', browserEightGB)
+  const dispOff = resolveBudget('?display=off', browserEightGB)
+  const dispCap = resolveBudget('?display=1600', browserEightGB)
+  check(
+    'display: ?display native/off/<px> honored on a locked budget (display-only, not the memory contract)',
+    liteDefault.displayMax === 2048 && dispNative.displayMode === 'native'
+      && dispOff.displayMode === 'off' && dispCap.displayMax === 1600,
+    JSON.stringify({ base: liteDefault.displayMax, native: dispNative.displayMode, off: dispOff.displayMode, cap: dispCap.displayMax }),
+  )
   const ultraBudget = resolveBudget('?flagship=1', phosmith24GB)
   const pressured = applyMemoryPressure(liteDefault, 2)
   const pressured3 = applyMemoryPressure(liteDefault, 3)
@@ -281,6 +306,12 @@ try {
       && pressured3.exportMaxMP === 4 && pressured3.proxyMax === 768
       && applyMemoryPressure(ultraBudget, 3).exportMaxMP <= 24,
     JSON.stringify({ ultraFlagship: ultraBudget.flagship, p2: pressured.cvRefine, p3: pressured3.exportMaxMP }),
+  )
+  check(
+    'policy: pressure ratchet drops SAM WebGPU and lowers the display ceiling',
+    applyMemoryPressure(ultraBudget, 1).samWebGPU === false
+      && pressured.displayMax === 1600 && pressured3.displayMax === 1280,
+    JSON.stringify({ p1sam: applyMemoryPressure(ultraBudget, 1).samWebGPU, p2disp: pressured.displayMax, p3disp: pressured3.displayMax }),
   )
 
   /* ── Sizing: the authoritative proxy function ── */
@@ -299,6 +330,86 @@ try {
   let sizingThrew2 = false
   try { getBoundedProxySize(NaN, 10) } catch { sizingThrew2 = true }
   check('sizing: invalid dimensions reject cleanly', sizingThrew && sizingThrew2, 'both threw')
+
+  /* ── Display formula: viewport-anchored, decode-budget-gated ── */
+  const liteB = { ...PROFILE_PRESETS.lite }
+  const vp = { w: 1728, h: 1117, dpr: 2 }
+  const dCeiling = displayPlan({ srcW: 8000, srcH: 6000, budget: liteB, viewport: vp, textureLimit: 8192 })
+  const dSource = displayPlan({ srcW: 1600, srcH: 1000, budget: liteB, viewport: vp, textureLimit: 8192 })
+  const dViewport = displayPlan({ srcW: 8000, srcH: 6000, budget: liteB, viewport: { w: 500, h: 400, dpr: 1 }, textureLimit: 8192 })
+  const dTexture = displayPlan({ srcW: 8000, srcH: 6000, budget: { ...liteB, displayMode: 'native' }, viewport: vp, textureLimit: 4096 })
+  const dOff = displayPlan({ srcW: 8000, srcH: 6000, budget: { ...liteB, displayMode: 'off' }, viewport: vp })
+  check(
+    'display formula: side = min(viewport·dpr·slack, profile ceiling, texture cap, source) for any source',
+    dCeiling.side === 2048 && !dCeiling.allowFullDecode // 48 MP > decode budget
+      && dSource.side === 1600 && dSource.allowFullDecode // 1.6 MP fits
+      && dViewport.side === 750 // 500·1·1.5 viewport-bound
+      && dTexture.side === 4096 && dTexture.allowFullDecode // native opt-in, texture-capped
+      && dOff.side === 0 && !dOff.allowFullDecode,
+    JSON.stringify({ ceiling: dCeiling, source: dSource, viewport: dViewport, texture: dTexture, off: dOff }),
+  )
+  check(
+    'display formula: decode budget reuses escalateMaxMP and ratchets 6/4/2 under pressure',
+    decodeBudgetMP(liteB) === 8
+      && decodeBudgetMP({ ...liteB, pressureLevel: 1 }) === 6
+      && decodeBudgetMP({ ...liteB, pressureLevel: 2 }) === 4
+      && decodeBudgetMP({ ...liteB, pressureLevel: 3 }) === 2,
+    JSON.stringify([0, 1, 2, 3].map((level) => decodeBudgetMP({ ...liteB, pressureLevel: level }))),
+  )
+
+  /* ── Click-union composition: add/sub replay + peel ── */
+  const chanOf = (bits) => Uint8Array.from(bits.map((v) => (v ? 255 : 0)))
+  const rAt = (res, i) => (res ? res.rgba[i * 4] : null)
+  const unionOps = [
+    { op: 'add', chan: chanOf([1, 1, 0, 0]) },
+    { op: 'add', chan: chanOf([0, 0, 1, 0]) },
+    { op: 'sub', chan: chanOf([1, 0, 0, 0]) },
+  ]
+  const composed = composeChannels(unionOps, 4, 1)
+  const peeled = composeChannels(unionOps.slice(0, 2), 4, 1)
+  const netZero = composeChannels([unionOps[0], { op: 'sub', chan: chanOf([1, 1, 0, 0]) }], 4, 1)
+  const floorKeeps = composeChannels([unionOps[2]], 4, 1, chanOf([1, 1, 1, 1]))
+  check(
+    'click-union: op stack replays in order (add∪add∖sub), peels, nets to empty, respects the floor',
+    rAt(composed, 0) === 0 && rAt(composed, 1) === 255 && rAt(composed, 2) === 255 && rAt(composed, 3) === 0
+      && rAt(peeled, 0) === 255 && netZero === null
+      && rAt(floorKeeps, 0) === 0 && rAt(floorKeeps, 3) === 255,
+    JSON.stringify({ composed: composed && [...composed.rgba].filter((_, i) => i % 4 === 0) }),
+  )
+  /* ── Candidate pick: the whole-scene mask never wins an ambiguous click ── */
+  // Three 10x10 candidates: a 9% object, a 25% part, a 96% whole-scene guess
+  // scored the way SAM scores a click into a field of near-identical objects
+  // — the runaway outscores the object actually pointed at.
+  const candidates = (fracs) => {
+    const size = 100
+    const data = new Uint8Array(size * fracs.length)
+    fracs.forEach((f, c) => data.fill(1, c * size, c * size + Math.round(f * size)))
+    return data
+  }
+  const fieldOfFlowers = candidates([0.09, 0.25, 0.96])
+  const fieldCov = maskChannelCoverages(fieldOfFlowers, 10, 10, 3)
+  const fieldScores = Float32Array.from([0.87, 0.71, 0.94])
+  // A frame-filling close-up: every candidate is large and the biggest is the
+  // real subject, so the argmax winner must survive the runaway test.
+  const closeUpCov = maskChannelCoverages(candidates([0.91, 0.95, 0.98]), 10, 10, 3)
+  const closeUpScores = Float32Array.from([0.6, 0.7, 0.9])
+  check(
+    'candidate pick: an ambiguous click rejects the whole-scene runaway, box/refine and all-large keep argmax',
+    pickBestMask(fieldScores, { coverages: fieldCov, ambiguous: true }) === 0
+      && pickBestMask(fieldScores, { coverages: fieldCov, ambiguous: false }) === 2
+      && pickBestMask(fieldScores) === 2
+      && pickBestMask(closeUpScores, { coverages: closeUpCov, ambiguous: true }) === 2,
+    `coverages ${fieldCov.map((c) => `${(c * 100).toFixed(0)}%`).join('/')} · runaway ≥ ${RUNAWAY_COVERAGE * 100}%`,
+  )
+
+  const maskLike = { data: Uint8ClampedArray.from([255, 255, 255, 255, 0, 0, 0, 0]), width: 2, height: 1 }
+  check(
+    'click-union: maskToChannel + pointInMask (tolerance) agree with the RGBA mask',
+    maskToChannel(maskLike)[0] === 255 && maskToChannel(maskLike)[1] === 0
+      && pointInMask(maskLike, 0, 0, 0) === true && pointInMask(maskLike, 1, 0, 0) === false
+      && pointInMask(maskLike, 1, 0, 1) === true && pointInMask(null, 0, 0) === false,
+    'channel + hit tests agree',
+  )
 
   // The optional fixture exercises the bounded RAW-container parser directly.
   // It deliberately avoids Playwright's slow multi-megabyte file-upload bridge;
@@ -367,7 +478,8 @@ try {
       'sam-client.js', 'sam-worker.js', 'sam-engine.js', 'sam-core.js', 'edge-refine.js',
       'export-hd.js', 'detect-engine.js', 'detect-worker.js', 'embed-store.js', 'text-core.js',
       'text-ui.js', 'image-raw.js', 'heavy-job-queue.js', 'decode-worker.js', 'decode-client.js',
-      'decode-core.js', 'proxy-plan.js', 'cv-refine-client.js', 'cv-refine-worker.js']
+      'decode-core.js', 'proxy-plan.js', 'cv-refine-client.js', 'cv-refine-worker.js',
+      'raw-develop-client.js', 'raw-develop-worker.js']
     const sources = Object.fromEntries(jsFiles.map((f) => [f, readFileSync(path.join(ROOT, 'js', f), 'utf8')]))
     const all = Object.values(sources).join('\n') + readFileSync(path.join(ROOT, 'sw.js'), 'utf8')
       + readFileSync(path.join(ROOT, 'index.html'), 'utf8')
@@ -396,6 +508,13 @@ try {
       /embedPersist === true/.test(sources['sam-engine.js']),
       'gated',
     )
+    check(
+      'static: SAM device pick is budget-gated — the baseline never probes WebGPU',
+      /state\.budget\.samWebGPU !== true/.test(sources['sam-engine.js'])
+        && /samWebGPU: false/.test(sources['policy.js'])
+        && /next\.samWebGPU = false/.test(sources['policy.js']),
+      'pickDevice honors samWebGPU; lite preset + pressure ratchet keep it off',
+    )
     const assetGetImageData = (sources['asset-store.js'].match(/getImageData\(/g) || []).length
     check(
       'static: asset-store reads back only the 16×16 hash canvas, never a full frame',
@@ -406,6 +525,26 @@ try {
       'static: wasm artifacts exist (cv-refine.js + cv-refine.wasm)',
       existsSync(path.join(ROOT, 'public/wasm/cv-refine.js')) && existsSync(path.join(ROOT, 'public/wasm/cv-refine.wasm')),
       'built',
+    )
+    check(
+      'static: raw-develop wasm artifacts exist (raw-develop.js + raw-develop.wasm)',
+      existsSync(path.join(ROOT, 'public/wasm/raw-develop.js')) && existsSync(path.join(ROOT, 'public/wasm/raw-develop.wasm')),
+      'built',
+    )
+    check(
+      'static: LibRaw develop is the preview-less fallback — lazy, disposed after use, off at pressure ≥ 2',
+      /developRaw\(source, \{ budget: BUDGET \}\)/.test(sources['app.js'])
+        && /worker\.terminate\(\)/.test(sources['raw-develop-client.js'])
+        && /budget\.rawDevelop === false \|\| \(budget\.pressureLevel \|\| 0\) >= 2/.test(sources['raw-develop-client.js'])
+        && /next\.rawDevelop = false/.test(sources['policy.js']),
+      'wired only in the no-preview branch; terminates worker; pressure-gated',
+    )
+    check(
+      'static: develop returns a JPEG Blob through the normal decode path (no full-res RGBA crosses threads)',
+      /new Blob\(\[result\.jpeg\], \{ type: 'image\/jpeg' \}\)/.test(sources['raw-develop-client.js'])
+        && !/getImageData|Uint8ClampedArray|RGBA/.test(sources['raw-develop-worker.js'])
+        && /half_size/.test(readFileSync(path.join(ROOT, 'cpp/raw_develop.cpp'), 'utf8')),
+      'jpeg blob only; half-size demosaic bounds the peak',
     )
     const sw = readFileSync(path.join(ROOT, 'sw.js'), 'utf8')
     check(
@@ -455,14 +594,14 @@ try {
   )
   await pageHost.close()
 
-  /* ─── Phase A: lite (memory-locked) — the 8 GB contract ─────────────── */
+  /* ─── Phase A: lite (memory-locked) — the bounded-memory contract ───── */
   const page = await newAppPage(context, '?flagship=0', null)
   const bootState = await page.evaluate(() => window.__seglab.state())
   const bootBudget = await page.evaluate(() => window.__seglab.resourceBudget())
   check(
     'lite: no model loads before an image; locked lite budget resolved',
     bootState.ready === false && bootState.mode === null
-      && bootBudget.profile === 'lite' && bootBudget.memoryLocked === true && bootBudget.proxyMax === 768,
+      && bootBudget.profile === 'lite' && bootBudget.memoryLocked === true && bootBudget.proxyMax === 1024,
     JSON.stringify({ ready: bootState.ready, profile: bootBudget.profile, proxyMax: bootBudget.proxyMax }),
   )
   const swSmoke = await page.evaluate(async () => {
@@ -475,12 +614,24 @@ try {
     swSmoke.registered && swSmoke.active,
     JSON.stringify(swSmoke),
   )
-  await page.evaluate(() => window.__seglab.loadDemo(900))
+  await page.evaluate(() => window.__seglab.loadDemo(1400))
   const liteFrame = await page.evaluate(() => window.__seglab.imageTransform())
   check(
-    'lite: 900 px source becomes a ≤768 px interaction proxy',
-    liteFrame && liteFrame.proxyActive === true && Math.max(liteFrame.proxyW, liteFrame.proxyH) === 768,
+    'lite: 1400 px source becomes a ≤1024 px interaction proxy',
+    liteFrame && liteFrame.proxyActive === true && Math.max(liteFrame.proxyW, liteFrame.proxyH) === 1024,
     JSON.stringify({ proxy: `${liteFrame?.proxyW}x${liteFrame?.proxyH}` }),
+  )
+  const disp = await page.evaluate(() => ({
+    photo: document.getElementById('photo').width,
+    view: document.getElementById('view').width,
+    overlay: document.getElementById('overlay').width,
+    bound: Math.round(Math.max(window.innerWidth, window.innerHeight) * Math.min(window.devicePixelRatio || 1, 3) * 1.5),
+  }))
+  check(
+    'display: crisp preview out-resolves the proxy, stays within the viewport-anchored bound; overlay tracks the model buffer',
+    disp.photo > disp.view && disp.overlay === disp.view
+      && disp.photo <= Math.max(disp.bound, disp.view) && disp.photo <= 2048,
+    JSON.stringify(disp),
   )
   const idleUi = await page.evaluate(() => ({
     prepHidden: document.getElementById('prep')?.hidden,
@@ -501,14 +652,30 @@ try {
     textModeUi.hidden === true && textModeUi.display === 'none',
     JSON.stringify(textModeUi),
   )
-  const noEager = await page.evaluate(() => window.__seglab.eagerEncode())
-  check('lite: no speculative encode before the first selection', noEager === null, `eagerEncode=${JSON.stringify(noEager)}`)
+  log('phase A (lite) — eager encode warms model + embedding at import…')
+  const eager = await page.evaluate(() => window.__seglab.eagerEncode())
+  const engEager = await page.evaluate(() => window.__seglab.engineState())
+  const chipDevice = await page.evaluate(() => document.getElementById('chip-device')?.textContent || '')
+  check(
+    'lite: bounded eager encode lands before the first selection (one embedding, wasm lane)',
+    eager && eager.stale !== true && engEager.cachedImages === 1 && engEager.device === 'wasm',
+    JSON.stringify({ eager, cached: engEager?.cachedImages, device: engEager?.device }),
+  )
+  check(
+    'lite: SAM runs on wasm — the baseline never probes WebGPU (status pill agrees)',
+    engEager.device === 'wasm' && /device: wasm/.test(chipDevice),
+    `chip="${chipDevice}"`,
+  )
 
-  log('phase A (lite) — first click downloads the model on a cold profile…')
   const geo = await page.evaluate(() => window.__seglab.demoGeometry())
   const p = geo.proxyScale
   const sA = await page.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geo.disc.x * p, y: geo.disc.y * p })
   checkDisc('lite draft', sA, geo.disc.x * p, geo.disc.y * p, DISC_FRAC)
+  check(
+    'first click is decode-only (the eager embedding served it)',
+    sA.lastRun && sA.lastRun.encoded === false,
+    `encoded=${sA.lastRun?.encoded}, decode ${sA.lastRun?.decodeMs}ms`,
+  )
   const statsA = await page.evaluate(() => window.__seglab.maskStats())
   check('hygiene: single component, no crumbs', statsA && statsA.components === 1, `components=${statsA?.components}`)
   check('edge refinement: soft boundary band present', statsA && statsA.softPixels > 100, `softPixels=${statsA?.softPixels}`)
@@ -518,6 +685,45 @@ try {
     'repeat click skips the encoder (cache hit)',
     sA2.lastRun && sA2.lastRun.encoded === false,
     `encoded=${sA2.lastRun?.encoded}, decode ${sA2.lastRun?.decodeMs}ms`,
+  )
+
+  // Click-union: separate objects accumulate; exclude carves one out; Z peels.
+  await page.evaluate(() => window.__seglab.reset())
+  const sqc = { x: (geo.square.x + geo.square.w / 2) * p, y: (geo.square.y + geo.square.h / 2) * p }
+  const u1 = await page.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geo.disc.x * p, y: geo.disc.y * p })
+  const u2 = await page.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), sqc)
+  const statsU2 = await page.evaluate(() => window.__seglab.maskStats())
+  const covU1 = u1.maskSummary?.coverage || 0
+  check(
+    'click-union: clicking a second object ADDS it (commit + two components), never replaces',
+    u2.baseOps === 1 && u2.clicks === 1 && statsU2?.components === 2
+      && (u2.maskSummary?.coverage || 0) > covU1 * 1.3,
+    `baseOps=${u2.baseOps} components=${statsU2?.components} coverage ${(covU1 * 100).toFixed(2)}%→${((u2.maskSummary?.coverage || 0) * 100).toFixed(2)}%`,
+  )
+  const u3 = await page.evaluate(({ x, y }) => window.__seglab.clickAt(x, y, true), { x: geo.disc.x * p, y: geo.disc.y * p })
+  const statsU3 = await page.evaluate(() => window.__seglab.maskStats())
+  check(
+    'click-union: exclude on a committed object carves it out; the other object survives',
+    u3.baseOps === 2 && statsU3?.components === 1
+      && (u3.maskSummary?.coverage || 0) < (u2.maskSummary?.coverage || 0)
+      && (u3.maskSummary?.coverage || 0) > 0,
+    `baseOps=${u3.baseOps} components=${statsU3?.components} coverage ${((u3.maskSummary?.coverage || 0) * 100).toFixed(2)}%`,
+  )
+  const z1 = await page.evaluate(() => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z' }))
+    return window.__seglab.state()
+  })
+  const z2 = await page.evaluate(() => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z' }))
+    return window.__seglab.state()
+  })
+  check(
+    'click-union: Z discards the live object first, then peels committed ops in order',
+    // z1: live square gone; base nets ~empty (add(disc)∖sub(disc) may leave
+    // a sub-pixel residue where the two decodes disagree). z2: disc returns.
+    z1.clicks === 0 && (z1.maskSummary?.coverage || 0) < covU1 * 0.15 && z1.baseOps === 2
+      && z2.baseOps === 1 && Math.abs((z2.maskSummary?.coverage || 0) - covU1) < covU1 * 0.2,
+    JSON.stringify({ z1: { clicks: z1.clicks, baseOps: z1.baseOps, coverage: z1.maskSummary?.coverage || 0 }, z2: { baseOps: z2.baseOps, coverage: z2.maskSummary?.coverage } }),
   )
 
   // Minute object.
@@ -624,10 +830,10 @@ try {
   const qlog = await page.evaluate(() => window.__seglab.queueLog())
   const qframe = await page.evaluate(() => window.__seglab.imageTransform())
   check(
-    'queue: blob import runs decode-proxy as a heavy job; proxy stays ≤768',
+    'queue: blob import runs decode-proxy as a heavy job; proxy stays ≤1024',
     qlog.some((e) => e.label === 'decode-proxy' && e.outcome === 'done')
       && qlog.some((e) => e.label === 'model-warm')
-      && qframe && Math.max(qframe.proxyW, qframe.proxyH) <= 768,
+      && qframe && Math.max(qframe.proxyW, qframe.proxyH) <= 1024,
     `labels=${[...new Set(qlog.map((e) => e.label))].join(',')} proxy=${qframe?.proxyW}x${qframe?.proxyH}`,
   )
   // Rapid double import: the first must never commit.
@@ -650,9 +856,9 @@ try {
   const flagBudget = await pageFlags.evaluate(() => window.__seglab.resourceBudget())
   const flagFrame = await pageFlags.evaluate(() => window.__seglab.imageTransform())
   check(
-    'safety (live): unsafe flags are refused — lite, no flagship, ≤768 proxy',
-    flagBudget.profile === 'lite' && flagBudget.flagship === false && flagBudget.proxyMax === 768
-      && flagFrame && Math.max(flagFrame.proxyW, flagFrame.proxyH) <= 768,
+    'safety (live): unsafe flags are refused — lite, no flagship, ≤1024 proxy',
+    flagBudget.profile === 'lite' && flagBudget.flagship === false && flagBudget.proxyMax === 1024
+      && flagFrame && Math.max(flagFrame.proxyW, flagFrame.proxyH) <= 1024,
     JSON.stringify({ profile: flagBudget.profile, flagship: flagBudget.flagship, proxy: `${flagFrame?.proxyW}x${flagFrame?.proxyH}` }),
   )
   await pageFlags.close()
@@ -726,7 +932,7 @@ try {
     `seed=${seededOut.alpha?.[20 * 96 + 20]} other=${seededOut.alpha?.[70 * 96 + 70]}`,
   )
   const tooBig = await pageV.evaluate((payload) => window.__seglab.cvRefine(payload), {
-    alpha: [255], width: 1024, height: 1, seeds: [], options: {},
+    alpha: [255], width: 2048, height: 1, seeds: [], options: {},
   })
   const badBuf = await pageV.evaluate((payload) => window.__seglab.cvRefine(payload), {
     alpha: [255, 255], width: 5, height: 5, seeds: [], options: {},
@@ -735,7 +941,7 @@ try {
     alpha: mk(8, 8, (x, y) => x > 1 && y > 1), width: 8, height: 8, seeds: [], options: { minArea: 0 },
   })
   check(
-    'wasm: >768 px and mismatched buffers are rejected without leaking worker state',
+    'wasm: >1024 px and mismatched buffers are rejected without leaking worker state',
     tooBig.alpha === null && badBuf.alpha === null && Array.isArray(stillWorks.alpha),
     `tooBig=${tooBig.alpha} badBuf=${badBuf.alpha} recovered=${Array.isArray(stillWorks.alpha)}`,
   )
@@ -751,6 +957,20 @@ try {
     JSON.stringify(detached),
   )
   await pageV.close()
+
+  /* ── LibRaw develop fallback (fixture-gated): real sensor → JPEG on-device ── */
+  if (RAW_FIXTURE) {
+    const pageR = await newAppPage(context, '?flagship=0', null)
+    log('phase A5b (raw develop) — LibRaw demosaic + libjpeg encode in a disposed worker…')
+    const dev = await pageR.evaluate(() => window.__seglab.developRawUrl('/__raw_fixture'))
+    check(
+      'raw develop: preview-less fallback demosaics the sensor to a decodable JPEG on-device',
+      dev.ok && dev.w > 0 && dev.h > 0 && dev.jpegBytes > 0
+        && dev.decodedW === dev.w && dev.decodedH === dev.h,
+      JSON.stringify(dev),
+    )
+    await pageR.close()
+  }
 
   /* ── Text-select plumbing + brush (proxy coords) ── */
   const pageE = await newAppPage(context, '?flagship=0', 900)

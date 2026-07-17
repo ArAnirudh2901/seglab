@@ -7,12 +7,13 @@
  *
  * in : { type:'meta',         requestId, blob }
  * in : { type:'decode-proxy', requestId, revision, blob, decodeW, decodeH,
- *        scale, orientation, wantWorking, workingMaxSide }
+ *        scale, orientation, wantWorking, workingMaxSide, displaySide }
  * in : { type:'decode-opaque', requestId, revision, blob,
  *        budget:{proxyMax,proxyMode,directMaxMP,directMaxSide,safeProxyMax} }
  * out: { type:'meta-result', requestId, meta }
  * out: { type:'decode-proxy-result', requestId, revision, bitmap(transfer),
- *        working: {blob,w,h}|null, original:{width,height}, proxyActive? }
+ *        working: {blob,w,h}|null, display: bitmap(transfer)|null,
+ *        original:{width,height}, proxyActive? }
  * out: { type:'error', requestId, error }
  */
 
@@ -33,9 +34,10 @@ self.onmessage = async (event) => {
         if (type === 'decode-proxy') {
             let bitmap = null
             let working = null
+            let display = null
             if (msg.wantWorking) {
-                ({ bitmap, working } = await decodeWithWorkingCopy(
-                    msg.blob, { w: msg.decodeW, h: msg.decodeH }, msg.scale, msg.workingMaxSide,
+                ({ bitmap, working, display } = await decodeWithWorkingCopy(
+                    msg.blob, { w: msg.decodeW, h: msg.decodeH }, msg.scale, msg.workingMaxSide, msg.displaySide || 0,
                 ))
             } else {
                 bitmap = await decodeBoundedBitmap(msg.blob, msg.decodeW, msg.decodeH, msg.scale, msg.orientation)
@@ -46,8 +48,9 @@ self.onmessage = async (event) => {
                 revision: msg.revision,
                 bitmap,
                 working,
+                display: display || null,
                 original: { width: msg.decodeW, height: msg.decodeH },
-            }, [bitmap])
+            }, display ? [bitmap, display] : [bitmap])
             return
         }
         if (type === 'decode-opaque') {

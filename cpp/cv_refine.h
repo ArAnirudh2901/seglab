@@ -1,10 +1,10 @@
-// cv_refine — bounded binary-mask cleanup for the ≤768px interaction proxy.
+// cv_refine — bounded binary-mask cleanup for the ≤1024px interaction proxy.
 // One-channel uint8 masks (0..255, ≥128 = on). Fixed reusable workspace, no
 // growth; every entry point rejects sides above CV_MAX_SIDE.
 #pragma once
 #include <cstdint>
 
-#define CV_MAX_SIDE 768
+#define CV_MAX_SIDE 1024
 
 extern "C" {
 

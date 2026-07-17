@@ -23,6 +23,7 @@ import {
     buildBoxPrompt,
     buildPointPrompt,
     cleanupMaskRGBA,
+    maskChannelCoverages,
     maskChannelToRGBA,
     maskIoU,
     pickBestMask,
@@ -57,13 +58,14 @@ const withTimeout = (promise, ms, label) =>
         )
     })
 
-// A budget-less engine assumes the 8 GB safe profile; policy.js overrides
-// bounded sizes and optional features through warm({ budget }).
+// A budget-less engine assumes the conservative baseline profile; policy.js
+// overrides bounded sizes and optional features through warm({ budget }).
 const DEFAULT_BUDGET = {
     profile: 'lite',
     draftCacheMax: 1,
     forceWasm: false,
     detectorWebGPU: false,
+    samWebGPU: false,
     embedPersist: false,
 }
 
@@ -157,6 +159,13 @@ export const loadTransformers = () => {
 const pickDevice = async () => {
     if (state.forcedWasm) { state.device = 'wasm'; return 'wasm' }
     if (state.device) return state.device
+    // Budget policy first: the unverified baseline never probes WebGPU — its
+    // compile/upload burst is a memory event there (same lesson as OWLv2).
+    if (state.budget.samWebGPU !== true) {
+        state.device = 'wasm'
+        trace('device-pick', { device: 'wasm', reason: 'policy' })
+        return 'wasm'
+    }
     let device = 'wasm'
     try {
         // navigator.gpu exists in dedicated workers too (where supported).
@@ -169,6 +178,7 @@ const pickDevice = async () => {
         }
     } catch { /* no WebGPU */ }
     state.device = device
+    trace('device-pick', { device, reason: 'probe' })
     return device
 }
 
@@ -458,9 +468,17 @@ const decodeMask = async (bundle, entry, req) => {
         entry.reshaped_input_sizes,
     )
     const scores = outputs.iou_scores.data
-    const best = pickBestMask(scores)
-    const [, , mh, mw] = masks[0].dims
+    const [, channels, mh, mw] = masks[0].dims
     if (!mw || !mh) throw new Error('Decoder returned a malformed mask')
+    // One positive click and no box is the prompt SAM has to resolve by
+    // guessing a granularity level — the only case where it hands back the
+    // whole scene. Any richer prompt (a box, a second click, an exclude) has
+    // already pinned the object down, so its score ranking is trustworthy.
+    const ambiguous = !boxPrompt && effectiveClicks.length === 1 && effectiveClicks[0][2] === 1
+    const best = pickBestMask(scores, {
+        coverages: maskChannelCoverages(masks[0].data, mw, mh, channels),
+        ambiguous,
+    })
     const rawRgba = maskChannelToRGBA(masks[0].data, mw, mh, best)
     const decodedAt = Date.now()
 
@@ -492,11 +510,14 @@ const segmentOnce = async (req) => {
     const laneKey = 'draft'
     trace('segment-start', { laneKey, revision: req.revision, imageKey: req.imageKey })
     const bundle = await loadBundle()
+    emitEvent({ type: 'stage', detail: { stage: 'encode', revision: req.revision } })
     const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
     const tEncoded = Date.now()
 
+    emitEvent({ type: 'stage', detail: { stage: 'decode', revision: req.revision, encoded } })
     const dec = await decodeMask(bundle, entry, req)
     if (!dec) return staleResult(req)
+    emitEvent({ type: 'stage', detail: { stage: 'post', revision: req.revision } })
 
     const refined = refineMaskEdges(dec.rgba, dec.width, dec.height, entry.gray)
 
@@ -565,8 +586,16 @@ export const encodeImage = async (req) => {
         if (isStale(req)) return { stale: true }
         const laneKey = 'draft'
         const bundle = await loadBundle()
-        const { encoded, save } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+        const { entry, encoded, save } = await ensureEmbeddings(bundle, req.imageKey, req.source)
         if (isStale(req)) return { stale: true }
+        // Prime the decoder session with one throwaway centre-point decode so
+        // the first real click pays a warm decode only. Transient buffers; the
+        // embedding is already resident, so nothing new stays behind.
+        if (req.prime) {
+            try {
+                await decodeMask(bundle, entry, { clicks: [[entry.w / 2, entry.h / 2, 1]], revision: req.revision })
+            } catch (err) { trace('decoder-prime-failed', { message: String(err?.message).slice(0, 120) }) }
+        }
         return { encoded, save, lane: LANES[laneKey].label, device: state.device }
     })
     if (prepared.stale || isStale(req)) return staleResult(req)

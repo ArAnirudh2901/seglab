@@ -51,10 +51,12 @@ export const decodeBoundedBitmap = async (blob, w, h, scale, orientation) => {
 /**
  * Unbounded-decode hosts (no ImageDecoder / no scaled createImageBitmap) pay
  * one full-raster decode for an oversized upload no matter what. Pay it once:
- * also re-encode a ≤workingMaxSide copy so later interaction re-decodes stay
- * bounded. Returns { bitmap, working: { blob, w, h } | null }.
+ * also re-encode a ≤workingMaxSide copy, and (when `displaySide` asks) harvest
+ * the ≤displaySide on-screen frame from the same raster so the display never
+ * costs a second full decode. Returns
+ * { bitmap, working: { blob, w, h } | null, display: ImageBitmap | null }.
  */
-export const decodeWithWorkingCopy = async (blob, meta, scale, workingMaxSide) => {
+export const decodeWithWorkingCopy = async (blob, meta, scale, workingMaxSide, displaySide = 0) => {
     const full = await createImageBitmap(blob, { imageOrientation: 'none' })
     try {
         let working = null
@@ -72,8 +74,13 @@ export const decodeWithWorkingCopy = async (blob, meta, scale, workingMaxSide) =
             const encoded = await wc.convertToBlob({ type, quality: 0.92 }).catch(() => null)
             if (encoded) working = { blob: encoded, w: wc.width, h: wc.height }
         }
+        let display = null
+        if (displaySide > 0) {
+            const ds = Math.min(1, displaySide / Math.max(meta.w, meta.h))
+            display = await createImageBitmap(full, resizeOpts(meta.w, meta.h, ds)).catch(() => null)
+        }
         const bitmap = await createImageBitmap(full, resizeOpts(meta.w, meta.h, scale))
-        return { bitmap, working }
+        return { bitmap, working, display }
     } finally {
         full.close() // the full raster never outlives this call
     }

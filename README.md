@@ -23,16 +23,19 @@ one-time, browser-cached). The first **Text** search uses Grounding DINO Tiny
 the OWLv2 WASM fallback (~163 MB q8). Both run on-device and are never
 uploaded.
 
-## 8 GB Safe Mode (the default)
+## Memory-bounded by default
 
-Browsers privacy-round `navigator.deviceMemory` and cap it at 8 GB, so a
-plain browser tab can never prove more than 8 GB. SEGLAB therefore treats
-every browser-reported or unknown memory budget as an 8 GB machine and locks
-the **lite** profile:
+A browser tab cannot verify its real memory headroom —
+`navigator.deviceMemory` is privacy-rounded and capped, so a report proves
+nothing about actual free RAM. SEGLAB therefore never sizes budgets from a
+browser memory report: every unverified budget gets the **lite** profile.
+Lite is not a degraded mode; it is the fully optimised baseline every feature
+is engineered to fit, so a DSLR photo works smoothly on any laptop:
 
 | Setting | lite value |
 | --- | --- |
-| Interaction proxy | **≤ 768 px long edge** — every import path (JPEG/PNG/WebP/AVIF/HEIF/TIFF/GIF/BMP/RAW preview/paste/drop) |
+| Interaction proxy | **≤ 1024 px long edge** — every import path (JPEG/PNG/WebP/AVIF/HEIF/TIFF/GIF/BMP/RAW preview or on-device develop/paste/drop). 1024 is SlimSAM's own internal encode edge, so the model sees its exact native frame |
+| Display preview | **decoupled from the model** — a crisp GPU-resident display frame (≤ 2048 px, bounded-safe) so a DSLR photo looks sharp while the model keeps its bounded ≤ 1024 buffer (see *Crisp preview* below) |
 | Model | **SlimSAM only** — the SAM3 flagship lane never loads, downloads, or upgrades |
 | Embeddings | exactly **one** resident, current image only, no OPFS/IndexedDB persistence, no speculative encode before the first selection |
 | Detector | Grounding DINO q4f16 only when accelerated WebGPU is confirmed; otherwise OWLv2 WASM/q8. Loads on a real Text query and is disposed immediately after boxes |
@@ -46,6 +49,31 @@ SAM3 path cannot be re-enabled. On a locked budget, `?profile=ultra`,
 `?proxy=max`, `?proxy=off` and `?working=1` are also refused; parameters may
 only lower limits (`?proxy=512`, `?escalate=0`, `?force=wasm`).
 
+## Crisp preview (display decoupled from the model)
+
+The on-screen photo and the pixels the model reads are **two different
+frames**. SlimSAM (and magic-wand / colour / brush) work on the bounded
+≤ 1024 px interaction buffer — that is the memory contract. What you *see* is a
+separate, higher-resolution **display frame** painted over it: a GPU-resident
+bitmap (a texture, never a full CPU RGBA buffer or a model tensor), so a 45 MP
+DSLR photo looks sharp without ever materialising 45 MP of RAM. The mask
+overlay is drawn on the ≤ 1024 buffer and scaled onto the display; export is
+unaffected (it always re-decodes natively).
+
+The display frame is sized **bounded-safe per host**:
+
+- **Bounded-decode hosts** (Chromium's `ImageDecoder`) scale-decode the full
+  frame down to the display size cheaply → a near-native preview.
+- **Unbounded-decode hosts** (Safari has no `ImageDecoder`) use the largest
+  source that is safe to fully decode — a RAW's own smaller embedded preview or
+  the bounded working copy — never the full 45 MP frame (the tab-kill path).
+
+`?display=native` opts into one full-resolution decode for a true ~4 K preview
+even on Safari (accepting a large one-time transient); `?display=off` pins the
+preview to the model proxy; `?display=<px>` caps the display long edge lower.
+Because this is display-only, it never touches the segmentation memory contract
+and is honoured even on a locked budget.
+
 ## DSLR upload handling
 
 The original photo is retained as its **compressed Blob only** — never as a
@@ -57,6 +85,45 @@ otherwise. On hosts that can only full-raster-decode (Safari has no
 `ImageDecoder`), that one unavoidable decode also re-encodes a small bounded
 working copy, then the full raster is closed immediately. Crops and exports
 re-decode only the bounded region they need.
+
+## Camera RAW (preview first, then on-device develop)
+
+A camera RAW (`.nef/.cr2/.cr3/.arw/.dng/.raf/…`) is a container, not a picture.
+The **fast path** (`js/image-raw.js`) never demosaics: it parses the container's
+IFD pointers, lifts the camera's own **embedded JPEG preview** by byte range
+(a 33 MB NEF → a ~3 MB JPEG), and hands that to the normal decode-to-proxy path.
+For a select/cutout tool the preview *is* the photo, and this covers essentially
+every modern RAW with no sensor decode at all.
+
+The rare RAW that carries **no usable embedded preview** falls back to an
+on-device develop (`js/raw-develop-client.js` → `public/wasm/raw-develop.wasm`):
+[LibRaw](https://github.com/libraw/libraw) 0.22.2, compiled to WebAssembly with
+Emscripten, demosaics the sensor and libjpeg re-encodes the result **inside the
+worker**, so only a compact JPEG Blob crosses back — a full-res RGBA frame never
+leaves that heap. It is memory-safe by construction and by policy:
+
+- **Half-resolution demosaic** (`half_size`) — a ≤1024 px masking proxy never
+  needs more, and it cuts the develop footprint ~4×.
+- **Megapixel cap before unpack** — sensors above the profile's `rawDevelopMaxMP`
+  (lite 40 · standard 60 · pro 80 · ultra 100) are refused before LibRaw
+  allocates the full sensor buffer, so the peak is bounded and predictable.
+- **Lazy + disposed** — the ~2 MB module is never fetched until a preview-less
+  RAW is actually opened, and the worker is **terminated after every develop**
+  because a full-sensor demosaic grows the wasm heap and wasm memory never
+  shrinks; terminating returns it to the OS.
+- **Gated** — off at memory pressure ≥ 2; on failure the import surfaces the
+  existing "export a JPEG/TIFF" error. Still no server, no Python, zero cloud.
+
+RawSpeed (decoder only, no demosaic; speed-first, OOM-prone on huge files) and
+rawpy/imagecodecs (Python) were evaluated and rejected — LibRaw is the only
+option that fits a zero-cloud browser and is itself hardened against image-bomb
+allocations.
+
+Build it from a clean checkout with Emscripten on PATH:
+
+```bash
+./scripts/build-libraw-wasm.sh   # fetches pinned LibRaw, emits public/wasm/raw-develop.{js,wasm}
+```
 
 ## One heavy job at a time
 
@@ -73,11 +140,11 @@ the first selection encodes exactly one embedding for the current document.
 ## C++/WebAssembly mask refinement
 
 `cpp/cv_refine.cpp` compiles to a compact SIMD wasm module (~12 KB, fixed
-16 MiB heap, no growth, no threads/SharedArrayBuffer) that runs seeded
+32 MiB heap, no growth, no threads/SharedArrayBuffer) that runs seeded
 connected-component cleanup, bounded hole fill, min-area small-object removal
-and binary open/close on the **one-channel ≤768 px mask** inside its own
+and binary open/close on the **one-channel ≤1024 px mask** inside its own
 worker. It lazy-loads on the first refinement, transfers buffers (never
-copies), rejects dimensions above 768 px, and on any failure the model's own
+copies), rejects dimensions above 1024 px, and on any failure the model's own
 mask is kept — no retries, no fallback CV library. WebAssembly is
 browser-native sandboxed code, not an arbitrary executable; and a worker
 isolates lifecycle/responsiveness — it does **not** add system memory budget.
@@ -115,10 +182,11 @@ memory pressure is a one-way ratchet.
 ## About “256 × 256” masks
 
 `256 × 256` is SlimSAM's internal decoder-mask resolution, not the image
-resolution. The model sees the ≤768 px interaction frame; its mask is
+resolution. The model sees the ≤1024 px interaction frame; its mask is
 restored to that frame and snapped to real image edges before display/export.
-A larger proxy cannot invent model detail because SlimSAM encodes at a
-1024 px long edge internally.
+A proxy larger than 1024 px cannot invent model detail because SlimSAM encodes
+at a 1024 px long edge internally — which is exactly why the interaction proxy
+is capped there and the crisp on-screen preview is a separate display frame.
 
 ## Controls
 
@@ -154,11 +222,13 @@ bun verify.mjs   # policy/sizing/queue/embedding/wasm/static suites + real app i
 ## Architecture
 
 - `js/heavy-job-queue.js` — ONE memory-heavy job at a time (priorities, revisions, cancellation)
-- `js/proxy-plan.js` — the single authoritative ≤768 px proxy-sizing function
+- `js/proxy-plan.js` — the single authoritative ≤1024 px proxy-sizing function
 - `js/decode-worker.js` / `decode-client.js` / `decode-core.js` — bounded image decode off the UI thread
 - `js/asset-store.js` — blob-only custody of the original; bounded crop/export re-decodes
 - `js/sam-engine.js` / `sam-worker.js` / `sam-client.js` — SlimSAM inference; encode-once/decode-per-click; one-embedding lite lifecycle
 - `js/cv-refine-worker.js` / `cv-refine-client.js` + `cpp/cv_refine.cpp` — wasm mask cleanup
+- `js/image-raw.js` — RAW embedded-preview extractor (fast path, no demosaic)
+- `js/raw-develop-worker.js` / `raw-develop-client.js` + `cpp/raw_develop.cpp` — LibRaw wasm develop (preview-less fallback, disposed after use)
 - `js/detect-engine.js` / `detect-worker.js` — disposable, resource-gated text detector
 - `js/policy.js` / `capability.js` — locked lite budgets, trusted-host tiers, pressure ladder
 - `js/app.js` — UI, prompts, overlay, export orchestration

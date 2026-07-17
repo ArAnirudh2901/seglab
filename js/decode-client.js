@@ -26,8 +26,9 @@ const getWorker = () => {
             const data = event.data || {}
             const entry = pending.get(data.requestId)
             if (!entry) {
-                // Late reply for a timed-out/cancelled request: release its bitmap.
+                // Late reply for a timed-out/cancelled request: release its bitmaps.
                 try { data.bitmap?.close?.() } catch { /* not a bitmap */ }
+                try { data.display?.close?.() } catch { /* not a bitmap */ }
                 return
             }
             pending.delete(data.requestId)
@@ -78,18 +79,18 @@ export const readMeta = async (blob) => {
  */
 export const decodeProxy = ({
     blob, decodeW, decodeH, scale, orientation = 1,
-    wantWorking = false, workingMaxSide = 1280,
+    wantWorking = false, workingMaxSide = 1280, displaySide = 0,
     revision = null, isCurrent = null,
 }) => enqueueHeavy('decode-proxy', async () => {
     const roundtrip = post({
-        type: 'decode-proxy', revision, blob, decodeW, decodeH, scale, orientation, wantWorking, workingMaxSide,
+        type: 'decode-proxy', revision, blob, decodeW, decodeH, scale, orientation, wantWorking, workingMaxSide, displaySide,
     })
     if (roundtrip) {
         const res = await roundtrip
-        return { bitmap: res.bitmap, working: res.working }
+        return { bitmap: res.bitmap, working: res.working, display: res.display || null }
     }
-    if (wantWorking) return decodeWithWorkingCopy(blob, { w: decodeW, h: decodeH }, scale, workingMaxSide)
-    return { bitmap: await decodeBoundedBitmap(blob, decodeW, decodeH, scale, orientation), working: null }
+    if (wantWorking) return decodeWithWorkingCopy(blob, { w: decodeW, h: decodeH }, scale, workingMaxSide, displaySide)
+    return { bitmap: await decodeBoundedBitmap(blob, decodeW, decodeH, scale, orientation), working: null, display: null }
 }, { priority: 'import', revision, isCurrent })
 
 /** Opaque-format decode (no parseable header): bounded inside the worker. */
