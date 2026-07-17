@@ -1,5 +1,27 @@
 # SEGLAB — Full Plan (merged with Phosmith Offline Pro)
 
+## 2026-07-17 — RAW develop fixture: first real sensor through LibRaw in the suite (CLOSED)
+
+The fixture-gated develop phase had never decoded a real RAW. Closed with
+`d750-lossless.nef` (repo root, untracked via `*.NEF`): Nikon D750 14-bit
+Lossless sample, CC0 from raw.pixls.us, sha256 `f90deb28…7665` verified against
+the index. Full suite green — 101 checks — including both fixture phases:
+- parser lifts the embedded preview (6016×4016, 975 KB JPEG + 746 KB proxy);
+- develop demosaics the sensor on-device: 6016×4016 → half-size 3016×2016 JPEG
+  (551 KB), decode-verified end to end.
+Rerun: `RAW_FIXTURE=d750-lossless.nef bun verify.mjs`.
+
+No preview-stripping (exiftool) needed — the parser phase REQUIRES previews
+present, and the develop hook (`developRawUrl`) drives LibRaw directly, so one
+ordinary lossless RAW satisfies both.
+
+Finding: the repo's Z 8 NEF (`2680558334.nef`) is High Efficiency (TicoRAW).
+LibRaw can't decode it ("Unsupported file format"), so HE/HE* can never use the
+develop fallback. By design this doesn't matter: HE NEFs always embed full-size
+previews (the Z 8 file carries three; parser phase passes on it), so the fast
+path covers them — the fallback exists for older preview-less files, which
+predate HE. A Z 8 set to Lossless compression produces develop-eligible files.
+
 ## 2026-07-16 — on-device RAW develop: LibRaw wasm fallback for preview-less RAW (SHIPPED)
 
 Closes the last gap in RAW support. The fast path (`image-raw.js`) still lifts
