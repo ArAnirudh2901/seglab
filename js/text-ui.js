@@ -5,7 +5,7 @@
  * state or DOM here; app.js owns the input, overlay, and selection glue.
  */
 import {
-    colorEvidenceForBox, DETECTOR_INPUT, DETECTOR_PAD, letterboxPlan, normalizePhrase, rankDetections, scaleBox, unletterboxBox,
+    collapseToObject, colorEvidenceForBox, DETECTOR_INPUT, DETECTOR_PAD, letterboxPlan, normalizePhrase, rankDetections, scaleBox, unletterboxBox,
 } from './text-core.js'
 import { getTransform, getBoundedOriginal } from './asset-store.js'
 import { detectText } from './sam-client.js'
@@ -90,12 +90,15 @@ export const detectCandidates = async (phrase, { rankThreshold = 0.12 } = {}) =>
     // the best result; Grounding DINO benefits from the same duplicate guard.
     const eligible = mapped.filter((d) => d.score >= rankThreshold)
     const focused = focusRequestedColor(eligible, frame, norm.color)
-    const candidates = rankDetections(focused, {
+    const ranked = rankDetections(focused, {
         threshold: norm.color && focused !== eligible ? 0 : rankThreshold,
         iou: 0.5,
         topK: 5,
         relative: 0.6,
     })
         .map((d) => ({ box: scaleBox(d.box, kx, ky), score: d.score, label: d.label }))
+    // Singular phrase → one object: merge fragments the detector split apart so
+    // a single train isn't two boxes to tap.
+    const candidates = norm.multi ? ranked : collapseToObject(ranked)
     return { candidates, multi: norm.multi, backend, display: norm.display }
 }

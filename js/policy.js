@@ -38,12 +38,16 @@ const PRESETS = {
         // Only enables the 151 MB Grounding DINO q4f16 attempt after the
         // accelerator/f16 gate in sam-engine. OWLv2 still stays on WASM.
         detectorWebGPU: true,
+        // Detector session stays warm across searches, evicted before the next
+        // SAM encode: dispose:'now''s memory ceiling without its per-search
+        // WebGPU rebuild (~13 s here).
+        detectorEvictOnEncode: true,
         // SAM stays on WASM here: the WebGPU compile/upload burst is a memory
         // event on the unverified baseline (like OWLv2's lesson).
         samWebGPU: false,
         autoEscalate: false,
         hdExportDecode: false,
-        detectorDispose: 'now',
+        detectorDispose: 'idle',
         eagerEncode: true,       // bounded: one embedding, calm-gated, wasm lane
         cvRefine: true,          // wasm mask cleanup (skipped at pressure ≥ 2)
         rawDevelop: true,        // LibRaw develop for preview-less RAW; lazy,

@@ -65,6 +65,7 @@ const DEFAULT_BUDGET = {
     draftCacheMax: 1,
     forceWasm: false,
     detectorWebGPU: false,
+    detectorEvictOnEncode: false,
     samWebGPU: false,
     embedPersist: false,
 }
@@ -119,12 +120,17 @@ const activeLaneKey = () => 'draft'
 
 export const getBudget = () => ({ ...state.budget })
 
-// Text-detector production lane. Grounding DINO Tiny is intentionally absent:
-// its current ONNX export's Gather_11 expects a rank-3 phrase-token tensor,
-// whereas transformers.js uses the standard rank-2 zero-shot representation.
-// OWLv2/WASM is slower but compatible and never enters that broken graph.
+// Text-detector ladder. Grounding DINO q4f16/WebGPU leads only on an
+// f16-capable accelerator (gpuTier gate) — faster, smaller, better phrase
+// grounding. Every device keeps OWLv2/WASM as the floor, so the ladder always
+// resolves to a lane that runs, with no GPU and no f16 required.
 export const detectorCandidates = () => {
-    return [{ detector: 'owl', device: 'wasm', dtype: 'q8' }]
+    const b = state.budget
+    const accelerated = b.detectorWebGPU === true && b.gpuTier === 'accelerated' && b.forceWasm !== true
+    const ladder = []
+    if (accelerated) ladder.push({ detector: 'grounding', device: 'webgpu', dtype: 'q4f16' })
+    ladder.push({ detector: 'owl', device: 'wasm', dtype: 'q8' })
+    return ladder
 }
 
 export const getEngineState = () => ({
@@ -262,6 +268,13 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false, p
         }
     }
     if (!source) throw new Error('Embedding cache miss and no image source provided')
+    // Sequential-peak guard: detector session and SAM embedding never coexist
+    // on a tight profile. detect() drops the document before grounding; this
+    // drops the detector before the encode a selected box triggers — session
+    // stays warm across searches, never overlaps the encoder. Only a miss pays.
+    if (state.budget.detectorEvictOnEncode) {
+        try { (await import('./detect-engine.js')).disposeDetector() } catch { /* none loaded */ }
+    }
     trace('embedding-miss', { cacheKey, width: source.width, height: source.height, ephemeral })
     const { RawImage } = bundle.transformers
     const w = source.width

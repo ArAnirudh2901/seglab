@@ -70,13 +70,13 @@ export const buildBoxPrompt = (box, srcW, srcH, reshaped) => {
 }
 
 /**
- * A candidate covering ≥ this much of the frame is SAM's whole-scene guess,
- * not an object: past 90% there is no background left to cut a subject out
- * of. Sits above the largest plausible real subject — even a frame-filling
- * close-up tops out near 85% — so genuine big-subject selections are never
- * second-guessed.
+ * Under an ambiguous prompt, a candidate covering ≥ this much of the frame is
+ * SAM's whole-scene guess, not the clicked object. Whole-scene runaways reach
+ * ~85%, so 0.9 let them through; 0.75 catches them. Only overrides when a
+ * smaller candidate exists — a genuinely frame-filling subject has no smaller
+ * granularity level to fall to, so its argmax winner still stands.
  */
-export const RUNAWAY_COVERAGE = 0.9
+export const RUNAWAY_COVERAGE = 0.75
 
 /**
  * Index of the best of SAM's three candidate masks.

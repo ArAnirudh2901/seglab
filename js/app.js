@@ -1492,6 +1492,12 @@ async function runDetect(phrase) {
         state.textMulti = res.multi
         els.selectall.hidden = res.candidates.length < 2
         const n = res.candidates.length
+        // Singular phrase, one object: select it outright — no tap needed.
+        if (!res.multi && n === 1) {
+            setStatus(`Selecting “${phrase.trim()}”…`)
+            selectCandidate(0)
+            return
+        }
         setStatus(`${n} match${n > 1 ? `es — tap one or Select all` : ' — tap it'}`)
         renderOverlay()
     } catch (err) {

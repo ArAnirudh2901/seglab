@@ -24,7 +24,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  colorEvidenceForBox, DETECTOR_INPUT, letterboxPlan, normalizePhrase, nms, rankDetections, scaleBox, unletterboxBox,
+  collapseToObject, colorEvidenceForBox, DETECTOR_INPUT, letterboxPlan, normalizePhrase, nms, rankDetections, scaleBox, unletterboxBox,
 } from './js/text-core.js'
 import { classifyCapability } from './js/capability.js'
 import { refineMaskEdges } from './js/edge-refine.js'
@@ -185,6 +185,24 @@ try {
     `plan=${plan.dw}x${plan.dh} full=[${full}]`,
   )
 
+  // Singular phrase: a train split front/rear collapses to one box; a distinct
+  // far object and a small sign stay out of it.
+  const fragments = [
+    { box: [560, 635, 815, 920], score: 0.42, label: 'train' }, // front
+    { box: [1105, 690, 1420, 900], score: 0.31, label: 'train' }, // rear (gap)
+    { box: [1780, 800, 1840, 880], score: 0.2, label: 'train' }, // far small object
+  ]
+  const [merged] = collapseToObject(fragments)
+  const twoTrains = collapseToObject([
+    { box: [0, 0, 300, 300], score: 0.5 }, { box: [1400, 0, 1700, 300], score: 0.4 },
+  ])
+  check(
+    'text-core: singular phrase collapses split fragments, not distinct objects',
+    merged.box[0] === 560 && merged.box[2] === 1420 && merged.box[3] === 920
+      && twoTrains.length === 1 && twoTrains[0].box[2] === 300,
+    `merged=[${merged.box}] distinct kept ${twoTrains.length}`,
+  )
+
   // Edge refiner: boundary-local soft alpha (unchanged contract).
   const ew = 37
   const eh = 29
@@ -253,7 +271,7 @@ try {
       && liteDefault.hdExportDecode === false && liteDefault.eagerEncode === true
       && liteDefault.embedPersist === false && liteDefault.exportMaxSide === 4096
       && liteDefault.exportMaxMP === 8 && liteDefault.cropMaxSide === 1280
-      && liteDefault.detectorDispose === 'now',
+      && liteDefault.detectorDispose === 'idle' && liteDefault.detectorEvictOnEncode === true,
     JSON.stringify(liteDefault),
   )
   check(
@@ -1002,7 +1020,7 @@ try {
       && brushErase.maskSummary.coverage < brushAdd.maskSummary.coverage,
     `add=${((brushAdd?.maskSummary?.coverage || 0) * 100).toFixed(2)}% erase=${((brushErase?.maskSummary?.coverage || 0) * 100).toFixed(2)}%`,
   )
-  log('⚠ text-detector phrase→boxes not gated headless (ORT op gap) — confirm in real browser')
+  log('⚠ text-detector phrase→boxes not gated headless (avoids a 151 MB model pull) — GDINO q4f16/WebGPU → OWLv2/WASM ladder confirmed in a real browser')
   await pageE.close()
 
   /* ── Weak device: everything still works on forced WASM ── */

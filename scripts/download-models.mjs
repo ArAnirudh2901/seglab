@@ -5,19 +5,21 @@
  *   lib/ort/ort-wasm-simd-threaded*.{mjs,wasm} — ORT wasm (asyncify = Chromium/FF
  *                                              pair, plain = Safari pair)
  *   models/Xenova/slimsam-77-uniform/…       — SlimSAM fp32 (WebGPU) + q8 (WASM)
+ *   models/onnx-community/grounding-dino-…/…  — Grounding DINO q4f16, --detector
  *   models/onnx-community/owlv2-…/…          — OWLv2 q8, only with --detector
  *   models/manifest.json                     — presence signal read at runtime
  *
- * lib/ and models/ are gitignored (~90 MB core, +163 MB with --detector).
+ * lib/ and models/ are gitignored (~90 MB core, +314 MB with --detector).
  * Idempotent: complete files are skipped. Fails loudly if the
  * transformers→ORT version pin ever drifts.
  *
  * Usage: node scripts/download-models.mjs [--detector]
  *
  *   (core)       click/box/lasso selection + export run with no network.
- *   --detector   also vendors OWLv2 so text-select ("phrase → boxes") is
- *                offline too. Skipped by default — it is 163 MB and the
- *                feature is optional/disposable at runtime.
+ *   --detector   also vendors both text-select lanes so "phrase → boxes" is
+ *                offline on any device: Grounding DINO q4f16 (accelerated) and
+ *                OWLv2 q8 (universal fallback). Skipped by default — 314 MB,
+ *                and the feature is optional/disposable at runtime.
  */
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
@@ -30,8 +32,9 @@ const TRANSFORMERS_VERSION = '4.2.0'
 // Must equal dependencies["onnxruntime-web"] of the pinned transformers build.
 const ORT_VERSION = '1.26.0-dev.20260416-b7804b056c'
 const SLIMSAM = 'Xenova/slimsam-77-uniform'
-// Must equal DETECTORS.owl in js/detect-engine.js (model + weightFile).
+// Must equal DETECTORS in js/detect-engine.js (model + weightFile per lane).
 const OWLV2 = 'onnx-community/owlv2-base-patch16-ensemble-ONNX'
+const GDINO = 'onnx-community/grounding-dino-tiny-ONNX'
 
 const withDetector = process.argv.includes('--detector')
 
@@ -62,6 +65,16 @@ const OWLV2_FILES = [
     'onnx/model_quantized.onnx',
 ]
 
+// q4f16 only — the exact dtype js/detect-engine.js pins for the accelerated
+// Grounding DINO WebGPU lane.
+const GDINO_FILES = [
+    'config.json',
+    'preprocessor_config.json',
+    'tokenizer.json',
+    'tokenizer_config.json',
+    'onnx/model_q4f16.onnx',
+]
+
 const hubJobs = (repo, files) => files.map((entry) => {
     const file = typeof entry === 'string' ? entry : entry.file
     return {
@@ -81,6 +94,7 @@ const jobs = [
         dest: `lib/ort/${f}`,
     })),
     ...hubJobs(SLIMSAM, SLIMSAM_FILES),
+    ...(withDetector ? hubJobs(GDINO, GDINO_FILES) : []),
     ...(withDetector ? hubJobs(OWLV2, OWLV2_FILES) : []),
 ]
 
@@ -139,8 +153,9 @@ const manifest = {
     transformers: TRANSFORMERS_VERSION,
     onnxruntimeWeb: ORT_VERSION,
     model: SLIMSAM,
-    models: withDetector ? [SLIMSAM, OWLV2] : [SLIMSAM],
+    models: withDetector ? [SLIMSAM, GDINO, OWLV2] : [SLIMSAM],
     detector: withDetector ? OWLV2 : null,
+    detectors: withDetector ? [GDINO, OWLV2] : [],
     generatedAt: new Date().toISOString(),
     files,
 }
@@ -148,4 +163,4 @@ await mkdir(path.join(ROOT, 'models'), { recursive: true })
 await writeFile(path.join(ROOT, 'models', 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 const total = files.reduce((sum, f) => sum + f.bytes, 0)
 log(`done — ${files.length} files, ${mb(total)} total; wrote models/manifest.json`)
-if (!withDetector) log('text-select (OWLv2) not vendored — re-run with --detector to make it offline too')
+if (!withDetector) log('text-select (Grounding DINO + OWLv2) not vendored — re-run with --detector to make it offline too')

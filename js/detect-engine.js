@@ -4,16 +4,25 @@
  * the existing decoder. Lazy and disposable (Lite frees it after boxes).
  * Everything runs on-device — no sidecar or image upload.
  *
- * OWLv2 q8/WASM is the compatible production lane. Grounding DINO Tiny's
- * current ONNX export expects a three-dimensional phrase-token tensor, while
- * transformers.js supplies the standard two-dimensional zero-shot tensor;
- * its Gather_11 node consequently fails at runtime. Keep it out of the
- * production ladder until the upstream export and pipeline agree.
+ * Two lanes, always ending on the universal floor:
+ *   • Grounding DINO Tiny q4f16 on WebGPU — accelerated, 151 MB, best phrase
+ *     grounding. Only attempted on an f16-capable accelerator (gpuTier gate).
+ *     transformers.js v4's ONNX export fixed the earlier rank-3 token-tensor
+ *     mismatch, so it now runs the standard zero-shot graph.
+ *   • OWLv2 q8 on WASM — the compatible fallback that runs on every browser,
+ *     no GPU, no f16. The ladder degrades here on any accelerated-lane failure.
  */
 import { loadTransformers } from './sam-engine.js'
 import { isVendored } from './model-assets.js'
 
 const DETECTORS = Object.freeze({
+    grounding: {
+        id: 'grounding',
+        label: 'Grounding DINO',
+        model: 'onnx-community/grounding-dino-tiny-ONNX',
+        weightFile: 'model_q4f16.onnx',
+        downloadMB: 151,
+    },
     owl: {
         id: 'owl',
         label: 'OWLv2',
@@ -28,19 +37,30 @@ const normalizeCandidate = (candidate) => Array.isArray(candidate)
     ? { detector: 'owl', device: candidate[0], dtype: candidate[1] }
     : { detector: candidate?.detector || 'owl', device: candidate?.device, dtype: candidate?.dtype }
 
-/** Grounding DINO is deliberately disabled until its ONNX input contract is
- * fixed upstream; callers use this to keep download/cache UI truthful. */
-export const acceleratedDetectorAvailable = false
+// The accelerated lane downloads Grounding DINO; the fallback lane, OWLv2.
+const laneDetector = ({ accelerated = false } = {}) => (accelerated ? DETECTORS.grounding : DETECTORS.owl)
 
-/** First-search download for the UI: the compatible OWLv2 q8 model. */
-export const detectorDownloadMB = () => DETECTORS.owl.downloadMB
+// Grounding DINO's grounded head keys off dot-terminated lowercase phrases;
+// OWLv2 takes the templates as-is. Format per lane so either can run the same
+// normalizePhrase output.
+const formatLabels = (labels, detectorId) => (detectorId === 'grounding'
+    ? labels.map((label) => `${String(label).toLowerCase().trim().replace(/\.+$/, '')}.`)
+    : labels)
+
+/** Grounding DINO now runs on transformers.js v4; the accelerated lane is live
+ *  wherever the gpuTier gate clears. Callers still show OWLv2's size when it
+ *  doesn't. */
+export const acceleratedDetectorAvailable = true
+
+/** First-search download for the UI: the lane the caller's device will use. */
+export const detectorDownloadMB = ({ accelerated = false } = {}) => laneDetector({ accelerated }).downloadMB
 export const DETECTOR_DOWNLOAD_MB = detectorDownloadMB()
 
 /** Whether the weights are already on disk. The pipe itself lives in the worker,
  *  so the main thread can't just ask `detectorLoaded()`; Cache Storage is the
  *  shared fact, and it survives reloads. */
 export const detectorCached = async ({ accelerated = false } = {}) => {
-    const detector = DETECTORS.owl
+    const detector = laneDetector({ accelerated })
     // Vendored (--detector) serves from disk: no download, true even cache-less.
     if (await isVendored(detector.model)) return true
     if (typeof caches === 'undefined') return false
@@ -59,7 +79,7 @@ export const detectorCached = async ({ accelerated = false } = {}) => {
  *  reports true once the .onnx itself landed. */
 const HUB_FILES = ['config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json']
 export const prefetchDetectorWeights = async ({ accelerated = false } = {}) => {
-    const detector = DETECTORS.owl
+    const detector = laneDetector({ accelerated })
     // detectorCached() short-circuits on the manifest, so a --detector
     // checkout never touches huggingface.co.
     if (await detectorCached({ accelerated })) return true
@@ -92,8 +112,8 @@ export const detectorLoaded = () => !!pipe
 export const detectorTag = () => loadedTag
 
 // Degrade-don't-die: try each model/backend option until a session builds.
-// `candidates` currently contains only OWLv2/WASM; the generic ladder remains
-// in place so a future compatible accelerator can fall back on run failures.
+// The ladder runs Grounding DINO/WebGPU first (when the gpuTier gate cleared)
+// and falls back to OWLv2/WASM, which builds on every browser.
 const loadDetector = (candidates, progress_callback) => {
     const options = (candidates || []).map(normalizeCandidate)
     const tag = options.map(optionTag).join('|')
@@ -152,9 +172,14 @@ export const detect = async ({ frame, labels, threshold = 0.05, candidates, prog
         while (remaining.length) {
             const { pipe: activePipe, option } = await loadDetector(remaining, progress_callback)
             try {
-                const out = await activePipe(image, labels, { threshold, percentage: true, top_k: 64 })
+                const out = await activePipe(image, formatLabels(labels, option.detector), { threshold, percentage: true, top_k: 64 })
+                // `percentage` yields [0,1]; normalize defensively so a lane that
+                // returns pixels (some grounded heads ignore the flag) still maps
+                // through unletterboxBox, which expects square-normalized boxes.
+                const nx = (v) => (Math.abs(v) > 1.5 ? v / frame.width : v)
+                const ny = (v) => (Math.abs(v) > 1.5 ? v / frame.height : v)
                 const dets = out.map((o) => ({
-                    box: [o.box.xmin, o.box.ymin, o.box.xmax, o.box.ymax],
+                    box: [nx(o.box.xmin), ny(o.box.ymin), nx(o.box.xmax), ny(o.box.ymax)],
                     score: o.score,
                     label: o.label,
                 }))

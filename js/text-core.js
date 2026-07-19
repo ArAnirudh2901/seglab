@@ -78,6 +78,47 @@ export const nms = (dets, iouThresh = 0.5) => {
 /** Scale a box between coordinate spaces (per-axis factor). */
 export const scaleBox = (box, sx, sy) => [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy]
 
+/** Bounding box of two [x0,y0,x1,y1] boxes. */
+export const boxUnion = (a, b) => [
+    Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3]),
+]
+
+/** Two boxes are pieces of one object when they overlap, or sit colinear with
+ *  only a small gap — the shape a detector makes when it splits one long
+ *  subject (a train's front and rear) into separate boxes. Gap is measured
+ *  against the smaller box, so a small far object never joins a large one. */
+const sameObject = (a, b, gap) => {
+    const ox = Math.min(a[2], b[2]) - Math.max(a[0], b[0])
+    const oy = Math.min(a[3], b[3]) - Math.max(a[1], b[1])
+    if (ox > 0 && oy > 0) return true
+    const w = Math.min(a[2] - a[0], b[2] - b[0])
+    const h = Math.min(a[3] - a[1], b[3] - b[1])
+    if (oy > 0.6 * h && ox <= 0 && -ox <= gap * w) return true // horizontal gap
+    if (ox > 0.6 * w && oy <= 0 && -oy <= gap * h) return true // vertical gap
+    return false
+}
+
+/** Collapse detector fragments of ONE object into a single box. A singular
+ *  phrase means one thing, so grow the top box with every fragment that
+ *  belongs to it (transitively) and drop the rest; a distinct second object
+ *  stays separate and loses to the top box. */
+export const collapseToObject = (dets, { gap = 1.5 } = {}) => {
+    if (dets.length <= 1) return dets
+    const order = [...dets].sort((p, q) => q.score - p.score)
+    let box = order[0].box.slice()
+    const used = new Set([0])
+    for (let grew = true; grew;) {
+        grew = false
+        for (let i = 1; i < order.length; i += 1) {
+            if (used.has(i) || !sameObject(box, order[i].box, gap)) continue
+            box = boxUnion(box, order[i].box)
+            used.add(i)
+            grew = true
+        }
+    }
+    return [{ ...order[0], box }]
+}
+
 /** Where a w×h frame sits inside the padded square: scaled by `k` to dw×dh at
  *  the top-left, gray everywhere else. */
 export const letterboxPlan = (w, h, side = DETECTOR_INPUT) => {
