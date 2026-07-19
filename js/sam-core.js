@@ -244,7 +244,7 @@ export const pointInMask = (imageData, x, y, tolerance = 3) => {
  */
 export const validateClickMask = ({ coverage, bbox }) => {
     if (!bbox || coverage <= 0) return { usable: false, reason: 'empty mask (selection missed)' }
-    if (coverage >= 0.999) return { usable: false, reason: 'solid mask (object not separated)' }
+    if (coverage >= 0.9995) return { usable: false, reason: 'solid mask (object not separated)' }
     return { usable: true, reason: null }
 }
 
@@ -282,7 +282,7 @@ const labelComponents = (bin, w, h) => {
 
 /** Component label at (or within `radius` of) a seed point — a positive
  *  click can land a few pixels outside the mask the decoder returned. */
-const labelNearSeed = (labels, w, h, x, y, radius = 8) => {
+const labelNearSeed = (labels, w, h, x, y, radius = 16) => {
     const cx = Math.round(x)
     const cy = Math.round(y)
     for (let r = 0; r <= radius; r += 1) {
@@ -319,7 +319,7 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     const bin = new Uint8Array(size)
     let fgArea = 0
     for (let i = 0; i < size; i += 1) {
-        if (rgba[i * 4] >= 128) { bin[i] = 1; fgArea += 1 }
+        if (rgba[i * 4] >= 64) { bin[i] = 1; fgArea += 1 }
     }
     if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
 
@@ -337,7 +337,7 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
         keep.add(best)
     }
     for (const l of keep) largestKept = Math.max(largestKept, areas[l - 1])
-    const minUnseeded = Math.max(48, largestKept * 0.01)
+    const minUnseeded = Math.max(16, largestKept * 0.005)
     for (let k = 0; k < areas.length; k += 1) {
         if (!keep.has(k + 1) && areas[k] >= minUnseeded) keep.add(k + 1)
     }

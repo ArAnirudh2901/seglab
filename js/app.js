@@ -1070,7 +1070,7 @@ els.overlay.addEventListener('pointerdown', (e) => {
     els.overlay.setPointerCapture(e.pointerId)
     const [x, y] = toCanvas(e)
     if (state.mode === 'click') {
-        state.drag = { kind: 'tap', start: [x, y], moved: false, negative: e.button === 2 || e.altKey }
+        state.drag = { kind: 'tap', start: [x, y], moved: false, negative: e.button === 2 || e.altKey, pointerType: e.pointerType }
     } else if (state.mode === 'box') {
         state.drag = { kind: 'box', start: [x, y], now: [x, y] }
     } else if (state.mode === 'lasso') {
@@ -1101,7 +1101,8 @@ els.overlay.addEventListener('pointermove', (e) => {
     if (!state.drag) return
     const [x, y] = toCanvas(e)
     if (state.drag.kind === 'tap') {
-        if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > 4) state.drag.moved = true
+        const moveThreshold = state.drag.pointerType === 'touch' ? 12 : 5
+        if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > moveThreshold) state.drag.moved = true
         return
     }
     if (state.drag.kind === 'box' || state.drag.kind === 'rect' || state.drag.kind === 'ellipse') {
@@ -1141,6 +1142,8 @@ els.overlay.addEventListener('pointerup', (e) => {
             bumpRevision()
             scheduleRun()
         }
+        renderOverlay()
+        refreshButtons()
     } else if (drag.kind === 'lasso') {
         const prompts = lassoToPrompts(drag.points)
         if (prompts) {
@@ -1154,6 +1157,8 @@ els.overlay.addEventListener('pointerup', (e) => {
             bumpRevision()
             scheduleRun()
         }
+        renderOverlay()
+        refreshButtons()
     } else if (drag.kind === 'region' && drag.points.length >= 3) {
         commitManualMask('region', polygonMask(drag.points), { poly: drag.points }, drag.negative || state.sign === 0)
     } else if (drag.kind === 'rect' || drag.kind === 'ellipse') {
@@ -1166,8 +1171,6 @@ els.overlay.addEventListener('pointerup', (e) => {
     } else if (drag.kind === 'brush') {
         commitBrushMask()
     }
-    renderOverlay()
-    refreshButtons()
 })
 
 els.overlay.addEventListener('dblclick', (e) => {
@@ -1192,6 +1195,8 @@ function applyClickPrompt(x, y, label) {
             state.clicks.push([x, y, 1])
         }
         bumpRevision()
+        renderOverlay()
+        refreshButtons()
         scheduleRun()
         return
     }
@@ -1205,6 +1210,8 @@ function applyClickPrompt(x, y, label) {
     if (state.clicks.length || state.box || state.lasso) {
         state.clicks.push([x, y, 0])
         bumpRevision()
+        renderOverlay()
+        refreshButtons()
         scheduleRun()
         return
     }
@@ -1221,7 +1228,7 @@ const scheduleRun = () => {
 
 async function runNow() {
     if (!state.hasImage) return
-    if (state.running) { state.runQueued = true; return }
+    if (state.running) { state.runQueued = true; setStatus('Click registered — finishing previous selection'); return }
     const clicks = state.lasso ? [state.lasso.point, ...state.clicks] : state.clicks
     const box = state.lasso ? state.lasso.box : state.box
     if (clicks.length === 0 && !box) return
@@ -1346,7 +1353,7 @@ async function maybeCvRefine(revision, clicks) {
         width,
         height,
         seeds,
-        options: { minArea: 24, openRadius: 0, closeRadius: 0 },
+        options: { minArea: 16, openRadius: 0, closeRadius: 0 },
         revision,
         budget: BUDGET,
     })
