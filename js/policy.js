@@ -42,8 +42,10 @@ const PRESETS = {
         // SAM encode: dispose:'now''s memory ceiling without its per-search
         // WebGPU rebuild (~13 s here).
         detectorEvictOnEncode: true,
-        // SAM stays on WASM here: the WebGPU compile/upload burst is a memory
-        // event on the unverified baseline (like OWLv2's lesson).
+        // Baseline default: WASM. resolveBudget() promotes this to WebGPU
+        // whenever a usable non-fallback adapter is probed (gpuTier != 'none'),
+        // since GPU accel is independent of the memory tier. This false is the
+        // no-GPU / no-probe floor and what memory pressure ratchets back down to.
         samWebGPU: false,
         autoEscalate: false,
         hdExportDecode: false,
@@ -182,6 +184,12 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.hostManaged = !!cap.hostManaged
         budget.flagshipEligible = !!cap.flagshipEligible
         budget.textureLimit = cap.textureLimit || 0
+        // GPU acceleration is independent of the memory tier (see capability.js):
+        // any usable, non-fallback WebGPU adapter runs SlimSAM on the GPU, even
+        // on the memory-locked lite baseline. SlimSAM is ~14 MB and the proxy is
+        // bounded, so the upload burst is small; segment() still falls back to
+        // WASM on any runtime failure, and ?force=wasm / memory pressure override.
+        budget.samWebGPU = cap.gpuTier !== 'none'
     }
     budget.memoryLocked = locked
     if (cap?.memorySource === 'unknown') budget.memoryUncertain = true

@@ -274,11 +274,14 @@ try {
       && liteDefault.detectorDispose === 'idle' && liteDefault.detectorEvictOnEncode === true,
     JSON.stringify(liteDefault),
   )
+  const liteNoGpu = resolveBudget('', classifyCapability({ webgpu: false, browserMemoryGB: 8 }))
+  const liteFallbackGpu = resolveBudget('', classifyCapability({ webgpu: true, fallback: true, browserMemoryGB: 8 }))
   check(
-    'policy: SAM stays on WASM for the unverified baseline (the OWLv2 lesson applied to SlimSAM)',
-    liteDefault.samWebGPU === false && PROFILE_PRESETS.standard.samWebGPU === true
-      && resolveBudget('', unknownMemory).samWebGPU === false,
-    JSON.stringify({ lite: liteDefault.samWebGPU, standard: PROFILE_PRESETS.standard.samWebGPU }),
+    'policy: SAM runs on the GPU whenever one is probed, independent of the memory tier',
+    liteDefault.samWebGPU === true && resolveBudget('', unknownMemory).samWebGPU === true
+      && liteNoGpu.samWebGPU === false && liteFallbackGpu.samWebGPU === false
+      && resolveBudget('?force=wasm', browserEightGB).forceWasm === true,
+    JSON.stringify({ liteGpu: liteDefault.samWebGPU, liteNoGpu: liteNoGpu.samWebGPU, liteFallback: liteFallbackGpu.samWebGPU }),
   )
   const flagged = resolveBudget('?flagship=1', browserEightGB)
   const ultraReq = resolveBudget('?profile=ultra', browserEightGB)
@@ -532,11 +535,11 @@ try {
       'gated',
     )
     check(
-      'static: SAM device pick is budget-gated — the baseline never probes WebGPU',
+      'static: SAM device pick is budget-gated — samWebGPU decides, pressure still forces WASM',
       /state\.budget\.samWebGPU !== true/.test(sources['sam-engine.js'])
-        && /samWebGPU: false/.test(sources['policy.js'])
+        && /budget\.samWebGPU = cap\.gpuTier !== 'none'/.test(sources['policy.js'])
         && /next\.samWebGPU = false/.test(sources['policy.js']),
-      'pickDevice honors samWebGPU; lite preset + pressure ratchet keep it off',
+      'pickDevice honors samWebGPU; a probed GPU sets it, the pressure ratchet clears it',
     )
     const assetGetImageData = (sources['asset-store.js'].match(/getImageData\(/g) || []).length
     check(
@@ -688,7 +691,7 @@ try {
     JSON.stringify({ eager, cached: engEager?.cachedImages, device: engEager?.device }),
   )
   check(
-    'lite: SAM runs on wasm — the baseline never probes WebGPU (status pill agrees)',
+    'lite: SAM runs on wasm here (headless has no usable GPU) and the chip reports it honestly',
     engEager.device === 'wasm' && /device: wasm/.test(chipDevice),
     `chip="${chipDevice}"`,
   )

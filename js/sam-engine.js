@@ -48,6 +48,10 @@ const LANES = {
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
 const PROGRESS_THROTTLE_MS = 120
+// A single WebGPU runtime failure can be a transient driver/compile glitch, so
+// it no longer permanently demotes the session — only this many consecutive
+// failures do. A successful GPU segment resets the counter.
+const WEBGPU_FAILURE_LIMIT = 2
 
 const withTimeout = (promise, ms, label) =>
     new Promise((resolve, reject) => {
@@ -71,8 +75,10 @@ const DEFAULT_BUDGET = {
 }
 
 const state = {
-    device: null,            // 'webgpu' | 'wasm' once known
-    forcedWasm: false,       // sticky downgrade after a WebGPU runtime failure
+    device: null,            // 'webgpu' | 'wasm' once known ('what actually loaded')
+    forcedWasm: false,       // sticky downgrade after repeated WebGPU failures
+    webgpuFailures: 0,       // consecutive WebGPU runtime failures (reset on success)
+    gpuInfo: null,           // adapter.info of the GPU we actually run on
     ready: false,            // SlimSAM serving
     obsoleteBefore: 0,       // jobs with revision < this must not commit (cancel op)
     budget: { ...DEFAULT_BUDGET },
@@ -136,6 +142,7 @@ export const detectorCandidates = () => {
 export const getEngineState = () => ({
     device: state.device,
     forcedWasm: state.forcedWasm,
+    gpuInfo: state.gpuInfo,
     ready: state.ready,
     lane: LANES[activeLaneKey()].label,
     profile: state.budget.profile,
@@ -166,15 +173,29 @@ const pickDevice = async () => {
     try {
         // navigator.gpu exists in dedicated workers too (where supported).
         if (typeof navigator !== 'undefined' && navigator.gpu) {
-            // Prefer the user's performance GPU (including a discrete GPU) when
-            // the browser permits it; fall back to its default adapter.
+            // Bias toward the discrete/high-performance GPU on hybrid laptops
+            // (NVIDIA+iGPU, AMD dGPU+APU, …); then a low-power adapter; then
+            // whatever the browser defaults to.
             const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
+                || await navigator.gpu.requestAdapter({ powerPreference: 'low-power' })
                 || await navigator.gpu.requestAdapter()
-            if (adapter) device = 'webgpu'
+            // A software/fallback adapter is CPU emulation wearing a GPU label —
+            // the threaded WASM lane is the honest floor, so decline it.
+            if (adapter && !adapter.isFallbackAdapter) {
+                device = 'webgpu'
+                // GPUAdapterInfo exposes fields as prototype getters, so pick
+                // them explicitly — a spread yields {}.
+                const info = adapter.info
+                state.gpuInfo = info
+                    ? { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description }
+                    : null
+            } else if (adapter) {
+                trace('device-pick', { device: 'wasm', reason: 'fallback-adapter' })
+            }
         }
     } catch { /* no WebGPU */ }
     state.device = device
-    trace('device-pick', { device, reason: 'probe' })
+    trace('device-pick', { device, reason: 'probe', gpu: state.gpuInfo || undefined })
     return device
 }
 
@@ -197,12 +218,37 @@ const loadBundle = () => {
                 total: info?.total,
             },
         })
+        // Load ladder that keeps the GPU whenever it can and, crucially, sets
+        // state.device to whatever ACTUALLY loaded — the device chip must never
+        // claim a GPU run that silently happened on the CPU.
+        const loadModel = async () => {
+            if (device !== 'webgpu') {
+                state.device = 'wasm'
+                return Cls.from_pretrained(lane.model, { device: 'wasm', progress_callback, ...lane.options })
+            }
+            try {
+                const m = await Cls.from_pretrained(lane.model, { device: 'webgpu', progress_callback, ...lane.options })
+                state.device = 'webgpu'
+                return m
+            } catch (dtypeErr) {
+                // Stay on the GPU: the default dtype may be unsupported on this
+                // adapter (e.g. no shader-f16). fp32 runs on every WebGPU adapter.
+                try {
+                    const m = await Cls.from_pretrained(lane.model, { device: 'webgpu', dtype: 'fp32', progress_callback, ...lane.options })
+                    state.device = 'webgpu'
+                    trace('model-load-webgpu-fp32', { after: String(dtypeErr?.message).slice(0, 120) })
+                    return m
+                } catch (gpuErr) {
+                    // Only now abandon the GPU — and record it honestly.
+                    console.warn('[seglab] SlimSAM WebGPU load failed; WASM fallback:', gpuErr?.message)
+                    state.device = 'wasm'
+                    return Cls.from_pretrained(lane.model, { device: 'wasm', progress_callback, ...lane.options })
+                }
+            }
+        }
         const [model, processor] = await withTimeout(
             Promise.all([
-                Cls.from_pretrained(lane.model, { device, progress_callback, ...lane.options })
-                    // SlimSAM may retry deviceless; the bounded WASM lane is
-                    // the safe fallback when WebGPU initialization fails.
-                    .catch(() => Cls.from_pretrained(lane.model, { progress_callback, ...lane.options })),
+                loadModel(),
                 transformers.AutoProcessor.from_pretrained(lane.model, { progress_callback }),
             ]),
             LOAD_TIMEOUT_MS,
@@ -559,7 +605,9 @@ export const segment = async (req) => {
     const laneKey = activeLaneKey()
     trace('segment-route', { laneKey, revision: req.revision })
     try {
-        return await serialize(() => segmentOnce({ ...req, lane: laneKey }))
+        const result = await serialize(() => segmentOnce({ ...req, lane: laneKey }))
+        if (state.device === 'webgpu') state.webgpuFailures = 0 // healthy GPU run
+        return result
     } catch (err) {
         console.error('[seglab][engine] segment-failed', { laneKey, revision: req.revision, err })
         if (isStale(req)) return staleResult(req) // don't demote lanes over a cancelled job
@@ -568,13 +616,22 @@ export const segment = async (req) => {
             await relievePressure(2)
         }
         if (state.device !== 'webgpu' || state.forcedWasm) throw err
-        console.warn('[seglab] segment failed on WebGPU; retrying on WASM:', err?.message)
-        state.forcedWasm = true
+        // Serve this job on WASM regardless, but only make the demotion sticky
+        // once WebGPU has failed WEBGPU_FAILURE_LIMIT times in a row — a lone
+        // driver/compile glitch must not cost the whole session its GPU.
+        state.webgpuFailures += 1
+        const permanent = state.webgpuFailures >= WEBGPU_FAILURE_LIMIT
+        console.warn(`[seglab] segment failed on WebGPU (${state.webgpuFailures}/${WEBGPU_FAILURE_LIMIT}); retrying on WASM${permanent ? ' — GPU disabled for this session' : ''}:`, err?.message)
+        state.forcedWasm = permanent
         state.device = 'wasm'
         state.ready = false
         bundles.draft = null
         releaseDocument()
-        return serialize(() => segmentOnce({ ...req, lane: 'draft' }))
+        const result = await serialize(() => segmentOnce({ ...req, lane: 'draft' }))
+        // Non-sticky: let a later job re-probe the GPU by forcing a fresh
+        // device pick + rebuild (only paid after a rare runtime failure).
+        if (!permanent) { state.device = null; bundles.draft = null }
+        return result
     }
 }
 
