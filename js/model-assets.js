@@ -17,12 +17,23 @@ const headOk = async (url) => {
     try { return (await fetch(url, { method: 'HEAD' })).ok } catch { return false }
 }
 
-// Safari needs the non-asyncify ORT build (mirrors transformers.js's own pick).
+// ORT build pick, mirroring transformers.js upstream (PR #1700): only Safari
+// WITHOUT WebGPU (< 26) gets the plain CPU-only build — its wasm engine chokes
+// on asyncify. Safari 26+ ships WebGPU and runs the asyncify build, which is
+// the one carrying the WebGPU EP; all other browsers always get asyncify.
 const isSafariUA = () => {
     const ua = typeof navigator !== 'undefined' ? String(navigator.userAgent || '') : ''
     return /Safari\//.test(ua) && !/Chrom(e|ium)|Edg\//.test(ua)
 }
-const ortName = (ext) => `ort-wasm-simd-threaded${isSafariUA() ? '' : '.asyncify'}.${ext}`
+const hasWebGpuApi = () => typeof navigator !== 'undefined' && 'gpu' in navigator
+const needsPlainOrtBuild = () => isSafariUA() && !hasWebGpuApi()
+const ortName = (ext) => `ort-wasm-simd-threaded${needsPlainOrtBuild() ? '' : '.asyncify'}.${ext}`
+
+/** Whether the ORT build this browser gets can run the WebGPU EP at all.
+ *  The plain build has no webgpuInit export, so a 'webgpu' session there dies
+ *  with "De().webgpuInit is not a function" even when navigator.gpu exists.
+ *  Must stay in sync with ortName's pick. */
+export const ortWebGpuSupported = () => hasWebGpuApi() && !needsPlainOrtBuild()
 
 let manifestPromise = null
 

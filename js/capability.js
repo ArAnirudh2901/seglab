@@ -78,6 +78,23 @@ const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit })
     return f16 && textureReady && storageReady ? 'accelerated' : 'basic'
 }
 
+/**
+ * Best-effort profile guess for a browser the memory-trust lock won't verify.
+ * `navigator.deviceMemory` is privacy-rounded AND capped at 8, so an 8 (or any
+ * positive reading) can't prove "8 GB and no more" — it's unusable as a raise
+ * signal, only as a floor: a reading genuinely below 8 is real and trusted
+ * downward. `logicalProcessors` (navigator.hardwareConcurrency) has no such
+ * cap and correlates loosely with device class, so it drives the guess — kept
+ * deliberately capped at 'standard' since it's still a guess, never 'pro' or
+ * 'ultra' (those stay Phosmith-verified-only, or an explicit user override).
+ */
+const estimateProfile = ({ trusted, cores, memoryGB }) => {
+    if (trusted) return null // classifyCapability already has a verified figure
+    if (!cores) return 'lite' // no core-count signal — nothing to estimate from
+    if (memoryGB > 0 && memoryGB < 8) return 'lite'
+    return cores >= 6 ? 'standard' : 'lite'
+}
+
 const proxyFor = (profile, gpuTier, textureLimit) => {
     // SlimSAM resizes every input to a 1024 long edge, so 1024 is the baseline
     // that feeds the model its exact native frame (and a crisp preview) at no
@@ -106,6 +123,11 @@ export const classifyCapability = (input = {}) => {
     const profile = profileForMemory(memoryGB, memorySource === 'phosmith', resourceMode)
     const gpuTier = gpuTierFor(input)
     const vramGB = host?.vramGB || 0
+    const estimatedProfile = estimateProfile({
+        trusted: memorySource === 'phosmith',
+        cores: Number(input.logicalProcessors) || 0,
+        memoryGB,
+    })
 
     return {
         webgpu: !!input.webgpu,
@@ -127,6 +149,10 @@ export const classifyCapability = (input = {}) => {
         storageBufferLimit: Number(input.storageBufferLimit) || 0,
         gpuPreference: 'high-performance',
         profile,
+        // Best-effort guess for an unverified budget's default; null once
+        // Phosmith supplies a real figure. See resolveBudget for precedence
+        // against the user's own persisted profile-toggle choice.
+        estimatedProfile,
         proxyMax: proxyFor(profile, gpuTier, Number(input.textureLimit) || 0),
         // Segmentation is SlimSAM-only. Kept as a stable diagnostic field for
         // existing host integrations; it is deliberately never eligible.

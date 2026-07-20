@@ -216,6 +216,19 @@
         white-space: nowrap;
     }
     .chip.on { color: var(--accent); border-color: rgba(53, 224, 194, 0.4); }
+    #profile-select {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 2px 22px 2px 10px;
+        background: var(--panel) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6"><path d="M0 0l4 6 4-6z" fill="%23888"/></svg>') no-repeat right 8px center;
+        color: var(--dim);
+        font: inherit;
+        font-size: 12.5px;
+        appearance: none;
+        -webkit-appearance: none;
+        cursor: pointer;
+    }
+    #profile-select:hover { color: var(--text); }
     #loadbar {
         position: absolute;
         left: 0;
@@ -297,6 +310,13 @@
     <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt = exclude · polygon <kbd>Enter</kbd> close</span>
     <span id="chip-mode" class="chip">engine: —</span>
     <span id="chip-device" class="chip">device: —</span>
+    <select id="profile-select" title="Resource profile — Auto picks a safe default from this device's real signals; force a tier if you know better">
+        <option value="auto">Profile: Auto</option>
+        <option value="lite">Profile: Lite</option>
+        <option value="standard">Profile: Standard</option>
+        <option value="pro">Profile: Pro</option>
+        <option value="ultra">Profile: Ultra</option>
+    </select>
     <span id="chip-timing" class="chip">— ms</span>
 </footer>
 

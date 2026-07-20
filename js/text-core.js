@@ -23,7 +23,17 @@ const COLOR_WORDS = new Map([
 ])
 const COLOR_FILLERS = new Set(['color', 'colour', 'colored', 'coloured'])
 
-const depluralize = (w) => (w.length > 3 && w.endsWith('s') && !NEVER_PLURAL.test(w) ? w.slice(0, -1) : w)
+// -ves and mutated plurals that strip-the-s mangles ("leaves" → "leave").
+const IRREGULAR_PLURALS = new Map([
+    ['leaves', 'leaf'], ['wolves', 'wolf'], ['shelves', 'shelf'], ['halves', 'half'],
+    ['loaves', 'loaf'], ['scarves', 'scarf'], ['calves', 'calf'], ['hooves', 'hoof'],
+    ['thieves', 'thief'], ['elves', 'elf'], ['knives', 'knife'], ['wives', 'wife'],
+    ['people', 'person'], ['children', 'child'], ['men', 'man'], ['women', 'woman'],
+    ['mice', 'mouse'], ['geese', 'goose'], ['feet', 'foot'], ['teeth', 'tooth'],
+])
+
+const depluralize = (w) => IRREGULAR_PLURALS.get(w)
+    || (w.length > 3 && w.endsWith('s') && !NEVER_PLURAL.test(w) ? w.slice(0, -1) : w)
 
 /** Raw phrase → detector label(s) + selection intent.
  * "all red zebras" sends both the exact phrase and the object-only fallback.
@@ -52,6 +62,27 @@ export const normalizePhrase = (raw) => {
         multi: COUNT_INTENT.test(clean) || words[words.length - 1] !== head,
         display: clean,
     }
+}
+
+/** CLIP-style templates help OWLv2 rank but hurt Grounding DINO: its grounded
+ *  head scores boxes per token, so "a photo of" lets scene-sized boxes match.
+ *  Strip back to the bare noun phrase for the grounding lane. */
+export const bareLabel = (label) => String(label).toLowerCase().trim()
+    .replace(/^a photo of (a|an|the) /, '').replace(/\.+$/, '')
+
+/** True when a detector filled its top-k cap with a near-uniform score band —
+ *  a collapsed alignment head (seen on q4f16 Grounding DINO on some GPUs).
+ *  Scores carry no ranking signal, so the output is unusable regardless of
+ *  the boxes. */
+export const degenerateScores = (dets, { minCount = 32, minSpread = 0.08 } = {}) => {
+    if (dets.length < minCount) return false
+    let lo = Infinity
+    let hi = -Infinity
+    for (const d of dets) {
+        if (d.score < lo) lo = d.score
+        if (d.score > hi) hi = d.score
+    }
+    return hi - lo < minSpread
 }
 
 /** IoU of two [x0,y0,x1,y1] boxes. */
@@ -201,11 +232,27 @@ export const unletterboxBox = (box, plan, { minOnImage = 0.4 } = {}) => {
     return [cx0 / k, cy0 / k, cx1 / k, cy1 / k]
 }
 
-/** Threshold → NMS → top-K, high score first. `relative` also drops boxes far
- *  below the best match: an open-vocabulary detector can emit low-scoring,
- *  scene-sized guesses alongside real hits, and they outlive a fixed floor. */
+/** Fraction of `inner`'s area covered by `outer`. */
+const containment = (outer, inner) => {
+    const ix = Math.max(0, Math.min(outer[2], inner[2]) - Math.max(outer[0], inner[0]))
+    const iy = Math.max(0, Math.min(outer[3], inner[3]) - Math.max(outer[1], inner[1]))
+    const area = (inner[2] - inner[0]) * (inner[3] - inner[1])
+    return area > 0 ? (ix * iy) / area : 0
+}
+
+/** Drop group boxes. Shown several instances, a detector also emits a box
+ *  around the whole cluster; it survives NMS (low IoU against each member) but
+ *  selects far more than the phrase asked for. A box that mostly contains 2+
+ *  other kept detections is the cluster, not an instance — keep the members. */
+export const pruneContainers = (dets, { cover = 0.7 } = {}) => dets.filter((d) =>
+    dets.filter((m) => m !== d && containment(d.box, m.box) >= cover).length < 2)
+
+/** Threshold → NMS → container prune → top-K, high score first. `relative`
+ *  also drops boxes far below the best match: an open-vocabulary detector can
+ *  emit low-scoring, scene-sized guesses alongside real hits, and they outlive
+ *  a fixed floor. */
 export const rankDetections = (dets, { threshold = 0.15, iou = 0.5, topK = 8, relative = 0 } = {}) => {
     const above = dets.filter((d) => d.score >= threshold)
     const floor = Math.max(threshold, relative * above.reduce((m, d) => Math.max(m, d.score), 0))
-    return nms(above.filter((d) => d.score >= floor), iou).slice(0, topK)
+    return pruneContainers(nms(above.filter((d) => d.score >= floor), iou)).slice(0, topK)
 }

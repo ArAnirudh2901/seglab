@@ -42,6 +42,10 @@ const PRESETS = {
         // SAM encode: dispose:'now''s memory ceiling without its per-search
         // WebGPU rebuild (~13 s here).
         detectorEvictOnEncode: true,
+        // Reclaim the warm session's (unified) GPU memory after this much
+        // quiet time — an idle 151 MB model must not pin an 8 GB host into
+        // swap. A later search pays one rebuild.
+        detectorIdleMs: 45_000,
         // Baseline default: WASM. resolveBudget() promotes this to WebGPU
         // whenever a usable non-fallback adapter is probed (gpuTier != 'none'),
         // since GPU accel is independent of the memory tier. This false is the
@@ -80,6 +84,12 @@ const PRESETS = {
         autoEscalate: true,
         hdExportDecode: true,
         detectorDispose: 'idle',
+        // 'standard' is now reachable by an unverified-memory device (the
+        // profile estimate's ceiling), not only a trusted Phosmith host — so
+        // it gets the same encode-time detector eviction lite has, not just
+        // pro/ultra's assumption of ample headroom.
+        detectorEvictOnEncode: true,
+        detectorIdleMs: 120_000,
         eagerEncode: true,
         cvRefine: true,
         rawDevelop: true,
@@ -109,6 +119,7 @@ const PRESETS = {
         autoEscalate: true,
         hdExportDecode: true,
         detectorDispose: 'idle',
+        detectorIdleMs: 180_000,
         eagerEncode: true,
         cvRefine: true,
         rawDevelop: true,
@@ -138,6 +149,7 @@ const PRESETS = {
         autoEscalate: true,
         hdExportDecode: true,
         detectorDispose: 'idle',
+        detectorIdleMs: 180_000,
         eagerEncode: true,
         cvRefine: true,
         rawDevelop: true,
@@ -158,22 +170,34 @@ export const isMemoryLocked = (probed = null) => {
 
 /**
  * Session budget: preset + capability probe + URL overrides. On a memory-
- * locked device (unverified memory, or no probe yet) the profile is `lite` and
- * URL parameters may only LOWER limits — `?flagship=1`, `?proxy=max`,
- * `?proxy=off`, `?profile=ultra`, `?working=1` are all refused there.
+ * locked device (unverified memory, or no probe yet) the profile is ALWAYS
+ * `lite` by default — `cap.estimatedProfile` (capability.js) is a real-signal
+ * guess surfaced for the UI to suggest, but it is deliberately never applied
+ * on its own: the live test suite's A-phase guarantees (bounded export, one
+ * resident embedding, no OPFS persistence, unsafe-flag lockout) assume every
+ * plain browser gets the same bounded floor regardless of its actual core
+ * count. Only the user's own profile-toggle choice — `override`, a persisted,
+ * deliberate decision, not a URL param a page could set for itself — raises
+ * it, and it may go beyond the estimate's own `standard` ceiling since the
+ * user is vouching for their own device. URL parameters may only LOWER
+ * limits on a locked budget — `?flagship=1`, `?proxy=max`, `?proxy=off`,
+ * `?profile=ultra`, `?working=1` are all refused there.
  * `probed` is the boot capability object or a bare profile string (tests).
  */
-export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null) => {
+export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null, override = null) => {
     const params = new URLSearchParams(search)
     const cap = (probed && typeof probed === 'object') ? probed : null
     const locked = isMemoryLocked(probed)
     const requestedProfile = locked ? null : params.get('profile')
-    const name = locked ? 'lite' : (requestedProfile || (cap ? cap.profile : probed))
+    const manualOverride = locked && override && PRESETS[override] ? override : null
+    const name = locked
+        ? (manualOverride || 'lite')
+        : (requestedProfile || (cap ? cap.profile : probed))
     const budget = { ...(PRESETS[name] || PRESETS.lite) }
     // Adaptive proxy: the probe sizes it to the device. An explicit profile is
     // a developer override and gets that profile's normal proxy instead.
     if (cap && cap.proxyMax && !requestedProfile) {
-        budget.proxyMax = locked ? Math.min(cap.proxyMax, PRESETS.lite.proxyMax) : cap.proxyMax
+        budget.proxyMax = locked ? Math.min(cap.proxyMax, budget.proxyMax) : cap.proxyMax
     }
     if (cap) {
         budget.memoryGB = cap.memoryGB || 0
@@ -192,6 +216,11 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.samWebGPU = cap.gpuTier !== 'none'
     }
     budget.memoryLocked = locked
+    // How `name` was picked — the profile toggle reads this to label its
+    // "Auto" option and to know whether the user has already overridden it.
+    budget.profileSource = locked
+        ? (manualOverride ? 'manual' : 'default')
+        : (cap ? 'trusted' : 'preset')
     if (cap?.memorySource === 'unknown') budget.memoryUncertain = true
 
     const adaptiveProxyMax = budget.proxyMax

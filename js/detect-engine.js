@@ -13,7 +13,8 @@
  *     no GPU, no f16. The ladder degrades here on any accelerated-lane failure.
  */
 import { loadTransformers } from './sam-engine.js'
-import { isVendored } from './model-assets.js'
+import { isVendored, ortWebGpuSupported } from './model-assets.js'
+import { bareLabel, degenerateScores } from './text-core.js'
 
 const DETECTORS = Object.freeze({
     grounding: {
@@ -40,17 +41,18 @@ const normalizeCandidate = (candidate) => Array.isArray(candidate)
 // The accelerated lane downloads Grounding DINO; the fallback lane, OWLv2.
 const laneDetector = ({ accelerated = false } = {}) => (accelerated ? DETECTORS.grounding : DETECTORS.owl)
 
-// Grounding DINO's grounded head keys off dot-terminated lowercase phrases;
-// OWLv2 takes the templates as-is. Format per lane so either can run the same
-// normalizePhrase output.
+// Grounding DINO's grounded head keys off dot-terminated lowercase noun
+// phrases — the CLIP template dilutes it (see bareLabel); OWLv2 takes the
+// templates as-is. Format per lane so either can run the same normalizePhrase
+// output.
 const formatLabels = (labels, detectorId) => (detectorId === 'grounding'
-    ? labels.map((label) => `${String(label).toLowerCase().trim().replace(/\.+$/, '')}.`)
+    ? [...new Set(labels.map((label) => `${bareLabel(label)}.`))]
     : labels)
 
 /** Grounding DINO now runs on transformers.js v4; the accelerated lane is live
- *  wherever the gpuTier gate clears. Callers still show OWLv2's size when it
- *  doesn't. */
-export const acceleratedDetectorAvailable = true
+ *  wherever the gpuTier gate clears AND the ORT build has a WebGPU EP (pre-26
+ *  Safari's doesn't). Callers still show OWLv2's size when it doesn't. */
+export const acceleratedDetectorAvailable = ortWebGpuSupported()
 
 /** First-search download for the UI: the lane the caller's device will use. */
 export const detectorDownloadMB = ({ accelerated = false } = {}) => laneDetector({ accelerated }).downloadMB
@@ -91,15 +93,35 @@ let pipe = null
 let pipePromise = null
 let loadedTag = null // 'device:dtype' that actually built
 let loadedOption = null
-// A session can construct successfully yet still reject a real input (for
-// example when a browser's ORT build cannot execute an exported Gather node).
-// Remember that outcome for this worker so every subsequent phrase goes
-// straight to the fallback instead of failing once per search.
-const inferenceFailures = new Set()
+// A lane can fail at session build (no usable backend for its device) or
+// construct successfully yet still reject a real input (for example when a
+// browser's ORT build cannot execute an exported Gather node). Remember either
+// outcome for this worker so every subsequent phrase goes straight to the
+// fallback instead of failing once per search.
+const laneFailures = new Set()
 
 const optionTag = (option) => `${option.detector}/${option.device}/${option.dtype}`
 
+// Idle TTL: a warm session saves the per-search rebuild, but its weights sit
+// in (unified) GPU memory the whole time. After detectorIdleMs without a
+// search the session is dropped, returning the memory; the next search pays
+// one rebuild. Never fires mid-detect — detect() cancels it on entry.
+let idleTimer = null
+const cancelIdleDispose = () => {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+}
+const scheduleIdleDispose = (ms) => {
+    cancelIdleDispose()
+    if (!(ms > 0) || !pipe) return
+    idleTimer = setTimeout(() => {
+        idleTimer = null
+        console.log(`[seglab] detector idle ${Math.round(ms / 1000)}s — session dropped, memory returned`)
+        disposeDetector()
+    }, ms)
+}
+
 export const disposeDetector = () => {
+    cancelIdleDispose()
     const p = pipe
     pipe = null
     pipePromise = null
@@ -137,6 +159,7 @@ const loadDetector = (candidates, progress_callback) => {
                 return { pipe: p, option }
             } catch (err) {
                 lastErr = err
+                laneFailures.add(optionTag(option))
                 console.warn(`[seglab] ${detector.label} ${option.device}/${option.dtype} unavailable:`, String(err?.message).slice(0, 120))
             }
         }
@@ -154,9 +177,11 @@ const loadDetector = (candidates, progress_callback) => {
  * detections whose boxes are normalized [0,1] against that square, for the
  * caller to un-letterbox: [{ box:[x0,y0,x1,y1], score, label }].
  * `candidates` is the [device,dtype] fallback ladder; `dispose` frees the
- * session after (Lite one-heavy policy).
+ * session after (Lite one-heavy policy); `idleMs` frees it after that much
+ * quiet time instead (0 = keep warm until the next encode evicts it).
  */
-export const detect = async ({ frame, labels, threshold = 0.05, candidates, progress_callback, dispose = false }) => {
+export const detect = async ({ frame, labels, threshold = 0.05, candidates, progress_callback, dispose = false, idleMs = 0 }) => {
+    cancelIdleDispose()
     const T = await loadTransformers()
     // 3-channel and already at the model's exact input size, so rgb(), resize()
     // and pad() inside transformers.js are all no-ops: the frame is never copied
@@ -165,7 +190,7 @@ export const detect = async ({ frame, labels, threshold = 0.05, candidates, prog
     const requested = (candidates || []).map(normalizeCandidate)
     // Keep the configured order, but don't retry a model that already proved
     // incompatible with this browser's ONNX Runtime during this worker life.
-    let remaining = requested.filter((option) => !inferenceFailures.has(optionTag(option)))
+    let remaining = requested.filter((option) => !laneFailures.has(optionTag(option)))
     if (remaining.length === 0) remaining = requested
     let lastErr
     try {
@@ -183,11 +208,17 @@ export const detect = async ({ frame, labels, threshold = 0.05, candidates, prog
                     score: o.score,
                     label: o.label,
                 }))
+                // A lane can run yet return garbage: q4f16 grounding on some
+                // GPUs fills top_k with a flat score band, so ranking picks
+                // arbitrary boxes. Demote to the next lane while one exists.
+                if (degenerateScores(dets) && remaining.length > 1) {
+                    throw new Error(`degenerate score distribution (${dets.length} boxes, flat scores)`)
+                }
                 return { dets, backend: loadedTag }
             } catch (err) {
                 lastErr = err
                 const failed = optionTag(option)
-                inferenceFailures.add(failed)
+                laneFailures.add(failed)
                 console.warn(`[seglab] ${detectorFor(option.detector).label} inference failed; falling back:`, String(err?.message || err).slice(0, 160))
                 disposeDetector()
                 remaining = remaining.filter((candidate) => optionTag(candidate) !== failed)
@@ -198,5 +229,6 @@ export const detect = async ({ frame, labels, threshold = 0.05, candidates, prog
         // Lite intentionally owns no detector session after a query, including
         // a failed query. A rejected GPU allocation must not pin the next one.
         if (dispose) disposeDetector()
+        else scheduleIdleDispose(idleMs)
     }
 }

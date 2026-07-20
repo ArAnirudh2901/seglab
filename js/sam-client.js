@@ -18,6 +18,9 @@ import { enqueueHeavy, cancelHeavyBefore, STALE } from './heavy-job-queue.js'
 
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
+// First text search may build a ~163 MB detector session and run its first
+// wasm inference in one call — minutes on a weak machine, not a hang.
+const DETECT_TIMEOUT_MS = 6 * 60 * 1000
 
 const withTimeout = (promise, ms, label) =>
     new Promise((resolve, reject) => {
@@ -30,6 +33,7 @@ const withTimeout = (promise, ms, label) =>
 
 export const clientState = {
     device: null,   // 'webgpu' | 'wasm' once known (as reported by the engine)
+    gpuInfo: null,  // { vendor, architecture, … } of the adapter actually in use
     mode: null,     // 'worker' | 'inline' once decided
     lane: null,     // 'slimsam' — the only interactive segmentation lane
     ready: false,
@@ -198,6 +202,7 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
             threshold: payload.threshold,
             candidates,
             dispose: engine.getBudget().detectorDispose === 'now',
+            idleMs: engine.getBudget().detectorIdleMs || 0,
             progress_callback: (info) => onEngineEvent({ type: 'progress', detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total } }),
         }), timeoutMs, label)
     }
@@ -219,6 +224,7 @@ const applyWarmState = (engineState) => {
     }
     trace('warm-ready', engineState)
     clientState.device = engineState?.device || clientState.device
+    clientState.gpuInfo = engineState?.gpuInfo || clientState.gpuInfo
     clientState.lane = engineState?.lane || clientState.lane
     clientState.ready = true
     emit({ type: 'state' })
@@ -390,7 +396,7 @@ export const hdExport = async (payload, transfer) => {
 export const detectText = async (frame, labels, { threshold = 0.05, revision = null } = {}) => {
     const result = await enqueueHeavy(
         'detect',
-        () => call('detect', { frame, labels, threshold }, [frame.data.buffer], INFER_TIMEOUT_MS, 'Text detection'),
+        () => call('detect', { frame, labels, threshold }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'Text detection'),
         { priority: 'normal', revision },
     )
     if (result === STALE) return { dets: [], backend: null, stale: true }

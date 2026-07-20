@@ -79,7 +79,7 @@ self.onmessage = async (event) => {
             if (candidates.some((candidate) => candidate.detector === 'grounding')) releaseDocument()
             const progress_callback = (info) => self.postMessage({
                 type: 'progress',
-                detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total },
+                detail: { lane: 'text', name: info?.name, status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total },
             })
             const res = await detect({
                 frame: payload.frame,
@@ -87,6 +87,7 @@ self.onmessage = async (event) => {
                 threshold: payload.threshold,
                 candidates,
                 dispose: getBudget().detectorDispose === 'now',
+                idleMs: getBudget().detectorIdleMs || 0,
                 progress_callback,
             })
             self.postMessage({ id, ok: true, result: res })

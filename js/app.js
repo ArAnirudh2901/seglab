@@ -27,17 +27,31 @@ import { acceleratedDetectorAvailable, detectorCached, detectorDownloadMB } from
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
 import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-client.js'
 
+// The user's own persisted profile choice — a deliberate decision, so it is
+// honored even on a memory-locked device (unlike a URL param, which a page
+// could set on its own behalf). 'auto' defers to resolveBudget's estimate.
+const PROFILE_OVERRIDE_KEY = 'seglab.profileOverride'
+const VALID_PROFILES = new Set(['lite', 'standard', 'pro', 'ultra'])
+const readProfileOverride = () => {
+    try {
+        const v = localStorage.getItem(PROFILE_OVERRIDE_KEY)
+        return VALID_PROFILES.has(v) ? v : null
+    } catch { return null }
+}
+let profileOverride = readProfileOverride()
+
 // Session budget: profile preset + URL overrides. The provisional budget is
 // LITE — nothing above it can be proven before the capability probe, and a
-// plain browser stays lite forever (only a trusted Phosmith hint raises it).
-let BUDGET = resolveBudget()
+// plain browser stays lite forever unless a trusted Phosmith hint or the
+// user's own profile toggle raises it.
+let BUDGET = resolveBudget(location.search, null, profileOverride)
 let capability = null
 let pendingPhosmithResources = null
 const bootProbe = probeCapability().then((cap) => {
     capability = pendingPhosmithResources
         ? withPhosmithResources(cap, pendingPhosmithResources)
         : cap
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability), BUDGET.pressureLevel || 0)
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride), BUDGET.pressureLevel || 0)
     refreshChips()
     return cap
 }).catch((err) => {
@@ -66,6 +80,7 @@ const els = {
     status: $('status'), loadbar: $('loadbar'),
     prep: $('prep'), prepText: $('prep-text'),
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipTiming: $('chip-timing'),
+    profileSelect: $('profile-select'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
     signtoggle: $('signtoggle'), textinput: $('textinput'), selectall: $('selectall'),
     toleranceWrap: $('tolerance-wrap'), tolerance: $('tolerance'), toleranceValue: $('tolerance-value'),
@@ -93,6 +108,7 @@ const state = {
     wandTolerance: 36,
     textCandidates: [],       // [{ box, score, label }] proxy coords, from the detector
     textMulti: false,         // phrase implied "all/every"
+    textBackend: null,        // 'detector:device:dtype' that actually ran the last search
     mask: null,               // DERIVED: baseMask ∪ liveMask — the composed selection
     maskRaw: null,            // baseMask ∪ live raw decoder mask (E toggle)
     showRaw: false,
@@ -145,7 +161,10 @@ const setStatus = (msg) => { els.status.textContent = msg }
 
 const refreshChips = () => {
     const lane = clientState.lane ? ` · ${clientState.lane}` : ''
-    els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}`
+    // 'grounding:webgpu:q4f16' → 'text: grounding/webgpu'; drop the dtype,
+    // it's noise here. Only shown once a text search has actually run.
+    const textLane = state.textBackend ? ` · text: ${state.textBackend.split(':').slice(0, 2).join('/')}` : ''
+    els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}${textLane}`
     const profile = BUDGET.profile || 'standard'
     const gpu = capability?.gpuTier || 'probing'
     // Only a trusted host budget is shown as a memory figure; a browser's
@@ -153,7 +172,12 @@ const refreshChips = () => {
     const memory = (capability?.memorySource === 'phosmith' && capability.memoryGB)
         ? ` · ${capability.memoryGB} GB host`
         : ''
-    els.chipDevice.textContent = `device: ${clientState.device || '—'} · ${profile} · ${gpu}${memory}`
+    // Vendor comes from the adapter we actually run on (engine gpuInfo), so
+    // "webgpu (nvidia)" can never label a session that silently fell to WASM.
+    const vendor = clientState.device === 'webgpu' && clientState.gpuInfo?.vendor
+        ? ` (${clientState.gpuInfo.vendor})`
+        : ''
+    els.chipDevice.textContent = `device: ${clientState.device || '—'}${vendor} · ${profile} · ${gpu}${memory}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
     const run = clientState.lastRun
     els.chipTiming.textContent = run
@@ -161,7 +185,21 @@ const refreshChips = () => {
             ? `encode ${run.encodeMs}ms · decode ${run.decodeMs}ms · post ${run.postMs}ms`
             : `decode ${run.decodeMs}ms · post ${run.postMs}ms (cached)`)
         : '— ms'
+    if (els.profileSelect) {
+        els.profileSelect.value = profileOverride || 'auto'
+        const autoOpt = els.profileSelect.querySelector('option[value="auto"]')
+        if (autoOpt) autoOpt.textContent = `Profile: Auto (${profile})`
+        // The estimate is real signal (CPU core count), but it's a guess, not
+        // a verified figure — it's surfaced as a suggestion, never applied on
+        // its own, so every plain browser keeps the same bounded lite floor.
+        const est = capability?.estimatedProfile
+        els.profileSelect.title = (est && est !== profile && !profileOverride)
+            ? `This device's core count suggests it could handle "${est}" — pick it here to try it (you can always switch back)`
+            : 'Resource profile — Auto stays on the safe bounded default; force a tier if you know this device can take it'
+    }
 }
+
+const PROFILE_RANK = { lite: 0, standard: 1, pro: 2, ultra: 3 }
 
 /** A Phosmith WebView can tighten or expand its usable-memory budget after the
  * editor has loaded. Existing image/model allocations are never enlarged in
@@ -174,12 +212,11 @@ const applyPhosmithResources = (resources = readPhosmithResources()) => {
     const previous = capability
     capability = withPhosmithResources(capability, resources)
     // Pressure is a one-way ratchet: a live budget update never resets it.
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability), BUDGET.pressureLevel || 0)
-    const profileRank = { lite: 0, standard: 1, pro: 2, ultra: 3 }
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride), BUDGET.pressureLevel || 0)
     const memoryReduced = previous.memoryGB > 0 && capability.memoryGB > 0
         && capability.memoryGB < previous.memoryGB
     const needsHeavyRelease = memoryReduced
-        || (profileRank[capability.profile] || 0) < (profileRank[previous.profile] || 0)
+        || (PROFILE_RANK[capability.profile] || 0) < (PROFILE_RANK[previous.profile] || 0)
     // A host downgrade is a real resource event, not only a UI-label change:
     // immediately release reloadable residents before the next allocation.
     if (needsHeavyRelease) relievePressure(3).catch(() => {})
@@ -195,13 +232,43 @@ window.addEventListener('phosmithresourceschange', (event) => {
     applyPhosmithResources(event.detail ?? readPhosmithResources())
 })
 
+/** The profile toggle: a deliberate, persisted user choice. 'auto' clears the
+ *  override and returns to resolveBudget's estimate; any named tier forces it,
+ *  including above the estimate's own 'standard' ceiling — the user is
+ *  vouching for their own device here, not a page claiming it for itself. */
+const setProfileOverride = (value) => {
+    const next = VALID_PROFILES.has(value) ? value : null
+    profileOverride = next
+    try {
+        if (next) localStorage.setItem(PROFILE_OVERRIDE_KEY, next)
+        else localStorage.removeItem(PROFILE_OVERRIDE_KEY)
+    } catch { /* private browsing / storage disabled — override stays in-memory only */ }
+    const previousProfile = BUDGET.profile
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride), BUDGET.pressureLevel || 0)
+    const needsHeavyRelease = (PROFILE_RANK[BUDGET.profile] || 0) < (PROFILE_RANK[previousProfile] || 0)
+    if (needsHeavyRelease) relievePressure(3).catch(() => {})
+    refreshChips()
+    if (state.hasImage) {
+        const suffix = needsHeavyRelease ? '; heavy GPU residents released' : ''
+        setStatus(`Resource budget updated — ${BUDGET.profile} profile applies to the next import/export${suffix}`)
+    }
+}
+
+els.profileSelect?.addEventListener('change', (e) => {
+    setProfileOverride(e.target.value === 'auto' ? null : e.target.value)
+})
+
 subscribe((event) => {
     if (event.type === 'progress') {
         const d = event.detail || {}
         if (d.status === 'progress' && d.total) {
             const pct = Math.round((d.loaded / d.total) * 100)
             els.loadbar.style.width = `${pct}%`
-            setStatus(`Downloading SlimSAM — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~14 MB)`)
+            // Progress can be SlimSAM or a text detector — name what's pulling.
+            const model = /grounding/i.test(d.name) ? 'Grounding DINO'
+                : /owl/i.test(d.name) ? 'OWLv2 detector' : 'SlimSAM'
+            const mb = Math.max(1, Math.round(d.total / 1e6))
+            setStatus(`Downloading ${model} — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~${mb} MB)`)
         } else if (d.status === 'done') {
             els.loadbar.style.width = '0%'
         }
@@ -1488,10 +1555,19 @@ async function runDetect(phrase) {
     try {
         const res = await detectCandidates(phrase)
         if (revision !== state.revision) return // superseded by newer input
+        state.textBackend = res?.backend || null
+        // `accelerated` names the lane the ladder was OFFERED; a returned
+        // backend that isn't grounding means this search (or an earlier one
+        // this session) hit a build/inference failure and demoted — see the
+        // laneFailures sticky-fallback in detect-engine.js. Surfaced once here
+        // instead of only in the console, so "why is this OWLv2" has an answer.
+        const fellBack = accelerated && state.textBackend && !state.textBackend.startsWith('grounding')
+        const fallbackNote = fellBack ? ' · Grounding DINO unavailable this session, using OWLv2' : ''
+        refreshChips()
         if (!res || res.candidates.length === 0) {
             state.textCandidates = []
             els.selectall.hidden = true
-            setStatus(`No matches for “${phrase.trim()}”. Try different words.`)
+            setStatus(`No matches for “${phrase.trim()}”. Try different words.${fallbackNote}`)
             renderOverlay()
             return
         }
@@ -1501,11 +1577,11 @@ async function runDetect(phrase) {
         const n = res.candidates.length
         // Singular phrase, one object: select it outright — no tap needed.
         if (!res.multi && n === 1) {
-            setStatus(`Selecting “${phrase.trim()}”…`)
+            setStatus(`Selecting “${phrase.trim()}”…${fallbackNote}`)
             selectCandidate(0)
             return
         }
-        setStatus(`${n} match${n > 1 ? `es — tap one or Select all` : ' — tap it'}`)
+        setStatus(`${n} match${n > 1 ? `es — tap one or Select all` : ' — tap it'}${fallbackNote}`)
         renderOverlay()
     } catch (err) {
         if (revision !== state.revision) return

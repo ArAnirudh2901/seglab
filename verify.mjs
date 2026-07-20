@@ -24,7 +24,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  collapseToObject, colorEvidenceForBox, DETECTOR_INPUT, letterboxPlan, normalizePhrase, nms, rankDetections, scaleBox, unletterboxBox,
+  bareLabel, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, unletterboxBox,
 } from './js/text-core.js'
 import { classifyCapability } from './js/capability.js'
 import { refineMaskEdges } from './js/edge-refine.js'
@@ -161,6 +161,44 @@ try {
     tightRed === 1 && broadScene > 0 && broadScene < tightRed,
     `tight=${tightRed.toFixed(2)} broad=${broadScene.toFixed(2)}`,
   )
+  const irregular = normalizePhrase('leaves')
+  check(
+    'text-core: irregular plurals depluralize to the real noun ("leaves" → leaf)',
+    irregular.labels[0] === 'a photo of a leaf' && irregular.multi === true
+      && normalizePhrase('all people').core === 'person',
+    `${irregular.labels[0]} multi=${irregular.multi}`,
+  )
+  check(
+    'text-core: grounding lane strips the CLIP template to the bare phrase',
+    bareLabel('a photo of a leaf') === 'leaf' && bareLabel('a photo of a red car.') === 'red car',
+    `"${bareLabel('a photo of a leaf')}" / "${bareLabel('a photo of a red car.')}"`,
+  )
+  // A cluster-sized box around two real instances is a group guess, not a
+  // match; a box containing only one other stays (could be the real object).
+  const grouped = rankDetections([
+    { box: [0, 0, 500, 500], score: 0.5 }, // container around both leaves
+    { box: [40, 40, 200, 200], score: 0.45 },
+    { box: [260, 260, 460, 460], score: 0.4 },
+  ], { threshold: 0.15, iou: 0.5, topK: 8 })
+  const lone = pruneContainers([
+    { box: [0, 0, 500, 500], score: 0.5 },
+    { box: [40, 40, 200, 200], score: 0.45 },
+  ])
+  check(
+    'text-core: group box around several matches is pruned, members kept',
+    grouped.length === 2 && grouped.every((d) => d.box[2] <= 460) && lone.length === 2,
+    `grouped kept ${grouped.length}, single containment kept ${lone.length}`,
+  )
+  // A collapsed q4f16 head fills top_k with a flat ~0.6 band; a healthy result
+  // has spread (or few boxes) and must never be flagged.
+  const flatBand = Array.from({ length: 64 }, (_, i) => ({ box: [i, 0, i + 1, 1], score: 0.59 + (i % 10) * 0.002 }))
+  const healthy = Array.from({ length: 64 }, (_, i) => ({ box: [i, 0, i + 1, 1], score: 0.05 + i * 0.01 }))
+  check(
+    'text-core: flat top-k score band is degenerate; spread or sparse output is not',
+    degenerateScores(flatBand) === true && degenerateScores(healthy) === false
+      && degenerateScores(flatBand.slice(0, 8)) === false,
+    `flat=${degenerateScores(flatBand)} healthy=${degenerateScores(healthy)}`,
+  )
   const deduped = nms([
     { box: [0, 0, 100, 100], score: 0.9 },
     { box: [5, 5, 105, 105], score: 0.8 },
@@ -271,7 +309,8 @@ try {
       && liteDefault.hdExportDecode === false && liteDefault.eagerEncode === true
       && liteDefault.embedPersist === false && liteDefault.exportMaxSide === 4096
       && liteDefault.exportMaxMP === 8 && liteDefault.cropMaxSide === 1280
-      && liteDefault.detectorDispose === 'idle' && liteDefault.detectorEvictOnEncode === true,
+      && liteDefault.detectorDispose === 'idle' && liteDefault.detectorEvictOnEncode === true
+      && liteDefault.detectorIdleMs === 45_000,
     JSON.stringify(liteDefault),
   )
   const liteNoGpu = resolveBudget('', classifyCapability({ webgpu: false, browserMemoryGB: 8 }))
@@ -282,6 +321,50 @@ try {
       && liteNoGpu.samWebGPU === false && liteFallbackGpu.samWebGPU === false
       && resolveBudget('?force=wasm', browserEightGB).forceWasm === true,
     JSON.stringify({ liteGpu: liteDefault.samWebGPU, liteNoGpu: liteNoGpu.samWebGPU, liteFallback: liteFallbackGpu.samWebGPU }),
+  )
+  /* ── Policy: profile estimate + manual toggle (real signals, never a URL param) ── */
+  const eightCoreBrowser = classifyCapability({ ...gpu, browserMemoryGB: 8, logicalProcessors: 8 })
+  const eightCoreLowMem = classifyCapability({ ...gpu, browserMemoryGB: 4, logicalProcessors: 8 })
+  const fourCoreBrowser = classifyCapability({ ...gpu, browserMemoryGB: 8, logicalProcessors: 4 })
+  check(
+    'capability: estimatedProfile reads real core count, capped at standard — never phosmith-free pro/ultra',
+    eightCoreBrowser.estimatedProfile === 'standard' && eightCoreBrowser.profile === 'lite'
+      && eightCoreLowMem.estimatedProfile === 'lite' // a real sub-8 reading demotes even with 8 cores
+      && fourCoreBrowser.estimatedProfile === 'lite'
+      && phosmith16GB.estimatedProfile === null, // trusted budgets already have a verified figure
+    JSON.stringify({
+      eightCore: eightCoreBrowser.estimatedProfile, lowMem: eightCoreLowMem.estimatedProfile,
+      fourCore: fourCoreBrowser.estimatedProfile, phosmith: phosmith16GB.estimatedProfile,
+    }),
+  )
+  const autoWithEstimate = resolveBudget('', eightCoreBrowser) // capable device, no override yet
+  const autoNoSignal = resolveBudget('', browserEightGB) // no cores probed — same as liteDefault
+  const manualLite = resolveBudget('', eightCoreBrowser, 'lite')
+  const manualStandard = resolveBudget('', eightCoreBrowser, 'standard')
+  const manualUltra = resolveBudget('', unknownMemory, 'ultra')
+  const overrideIgnoredWhenTrusted = resolveBudget('', phosmith16GB, 'lite')
+  check(
+    'policy: the memory-trust lock defaults to lite regardless of the estimate; only the profile toggle can raise it',
+    autoWithEstimate.profile === 'lite' && autoWithEstimate.memoryLocked === true
+      && autoWithEstimate.profileSource === 'default'
+      && autoNoSignal.profile === 'lite' && autoNoSignal.profileSource === 'default'
+      && manualLite.profile === 'lite' && manualLite.profileSource === 'manual'
+      && manualStandard.profile === 'standard' && manualStandard.profileSource === 'manual'
+      && manualStandard.memoryLocked === true
+      // The toggle is the user vouching for their own device, so it can reach
+      // beyond the estimate's own standard ceiling — unlike a URL param.
+      && manualUltra.profile === 'ultra' && manualUltra.memoryLocked === true
+      // A trusted Phosmith figure is real; the toggle does not apply there.
+      && overrideIgnoredWhenTrusted.profile === 'pro' && overrideIgnoredWhenTrusted.profileSource === 'trusted',
+    JSON.stringify({
+      auto: autoWithEstimate.profile, noSignal: autoNoSignal.profile, manualLite: manualLite.profile,
+      manualStandard: manualStandard.profile, manualUltra: manualUltra.profile, trusted: overrideIgnoredWhenTrusted.profile,
+    }),
+  )
+  check(
+    'policy: standard reached via the profile toggle also evicts the detector before an encode',
+    manualStandard.detectorEvictOnEncode === true && manualStandard.detectorIdleMs === 120_000,
+    JSON.stringify({ evict: manualStandard.detectorEvictOnEncode, idleMs: manualStandard.detectorIdleMs }),
   )
   const flagged = resolveBudget('?flagship=1', browserEightGB)
   const ultraReq = resolveBudget('?profile=ultra', browserEightGB)
@@ -541,6 +624,14 @@ try {
         && /next\.samWebGPU = false/.test(sources['policy.js']),
       'pickDevice honors samWebGPU; a probed GPU sets it, the pressure ratchet clears it',
     )
+    check(
+      'static: most-powerful-wins arbitration — slow GPU gets one CPU trial, faster side keeps the session',
+      /GPU_SUSPECT_ENCODE_MS/.test(sources['sam-engine.js'])
+        && /recordEncodePerf\(/.test(sources['sam-engine.js'])
+        && /applyPerfArbitration\(\)/.test(sources['sam-engine.js'])
+        && /requestDevice\(\)/.test(sources['sam-engine.js']),
+      'encode timing recorded per device; adapter smoke-tested before webgpu is claimed',
+    )
     const assetGetImageData = (sources['asset-store.js'].match(/getImageData\(/g) || []).length
     check(
       'static: asset-store reads back only the 16×16 hash canvas, never a full frame',
@@ -686,14 +777,18 @@ try {
   const engEager = await page.evaluate(() => window.__seglab.engineState())
   const chipDevice = await page.evaluate(() => document.getElementById('chip-device')?.textContent || '')
   check(
-    'lite: bounded eager encode lands before the first selection (one embedding, wasm lane)',
-    eager && eager.stale !== true && engEager.cachedImages === 1 && engEager.device === 'wasm',
+    'lite: bounded eager encode lands before the first selection (one embedding)',
+    eager && eager.stale !== true && engEager.cachedImages === 1,
     JSON.stringify({ eager, cached: engEager?.cachedImages, device: engEager?.device }),
   )
+  // Chrome ≥149 headless ships a real hardware adapter, so the probe may
+  // legitimately land on webgpu; the contract is honesty — the chip reports
+  // whichever lane actually runs (policy: a probed GPU is always allowed).
   check(
-    'lite: SAM runs on wasm here (headless has no usable GPU) and the chip reports it honestly',
-    engEager.device === 'wasm' && /device: wasm/.test(chipDevice),
-    `chip="${chipDevice}"`,
+    'lite: SAM device is the probed lane and the chip reports it honestly',
+    (engEager.device === 'wasm' || engEager.device === 'webgpu')
+      && chipDevice.includes(`device: ${engEager.device}`),
+    `device=${engEager.device} chip="${chipDevice}"`,
   )
 
   const geo = await page.evaluate(() => window.__seglab.demoGeometry())
