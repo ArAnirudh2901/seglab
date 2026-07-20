@@ -52,12 +52,6 @@ const PROGRESS_THROTTLE_MS = 120
 // it no longer permanently demotes the session — only this many consecutive
 // failures do. A successful GPU segment resets the counter.
 const WEBGPU_FAILURE_LIMIT = 2
-// "Most powerful wins" arbitration: a healthy GPU encodes SlimSAM's 1024px
-// input in well under a second; even weak iGPUs stay in low seconds. A GPU
-// encode slower than this is likely losing to the CPU (broken driver, ancient
-// iGPU next to a strong many-core CPU), so we run ONE bounded WASM trial and
-// keep whichever device measured faster. At most two device switches, ever.
-const GPU_SUSPECT_ENCODE_MS = 8000
 
 const withTimeout = (promise, ms, label) =>
     new Promise((resolve, reject) => {
@@ -85,10 +79,6 @@ const state = {
     forcedWasm: false,       // sticky downgrade after repeated WebGPU failures
     webgpuFailures: 0,       // consecutive WebGPU runtime failures (reset on success)
     gpuInfo: null,           // adapter.info of the GPU we actually run on
-    perf: { webgpu: 0, wasm: 0 }, // best fresh-encode ms per device (0 = unmeasured)
-    perfSwitch: null,        // device to rebuild onto before the next job
-    cpuTrialDone: false,     // the one bounded CPU trial has been spent
-    perfSettled: false,      // arbitration verdict reached; stop comparing
     ready: false,            // SlimSAM serving
     obsoleteBefore: 0,       // jobs with revision < this must not commit (cancel op)
     budget: { ...DEFAULT_BUDGET },
@@ -167,7 +157,6 @@ export const getEngineState = () => ({
     device: state.device,
     forcedWasm: state.forcedWasm,
     gpuInfo: state.gpuInfo,
-    perf: { ...state.perf },
     ready: state.ready,
     lane: LANES[activeLaneKey()].label,
     profile: state.budget.profile,
@@ -383,13 +372,11 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false, p
     }
 
     const inputs = await bundle.processor(image)
-    const encStart = Date.now()
     const embeddings = await withTimeout(
         bundle.model.get_image_embeddings({ pixel_values: inputs.pixel_values }),
         INFER_TIMEOUT_MS,
         'image encode',
     )
-    recordEncodePerf(Date.now() - encStart)
     const entry = {
         embeddings,
         original_sizes: inputs.original_sizes,
@@ -631,45 +618,6 @@ const segmentOnce = async (req) => {
 }
 
 /**
- * "Most powerful wins": record each fresh-encode duration for the device it
- * ran on. A suspiciously slow GPU triggers exactly one CPU trial; whichever
- * side measured faster keeps the session. Same-document re-encode keeps the
- * two measurements comparable.
- */
-const recordEncodePerf = (ms) => {
-    const dev = state.device
-    if (dev !== 'webgpu' && dev !== 'wasm') return
-    state.perf[dev] = state.perf[dev] ? Math.min(state.perf[dev], ms) : ms
-    if (state.perfSettled || state.forcedWasm || state.budget.forceWasm) return
-    if (dev === 'webgpu' && ms >= GPU_SUSPECT_ENCODE_MS && !state.cpuTrialDone) {
-        state.cpuTrialDone = true
-        state.perfSwitch = 'wasm'
-        trace('perf-suspect-gpu', { encodeMs: ms, limit: GPU_SUSPECT_ENCODE_MS })
-    } else if (dev === 'wasm' && state.cpuTrialDone && state.perf.webgpu) {
-        state.perfSettled = true
-        const gpuWins = state.perf.webgpu < state.perf.wasm
-        if (gpuWins) state.perfSwitch = 'webgpu' // GPU was slow; CPU slower still
-        trace('perf-verdict', { webgpuMs: state.perf.webgpu, wasmMs: state.perf.wasm, winner: gpuWins ? 'webgpu' : 'wasm' })
-    }
-}
-
-/** Apply a pending arbitration switch between jobs: rebuild the bundle on the
- *  target device. The dropped embedding re-encodes there — that re-encode IS
- *  the trial measurement. */
-const applyPerfArbitration = () => {
-    if (!state.perfSwitch) return
-    const target = state.perfSwitch
-    state.perfSwitch = null
-    // Memory pressure / policy can revoke the GPU while a switch is pending.
-    if (target === 'webgpu' && (state.budget.samWebGPU !== true || state.forcedWasm)) return
-    trace('perf-switch', { to: target, perf: { ...state.perf } })
-    state.device = target
-    state.ready = false
-    discardBundle()
-    releaseDocument()
-}
-
-/**
  * Segment with a single safe retry path: a WebGPU failure falls back to
  * SlimSAM on WASM after dropping the poisoned session and embedding.
  *
@@ -683,7 +631,6 @@ export const segment = async (req) => {
     if (req.budget && !state.ready) state.budget = { ...DEFAULT_BUDGET, ...req.budget }
     const laneKey = activeLaneKey()
     trace('segment-route', { laneKey, revision: req.revision })
-    applyPerfArbitration()
     try {
         const result = await serialize(() => segmentOnce({ ...req, lane: laneKey }))
         if (state.device === 'webgpu') state.webgpuFailures = 0 // healthy GPU run
@@ -722,7 +669,6 @@ export const segment = async (req) => {
  * released, so a real selection never waits behind a disk write.
  */
 export const encodeImage = async (req) => {
-    applyPerfArbitration() // trial runs on the prewarm encode, invisible to a click
     const prepared = await serialize(async () => {
         if (isStale(req)) return { stale: true }
         const laneKey = 'draft'

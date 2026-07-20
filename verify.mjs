@@ -625,12 +625,17 @@ try {
       'pickDevice honors samWebGPU; a probed GPU sets it, the pressure ratchet clears it',
     )
     check(
-      'static: most-powerful-wins arbitration — slow GPU gets one CPU trial, faster side keeps the session',
-      /GPU_SUSPECT_ENCODE_MS/.test(sources['sam-engine.js'])
-        && /recordEncodePerf\(/.test(sources['sam-engine.js'])
-        && /applyPerfArbitration\(\)/.test(sources['sam-engine.js'])
-        && /requestDevice\(\)/.test(sources['sam-engine.js']),
-      'encode timing recorded per device; adapter smoke-tested before webgpu is claimed',
+      // Memory lesson (measured): SlimSAM on WASM holds a ~3 GB ORT heap that
+      // never shrinks; on WebGPU it settles at ~0.5 GB. A working GPU must
+      // therefore NEVER be demoted to WASM for being slow — only a runtime
+      // FAILURE ladder (WEBGPU_FAILURE_LIMIT) may fall back. No speed/perf
+      // arbitration may reintroduce an encode-time device switch.
+      'static: a working WebGPU session is never demoted to WASM for speed — only repeated runtime failures fall back',
+      !/GPU_SUSPECT_ENCODE_MS|recordEncodePerf|applyPerfArbitration|perfSwitch/.test(sources['sam-engine.js'])
+        && /WEBGPU_FAILURE_LIMIT/.test(sources['sam-engine.js'])
+        && /state\.webgpuFailures \+= 1/.test(sources['sam-engine.js'])
+        && /requestDevice\(\)/.test(sources['sam-engine.js']), // adapter still smoke-tested before webgpu is claimed
+      'no perf-based device switch; WASM fallback is failure-gated only',
     )
     const assetGetImageData = (sources['asset-store.js'].match(/getImageData\(/g) || []).length
     check(
