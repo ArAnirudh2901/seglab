@@ -77,7 +77,7 @@ const $ = (id) => document.getElementById(id)
 const els = {
     main: $('main'), dropzone: $('dropzone'), stage: $('stage'),
     photo: $('photo'), view: $('view'), overlay: $('overlay'), file: $('file'),
-    pick: $('pick'), demo: $('demo'), newimg: $('newimg'),
+    pick: $('pick'), newimg: $('newimg'),
     status: $('status'), loadbar: $('loadbar'),
     prep: $('prep'), prepText: $('prep-text'),
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipTiming: $('chip-timing'),
@@ -518,8 +518,11 @@ const loadFile = async (file) => {
     }
 }
 
-// Canonical demo geometry in a 900×620 logical space (the known answers the
-// headless verify asserts against): big disc, rounded square, MINUTE dot.
+// TEST-ONLY synthetic fixture. The user-facing demo button was removed; this
+// canonical geometry in a 900×620 logical space (big disc, rounded square,
+// MINUTE dot) is reached ONLY through the window.__seglab.loadDemo* hooks, which
+// give verify.mjs deterministic, known-answer geometry a real photo cannot. It
+// never renders in the app.
 const DEMO = {
     baseW: 900,
     baseH: 620,
@@ -565,7 +568,6 @@ els.file.addEventListener('change', () => {
     els.file.value = ''
     loadFile(file)
 })
-els.demo.addEventListener('click', () => queueImage(buildDemoScene()))
 els.newimg.addEventListener('click', () => {
     beginImageRequest() // invalidate a queued file/idle encode before cleanup
     clearHeavyQueue()
