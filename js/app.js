@@ -371,6 +371,13 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
         const lite = BUDGET.profile === 'lite'
         const calm = await waitForCalm(lite ? { frames: 16, maxWaitMs: 10000 } : { frames: 12, maxWaitMs: 6000 })
         if (!current()) return null
+        // The governor may have shed between scheduling and now: a speculative
+        // encode on a host already under memory pressure is exactly the peak the
+        // ratchet is trying to avoid, so defer to the (user-initiated) first click.
+        if ((BUDGET.pressureLevel || 0) > 0) {
+            state.encodePending = true
+            return null
+        }
         if (!calm) {
             state.encodePending = true
             console.warn('[seglab] idle encode deferred — device did not settle after model warm')

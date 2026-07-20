@@ -14,9 +14,17 @@ export work with the network physically cut.
 ```bash
 cd ~/seglab
 bun run models       # one-time: vendors ~90 MB (transformers.js, ORT wasm, SlimSAM)
-bun run dev          # any static server works; this is python3 -m http.server
+bun run dev          # node static server that sets COOP/COEP (cross-origin isolation)
 # open http://127.0.0.1:8788
 ```
+
+`bun run dev` sends `Cross-Origin-Opener-Policy: same-origin` +
+`Cross-Origin-Embedder-Policy: require-corp` so the page is **cross-origin
+isolated**. That unlocks *threaded* WASM inference (SharedArrayBuffer) and
+`performance.measureUserAgentSpecificMemory()` — the real signal the memory
+governor watches. A plain static host works too, but must send those headers
+(`vercel.json` / `_headers` are included; `sw.js` re-tags the cross-origin CDN
+model fallback with CORP so it still loads under isolation).
 
 `bun run models` is what makes the app **work with no internet**. It vendors
 the transformers.js bundle, the ORT wasm pair and the SlimSAM weights under
@@ -43,12 +51,28 @@ Nothing downloads at startup. Unvendored, the first image import warms SlimSAM
 the OWLv2 WASM fallback (~163 MB q8). Both run on-device and are never
 uploaded.
 
-## Memory-bounded by default
+## Memory-bounded by default, adaptive when it's safe
 
 A browser tab cannot verify its real memory headroom —
 `navigator.deviceMemory` is privacy-rounded and capped, so a report proves
-nothing about actual free RAM. SEGLAB therefore never sizes budgets from a
-browser memory report: every unverified budget gets the **lite** profile.
+nothing about actual free RAM. SEGLAB never raises a budget from that report.
+Instead it starts from the **lite** floor and **auto-tiers** using signals that
+can't be spoofed upward — a usable WebGPU adapter (so SlimSAM runs ~0.5 GB on
+the GPU, not ~3 GB on the WASM lane), real multi-core `hardwareConcurrency`, not
+mobile, not a genuine sub-8 GB reading. A device that clears all of those runs
+**standard8**: memory-close to lite (same one embedding, one heavy job, ~1.3 GB
+NEF import peak) but with a crisper preview and a bigger, HD-decoded **12 MP**
+export. Everything else — a phone, a GPU-less device, a low-core or low-memory
+one — stays on lite. Nothing auto-climbs past standard8.
+
+A **runtime memory governor** (`memory-governor.js`) then guards it live: it
+watches measured agent-cluster bytes (`measureUserAgentSpecificMemory`, which
+sees the WASM heap the old JS-heap watchdog was blind to) plus timer drift (the
+device-relative swap signal) and sheds — detector → refine → embedding → caps —
+the instant real pressure appears. The **profile toggle** in the footer lets you
+force any tier, including above the safe auto ceiling; you're then vouching for
+the device, and the governor still steps back down if it can't keep up.
+
 Lite is not a degraded mode; it is the fully optimised baseline every feature
 is engineered to fit, so a DSLR photo works smoothly on any laptop:
 
@@ -233,11 +257,18 @@ bun verify.mjs   # policy/sizing/queue/embedding/wasm/static suites + real app i
 
 ## Browser compatibility
 
-- **Chromium**: `ImageDecoder` bounded decode, WebGPU where exposed, wasm SIMD.
+- **Chromium**: `ImageDecoder` bounded decode, WebGPU where exposed, wasm SIMD;
+  cross-origin isolated → threaded WASM + `measureUserAgentSpecificMemory`.
 - **Safari 16.4+**: no `ImageDecoder` → `createImageBitmap` + one-time bounded
-  working copy; wasm SIMD supported; WebGPU per OS version, WASM fallback.
+  working copy; wasm SIMD supported; WebGPU per OS version, WASM fallback. Under
+  `require-corp` it isolates too (threaded WASM); it has no
+  `measureUserAgentSpecificMemory`, so the governor rides timer drift there.
 - **No SIMD / old browsers**: wasm refinement silently off; JS pipeline serves.
-- No COOP/COEP, `SharedArrayBuffer` or threads are required.
+- **Mobile**: stays on the lite floor (never auto-climbs).
+- COOP/COEP are **recommended** (threaded inference + real memory measurement)
+  but not required — without isolation the app runs single-thread and the
+  governor falls back to the timer-drift signal. The auto-tier's memory signal
+  needs isolation, so a non-isolated device simply won't auto-climb (stays safe).
 
 ## Architecture
 
@@ -250,7 +281,9 @@ bun verify.mjs   # policy/sizing/queue/embedding/wasm/static suites + real app i
 - `js/image-raw.js` — RAW embedded-preview extractor (fast path, no demosaic)
 - `js/raw-develop-worker.js` / `raw-develop-client.js` + `cpp/raw_develop.cpp` — LibRaw wasm develop (preview-less fallback, disposed after use)
 - `js/detect-engine.js` / `detect-worker.js` — disposable, resource-gated text detector
-- `js/policy.js` / `capability.js` — locked lite budgets, trusted-host tiers, pressure ladder
+- `js/policy.js` / `capability.js` — lite floor, GPU/core-gated standard8 auto-tier, trusted-host tiers, pressure ladder
+- `js/memory-governor.js` — runtime safety net: measured bytes + timer drift → shed (down) / climb signal (up)
+- `scripts/dev-server.mjs` — cross-origin-isolating static dev server (COOP/COEP)
 - `js/app.js` — UI, prompts, overlay, export orchestration
 
 A future experimental scripting/plugin panel is documentation-only; no Python
