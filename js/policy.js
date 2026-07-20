@@ -16,6 +16,12 @@
 const PRESETS = {
     lite: {
         profile: 'lite',
+        // Soft ceiling (MB) the memory-governor watches measured agent-cluster
+        // bytes against (measureUserAgentSpecificMemory: main + workers + WASM).
+        // Normal WebGPU work measures well under this; a runaway WASM heap or an
+        // oversized export crosses it and sheds. GPU-side memory is a separate
+        // process the API can't see, so timer-drift is the paired swap signal.
+        memBudgetMB: 1800,
         proxyMax: 1024,          // = SlimSAM's own internal encode edge; below it
                                  // the model upscales (softer input) for no memory
                                  // saving. The pressure floor drops it.
@@ -65,6 +71,7 @@ const PRESETS = {
     },
     standard: {
         profile: 'standard',
+        memBudgetMB: 2800,
         proxyMax: 1024,
         proxyMode: 'auto',
         displayMax: 2560,
@@ -100,6 +107,7 @@ const PRESETS = {
     },
     pro: {
         profile: 'pro',
+        memBudgetMB: 3600,
         proxyMax: 1280,
         proxyMode: 'auto',
         displayMax: 3200,
@@ -130,6 +138,7 @@ const PRESETS = {
     },
     ultra: {
         profile: 'ultra',
+        memBudgetMB: 4600,
         proxyMax: 1536,
         proxyMode: 'auto',
         displayMax: 4096,

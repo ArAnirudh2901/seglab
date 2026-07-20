@@ -29,6 +29,7 @@ import {
 import { classifyCapability } from './js/capability.js'
 import { refineMaskEdges } from './js/edge-refine.js'
 import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
+import { decidePressure } from './js/memory-governor.js'
 import { getBoundedProxySize, displayPlan, decodeBudgetMP } from './js/proxy-plan.js'
 import {
   composeChannels, maskChannelCoverages, maskToChannel, pickBestMask, pointInMask, RUNAWAY_COVERAGE,
@@ -429,6 +430,31 @@ try {
     applyMemoryPressure(ultraBudget, 1).samWebGPU === false
       && pressured.displayMax === 1600 && pressured3.displayMax === 1280,
     JSON.stringify({ p1sam: applyMemoryPressure(ultraBudget, 1).samWebGPU, p2disp: pressured.displayMax, p3disp: pressured3.displayMax }),
+  )
+  check(
+    'policy: every tier declares a memBudgetMB the governor watches',
+    [liteDefault, PROFILE_PRESETS.standard, PROFILE_PRESETS.pro, PROFILE_PRESETS.ultra]
+      .every((b) => b.memBudgetMB >= 1000)
+      && applyMemoryPressure(liteDefault, 3).memBudgetMB === liteDefault.memBudgetMB, // pressure carries it through
+    JSON.stringify({ lite: liteDefault.memBudgetMB, ultra: PROFILE_PRESETS.ultra.memBudgetMB }),
+  )
+
+  /* ── Memory governor: the real safety net (measured bytes + drift, not JS heap) ── */
+  check(
+    // The measured signal SEES a runaway WASM heap (the 3 GB failure) that the
+    // old JS-heap watchdog was blind to; deep headroom under budget is the only
+    // thing that emits a climb signal; drift alone sheds without any byte reading.
+    'governor: WASM-scale bytes shed to L3; proven headroom climbs; drift sheds signal-less',
+    decidePressure({ bytesMB: 3000, budgetMB: 1800 }).level === 3
+      && decidePressure({ bytesMB: 500, budgetMB: 1800 }).headroom === true
+      && decidePressure({ bytesMB: 1600, budgetMB: 1800 }).level === 1
+      && decidePressure({ bytesMB: 0, driftMs: 6000 }).level === 2
+      && decidePressure({ bytesMB: 1200, budgetMB: 1800 }).headroom === false, // under budget but not deep → no climb
+    JSON.stringify({
+      wasm: decidePressure({ bytesMB: 3000, budgetMB: 1800 }).level,
+      headroom: decidePressure({ bytesMB: 500, budgetMB: 1800 }).headroom,
+      drift: decidePressure({ bytesMB: 0, driftMs: 6000 }).level,
+    }),
   )
 
   /* ── Sizing: the authoritative proxy function ── */

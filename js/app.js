@@ -16,6 +16,7 @@ import {
     cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure,
 } from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
+import { createMemoryGovernor } from './memory-governor.js'
 import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset, getOriginalBlob, getAssetKey } from './asset-store.js'
 import { saveSession, loadSession, clearSession } from './session-store.js'
@@ -614,40 +615,27 @@ document.addEventListener('visibilitychange', () => {
     if (document.hidden && state.hasImage) shedMemory(1, { announce: false })
 })
 
-// Heap watchdog (Chrome-only; sees only this thread's JS heap, so thresholds
-// are deliberately conservative): stop escalation, then shed detector and any
-// reloadable model state long before the host starts heavy swapping.
-if (performance.memory) {
-    setInterval(() => {
-        if (!state.hasImage) return
-        const used = performance.memory.usedJSHeapSize
-        if (used > 650e6) {
-            shedMemory(3)
-        } else if (used > 450e6) {
-            shedMemory(2)
-        } else if (used > 300e6) {
-            shedMemory(1)
-        }
-    }, 5000)
-} else {
-    // No heap signal (Safari): timer drift is the live pressure sentinel.
-    // A visible tab whose 1 s tick lands seconds late is swapping/starved —
-    // generalizes the one-shot rAF-gap check inside waitForCalm.
-    let lastTick = performance.now()
-    let stalls = 0
-    setInterval(() => {
-        const now = performance.now()
-        const drift = now - lastTick - 1000
-        lastTick = now
-        if (!state.hasImage || document.hidden) { stalls = 0; return }
-        if (drift > 2500) {
-            stalls += 1
-            shedMemory(stalls >= 2 ? 2 : 1, { announce: stalls >= 2 })
-        } else if (drift < 250) {
-            stalls = 0
-        }
-    }, 1000)
-}
+// Runtime memory governor — the real safety net (memory-governor.js). It reads
+// measured agent-cluster bytes (measureUserAgentSpecificMemory, sees WASM),
+// timer drift (device swap signal) and JS heap; the old JS-heap-only watchdog
+// was blind to the WASM/GPU memory that actually OOMs the app. onHeadroom is the
+// tier-climb signal (wired to the adaptive tier in a later step); for now it is
+// telemetry only.
+const DEBUG = /[?&]debug=1\b/.test(location.search)
+const governor = createMemoryGovernor({
+    getBudget: () => BUDGET,
+    isActive: () => state.hasImage && !document.hidden,
+    onPressure: (level) => shedMemory(level, { announce: level >= 2 }),
+    onHeadroom: () => {
+        // Placeholder until adaptive tiering consumes it. Proven headroom means
+        // the device is comfortably under its tier budget with no swap.
+        if (DEBUG) console.log('[seglab][governor] headroom proven — climb candidate')
+        window.__seglabHeadroom = (window.__seglabHeadroom || 0) + 1
+    },
+    onSample: DEBUG ? (s) => console.log('[seglab][governor]', s) : undefined,
+})
+governor.start()
+window.__seglabGovernor = governor // test/debug hook (cycleNow / feedMeasurement)
 
 /* ─── Modes ──────────────────────────────────────────────────────────────── */
 
