@@ -115,12 +115,15 @@ const HOST_PRO = { memoryBudgetGB: 16, vramGB: 12 }
 const HOST_ULTRA = { memoryBudgetGB: 24, vramGB: 24, gpuName: 'RTX 4090' }
 
 let pageSeq = 0
-const newAppPage = async (context, query, longSide, { host = null, restore = false } = {}) => {
+const newAppPage = async (context, query, longSide, { host = null, restore = false, pin = null } = {}) => {
   const page = await context.newPage()
   const tag = `p${++pageSeq}`
   // Synthetic phases must not inherit a session an earlier phase persisted.
   // Phase P opts back in — it is the gate that exercises restore.
   if (!restore) await page.addInitScript(() => { window.__seglabNoRestore = true })
+  // Pin a profile (via the manual-override localStorage key) so a phase testing
+  // a specific tier is deterministic regardless of the CI machine's autoTier.
+  if (pin) await page.addInitScript((p) => { try { localStorage.setItem('seglab.profileOverride', p) } catch { /* storage off */ } }, pin)
   page.on('console', (msg) => {
     const text = msg.text()
     if (text.startsWith('[seglab]') || msg.type() === 'error') log(`browser[${tag}]: ${text.slice(0, 180)}`)
@@ -331,44 +334,59 @@ try {
       && resolveBudget('?force=wasm', browserEightGB).forceWasm === true,
     JSON.stringify({ liteGpu: liteDefault.samWebGPU, liteNoGpu: liteNoGpu.samWebGPU, liteFallback: liteFallbackGpu.samWebGPU }),
   )
-  /* ── Policy: profile estimate + manual toggle (real signals, never a URL param) ── */
+  /* ── Policy: adaptive auto-tier + manual toggle (real signals, never a URL param) ── */
   const eightCoreBrowser = classifyCapability({ ...gpu, browserMemoryGB: 8, logicalProcessors: 8 })
   const eightCoreLowMem = classifyCapability({ ...gpu, browserMemoryGB: 4, logicalProcessors: 8 })
   const fourCoreBrowser = classifyCapability({ ...gpu, browserMemoryGB: 8, logicalProcessors: 4 })
+  const mobileEightCore = classifyCapability({ ...gpu, browserMemoryGB: 8, logicalProcessors: 8, mobile: true })
+  const noGpuEightCore = classifyCapability({ webgpu: false, browserMemoryGB: 8, logicalProcessors: 8 })
   check(
-    'capability: estimatedProfile reads real core count, capped at standard — never phosmith-free pro/ultra',
-    eightCoreBrowser.estimatedProfile === 'standard' && eightCoreBrowser.profile === 'lite'
-      && eightCoreLowMem.estimatedProfile === 'lite' // a real sub-8 reading demotes even with 8 cores
-      && fourCoreBrowser.estimatedProfile === 'lite'
-      && phosmith16GB.estimatedProfile === null, // trusted budgets already have a verified figure
+    // Unspoofable signals raise an unverified device, but ONLY to standard8 and
+    // ONLY when GPU (so SlimSAM runs ~0.5 GB on WebGPU, not ~3 GB on WASM) +
+    // real multi-core + not-mobile + not-sub-8 all agree. Never pro/ultra.
+    'capability: autoTier raises only to standard8, gated on GPU + cores + not-mobile + not-low-mem',
+    eightCoreBrowser.autoTier === 'standard8'
+      && eightCoreLowMem.autoTier === 'lite'  // a real sub-8 reading demotes even with 8 cores
+      && fourCoreBrowser.autoTier === 'lite'  // < 6 cores
+      && mobileEightCore.autoTier === 'lite'  // mobile never auto-climbs (RAM/thermal)
+      && noGpuEightCore.autoTier === 'lite'   // no GPU → WASM 3 GB risk, stay bounded
+      && phosmith16GB.autoTier === null,      // trusted budgets already have a verified figure
     JSON.stringify({
-      eightCore: eightCoreBrowser.estimatedProfile, lowMem: eightCoreLowMem.estimatedProfile,
-      fourCore: fourCoreBrowser.estimatedProfile, phosmith: phosmith16GB.estimatedProfile,
+      eightCore: eightCoreBrowser.autoTier, lowMem: eightCoreLowMem.autoTier, fourCore: fourCoreBrowser.autoTier,
+      mobile: mobileEightCore.autoTier, noGpu: noGpuEightCore.autoTier, phosmith: phosmith16GB.autoTier,
     }),
   )
-  const autoWithEstimate = resolveBudget('', eightCoreBrowser) // capable device, no override yet
-  const autoNoSignal = resolveBudget('', browserEightGB) // no cores probed — same as liteDefault
+  const autoTiered = resolveBudget('', eightCoreBrowser)     // capable device, no override → standard8
+  const autoNoSignal = resolveBudget('', browserEightGB)     // no cores probed → lite floor
   const manualLite = resolveBudget('', eightCoreBrowser, 'lite')
   const manualStandard = resolveBudget('', eightCoreBrowser, 'standard')
   const manualUltra = resolveBudget('', unknownMemory, 'ultra')
   const overrideIgnoredWhenTrusted = resolveBudget('', phosmith16GB, 'lite')
   check(
-    'policy: the memory-trust lock defaults to lite regardless of the estimate; only the profile toggle can raise it',
-    autoWithEstimate.profile === 'lite' && autoWithEstimate.memoryLocked === true
-      && autoWithEstimate.profileSource === 'default'
+    'policy: an unverified capable device DEFAULTS to standard8 (auto); lite without signals; manual override still governs and may exceed the ceiling',
+    autoTiered.profile === 'standard8' && autoTiered.memoryLocked === true
+      && autoTiered.profileSource === 'auto'
       && autoNoSignal.profile === 'lite' && autoNoSignal.profileSource === 'default'
-      && manualLite.profile === 'lite' && manualLite.profileSource === 'manual'
+      && manualLite.profile === 'lite' && manualLite.profileSource === 'manual'  // override may LOWER
       && manualStandard.profile === 'standard' && manualStandard.profileSource === 'manual'
       && manualStandard.memoryLocked === true
       // The toggle is the user vouching for their own device, so it can reach
-      // beyond the estimate's own standard ceiling — unlike a URL param.
+      // beyond the auto ceiling — unlike a URL param.
       && manualUltra.profile === 'ultra' && manualUltra.memoryLocked === true
       // A trusted Phosmith figure is real; the toggle does not apply there.
       && overrideIgnoredWhenTrusted.profile === 'pro' && overrideIgnoredWhenTrusted.profileSource === 'trusted',
     JSON.stringify({
-      auto: autoWithEstimate.profile, noSignal: autoNoSignal.profile, manualLite: manualLite.profile,
+      auto: autoTiered.profile, noSignal: autoNoSignal.profile, manualLite: manualLite.profile,
       manualStandard: manualStandard.profile, manualUltra: manualUltra.profile, trusted: overrideIgnoredWhenTrusted.profile,
     }),
+  )
+  check(
+    'policy: the standard8 auto-tier is memory-safe by construction — one embedding, one heavy, export ≤ 16 MP, but with HD decode + escalation',
+    autoTiered.draftCacheMax === 1 && autoTiered.maxResidentHeavy === 1
+      && autoTiered.exportMaxMP === 16 && autoTiered.hdExportDecode === true
+      && autoTiered.autoEscalate === true && autoTiered.samWebGPU === true
+      && autoTiered.memBudgetMB >= 1800,
+    JSON.stringify({ cache: autoTiered.draftCacheMax, exportMP: autoTiered.exportMaxMP, hd: autoTiered.hdExportDecode, esc: autoTiered.autoEscalate }),
   )
   check(
     'policy: standard reached via the profile toggle also evicts the detector before an encode',
@@ -753,12 +771,14 @@ try {
   )
   await pageHost.close()
 
-  /* ─── Phase A: lite (memory-locked) — the bounded-memory contract ───── */
-  const page = await newAppPage(context, '?flagship=0', null)
+  /* ─── Phase A: lite (memory-locked) — the bounded-memory contract ─────
+     Pinned to lite so this strictest-floor contract is tested deterministically
+     even on a capable CI machine that would otherwise autoTier to standard8. */
+  const page = await newAppPage(context, '?flagship=0', null, { pin: 'lite' })
   const bootState = await page.evaluate(() => window.__seglab.state())
   const bootBudget = await page.evaluate(() => window.__seglab.resourceBudget())
   check(
-    'lite: no model loads before an image; locked lite budget resolved',
+    'lite: no model loads before an image; pinned lite budget stays locked & bounded',
     bootState.ready === false && bootState.mode === null
       && bootBudget.profile === 'lite' && bootBudget.memoryLocked === true && bootBudget.proxyMax === 1024,
     JSON.stringify({ ready: bootState.ready, profile: bootBudget.profile, proxyMax: bootBudget.proxyMax }),
@@ -1014,12 +1034,13 @@ try {
   )
   await page.close()
 
-  // Unsafe URL flags in the real app.
-  const pageFlags = await newAppPage(context, '?flagship=1&profile=ultra&proxy=max&working=1', 4000)
+  // Unsafe URL flags in the real app (pinned lite so the lockout is tested on
+  // the known floor: URL params must not raise a locked budget).
+  const pageFlags = await newAppPage(context, '?flagship=1&profile=ultra&proxy=max&working=1', 4000, { pin: 'lite' })
   const flagBudget = await pageFlags.evaluate(() => window.__seglab.resourceBudget())
   const flagFrame = await pageFlags.evaluate(() => window.__seglab.imageTransform())
   check(
-    'safety (live): unsafe flags are refused — lite, no flagship, ≤1024 proxy',
+    'safety (live): unsafe URL flags are refused on a locked budget — no flagship, ≤1024 proxy, not raised to ultra',
     flagBudget.profile === 'lite' && flagBudget.flagship === false && flagBudget.proxyMax === 1024
       && flagFrame && Math.max(flagFrame.proxyW, flagFrame.proxyH) <= 1024,
     JSON.stringify({ profile: flagBudget.profile, flagship: flagBudget.flagship, proxy: `${flagFrame?.proxyW}x${flagFrame?.proxyH}` }),
@@ -1050,8 +1071,9 @@ try {
   )
   await pageC.close()
 
-  /* ── Lite export caps: >8 MP source exports reduced, never native ── */
-  const pageX = await newAppPage(context, '?flagship=0', 4200)
+  /* ── Export caps by tier: lite bounds to ≤8 MP from the proxy (no re-decode);
+       standard8 unlocks a bigger, HD-decoded cutout (the quality win). ── */
+  const pageX = await newAppPage(context, '?flagship=0', 4200, { pin: 'lite' })
   const geoX = await pageX.evaluate(() => window.__seglab.demoGeometry())
   await pageX.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoX.disc.x * geoX.proxyScale, y: geoX.disc.y * geoX.proxyScale })
   const exLite = await pageX.evaluate(() => window.__seglab.exportCutout())
@@ -1062,6 +1084,23 @@ try {
     `export ${exLite?.w}×${exLite?.h} (${((exLite?.w * exLite?.h || 0) / 1e6).toFixed(1)} MP), decoded=${exLite?.decoded}`,
   )
   await pageX.close()
+
+  // standard8 (pinned) exports the SAME 4200 px source larger and HD-decoded —
+  // the adaptive quality unlock a capable device now reaches automatically.
+  const pageX8 = await newAppPage(context, '?flagship=0', 4200, { pin: 'standard8' })
+  const budX8 = await pageX8.evaluate(() => window.__seglab.resourceBudget())
+  const geoX8 = await pageX8.evaluate(() => window.__seglab.demoGeometry())
+  await pageX8.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoX8.disc.x * geoX8.proxyScale, y: geoX8.disc.y * geoX8.proxyScale })
+  const exStd8 = await pageX8.evaluate(() => window.__seglab.exportCutout())
+  check(
+    'standard8 export: unlocks a larger, HD-decoded cutout (≤6144 px / ≤16 MP) than lite',
+    budX8.profile === 'standard8' && budX8.exportMaxMP === 16
+      && exStd8 && exStd8.w <= 6144 && (exStd8.w * exStd8.h) <= 16.1e6
+      && (exStd8.w * exStd8.h) > (exLite.w * exLite.h) // genuinely larger than the lite bound
+      && exStd8.decoded === true && exStd8.coverage > 0.01,
+    `std8 export ${exStd8?.w}×${exStd8?.h} (${((exStd8?.w * exStd8?.h || 0) / 1e6).toFixed(1)} MP, decoded=${exStd8?.decoded}) vs lite ${((exLite.w * exLite.h) / 1e6).toFixed(1)} MP`,
+  )
+  await pageX8.close()
 
   /* ── Wasm cv-refine gates (through the real worker + transferables) ── */
   const pageV = await newAppPage(context, '?flagship=0', 900)

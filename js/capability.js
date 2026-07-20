@@ -79,20 +79,28 @@ const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit })
 }
 
 /**
- * Best-effort profile guess for a browser the memory-trust lock won't verify.
- * `navigator.deviceMemory` is privacy-rounded AND capped at 8, so an 8 (or any
- * positive reading) can't prove "8 GB and no more" — it's unusable as a raise
- * signal, only as a floor: a reading genuinely below 8 is real and trusted
- * downward. `logicalProcessors` (navigator.hardwareConcurrency) has no such
- * cap and correlates loosely with device class, so it drives the guess — kept
- * deliberately capped at 'standard' since it's still a guess, never 'pro' or
- * 'ultra' (those stay Phosmith-verified-only, or an explicit user override).
+ * The highest tier an UNVERIFIED browser may auto-run, chosen from signals that
+ * cannot be spoofed *upward*:
+ *   - `logicalProcessors` (hardwareConcurrency): not capped, a device-class proxy.
+ *   - `gpuTier`: a usable, non-fallback WebGPU adapter — REQUIRED, because a
+ *     GPU-less device runs SlimSAM on WASM, whose ORT heap holds ~3 GB (measured),
+ *     so it must stay bounded at lite. 'accelerated' (f16 + healthy limits) is
+ *     the strongest signal.
+ *   - `deviceMemory`: used only DOWNWARD — a genuine sub-8 reading demotes; a
+ *     reading of 8 (the privacy cap) never raises.
+ *   - `mobile`: phones/tablets stay lite (small RAM, thermal throttling).
+ * Capped at `standard8` — pro/ultra are Phosmith-verified-only or manual override.
+ * A trusted host returns null (classifyCapability already has a real figure).
  */
-const estimateProfile = ({ trusted, cores, memoryGB }) => {
-    if (trusted) return null // classifyCapability already has a verified figure
-    if (!cores) return 'lite' // no core-count signal — nothing to estimate from
-    if (memoryGB > 0 && memoryGB < 8) return 'lite'
-    return cores >= 6 ? 'standard' : 'lite'
+const autoTierFor = ({ trusted, cores, memoryGB, gpuTier, mobile }) => {
+    if (trusted) return null
+    if (mobile) return 'lite'
+    if (gpuTier === 'none') return 'lite'            // WASM-only → ~3 GB risk, stay bounded
+    if (memoryGB > 0 && memoryGB < 8) return 'lite'  // a real sub-8 reading is trusted down
+    if (!cores || cores < 6) return 'lite'           // no / low multi-core signal
+    // Usable GPU (SlimSAM runs at ~0.5 GB on WebGPU, not ~3 GB on WASM) + real
+    // multi-core. Accelerated adapter or a strong core count earns standard8.
+    return (gpuTier === 'accelerated' || cores >= 8) ? 'standard8' : 'lite'
 }
 
 const proxyFor = (profile, gpuTier, textureLimit) => {
@@ -123,11 +131,11 @@ export const classifyCapability = (input = {}) => {
     const profile = profileForMemory(memoryGB, memorySource === 'phosmith', resourceMode)
     const gpuTier = gpuTierFor(input)
     const vramGB = host?.vramGB || 0
-    const estimatedProfile = estimateProfile({
-        trusted: memorySource === 'phosmith',
-        cores: Number(input.logicalProcessors) || 0,
-        memoryGB,
-    })
+    const cores = Number(input.logicalProcessors) || 0
+    const mobile = !!input.mobile
+    // The tier an unverified device may auto-run (capped at standard8, GPU- and
+    // core-gated). Applied by resolveBudget as the locked-budget default.
+    const autoTier = autoTierFor({ trusted: memorySource === 'phosmith', cores, memoryGB, gpuTier, mobile })
 
     return {
         webgpu: !!input.webgpu,
@@ -144,15 +152,16 @@ export const classifyCapability = (input = {}) => {
         allowFlagship: !!host?.allowFlagship,
         gpuName: host?.gpuName || input.gpuName || '',
         gpuTier,
-        logicalProcessors: Number(input.logicalProcessors) || 0,
+        logicalProcessors: cores,
+        mobile,
         textureLimit: Number(input.textureLimit) || 0,
         storageBufferLimit: Number(input.storageBufferLimit) || 0,
         gpuPreference: 'high-performance',
         profile,
-        // Best-effort guess for an unverified budget's default; null once
-        // Phosmith supplies a real figure. See resolveBudget for precedence
-        // against the user's own persisted profile-toggle choice.
-        estimatedProfile,
+        // The tier an unverified device auto-runs (null once Phosmith supplies a
+        // real figure). Applied by resolveBudget; the manual toggle can exceed it.
+        autoTier,
+        estimatedProfile: autoTier, // back-compat alias for the profile-toggle UI
         proxyMax: proxyFor(profile, gpuTier, Number(input.textureLimit) || 0),
         // Segmentation is SlimSAM-only. Kept as a stable diagnostic field for
         // existing host integrations; it is deliberately never eligible.
@@ -170,12 +179,18 @@ export const withPhosmithResources = (capability = {}, resources = null) => clas
 
 export const probeCapability = async ({ hostResources = readPhosmithResources() } = {}) => {
     const nav = typeof navigator === 'undefined' ? {} : navigator
+    // Phones/tablets stay lite regardless of cores/GPU (small RAM, thermal).
+    // userAgentData.mobile is the reliable signal; fall back to a UA sniff.
+    const mobile = typeof nav.userAgentData?.mobile === 'boolean'
+        ? nav.userAgentData.mobile
+        : /Mobi|Android|iPhone|iPad|iPod/i.test(String(nav.userAgent || ''))
     const raw = {
         webgpu: false,
         fallback: false,
         f16: false,
         browserMemoryGB: nav.deviceMemory || 0,
         logicalProcessors: nav.hardwareConcurrency || 0,
+        mobile,
         textureLimit: 0,
         storageBufferLimit: 0,
         hostResources,

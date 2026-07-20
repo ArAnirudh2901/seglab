@@ -69,6 +69,45 @@ const PRESETS = {
         workingMaxSide: 1280,    // bounded re-decode copy cap (Safari-shaped hosts)
         pressureLevel: 0,
     },
+    // The one memory-safe tier an UNVERIFIED device may auto-reach (capability
+    // autoTier) and the ceiling for browser-signal auto-climb — pro/ultra stay
+    // trusted-host or manual-override only. Deliberately below `standard`
+    // (24 MP / cache 3): it unlocks a bigger export, sharp HD-decode export,
+    // small-object escalation and a crisper preview, but keeps ONE embedding,
+    // ONE heavy job and a peak a real 8 GB host sustains — and the governor
+    // down-ratchets it if a given device can't.
+    standard8: {
+        profile: 'standard8',
+        memBudgetMB: 2200,
+        proxyMax: 1024,          // SlimSAM's native edge; higher only aids precision
+        proxyMode: 'auto',
+        displayMax: 2560,        // crisper preview (decoupled from the model proxy)
+        displayMode: 'auto',
+        directMaxMP: 3,
+        directMaxSide: 2560,
+        cropMaxSide: 1536,
+        exportMaxSide: 6144,
+        exportMaxMP: 16,         // the visible win: 8 → 16 MP cutouts
+        escalateMaxMP: 16,
+        draftCacheMax: 1,        // still exactly one resident embedding
+        flagshipCacheMax: 0,
+        maxResidentHeavy: 1,
+        flagship: false,
+        detectorWebGPU: true,
+        detectorEvictOnEncode: true,
+        detectorIdleMs: 120_000,
+        samWebGPU: true,
+        autoEscalate: true,      // native-res recovery for tiny objects
+        hdExportDecode: true,    // sharp native-region export (export-time only)
+        detectorDispose: 'idle',
+        eagerEncode: true,
+        cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 50,
+        embedPersist: false,     // packing peak avoided on an unverified device
+        workingMaxSide: 2560,
+        pressureLevel: 0,
+    },
     standard: {
         profile: 'standard',
         memBudgetMB: 2800,
@@ -199,8 +238,15 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     const locked = isMemoryLocked(probed)
     const requestedProfile = locked ? null : params.get('profile')
     const manualOverride = locked && override && PRESETS[override] ? override : null
+    // Adaptive tiering: on a locked (unverified) budget the default is the
+    // capability probe's autoTier (capability.js) — a capped, GPU/core-gated
+    // guess, never above standard8 — instead of a flat lite. It comes from
+    // hardware signals, not a URL param, so the unsafe-flag lockout still holds.
+    // Precedence: manual override (the user vouching, may exceed the ceiling) >
+    // autoTier > lite.
+    const autoTier = locked && cap && PRESETS[cap.autoTier] ? cap.autoTier : null
     const name = locked
-        ? (manualOverride || 'lite')
+        ? (manualOverride || autoTier || 'lite')
         : (requestedProfile || (cap ? cap.profile : probed))
     const budget = { ...(PRESETS[name] || PRESETS.lite) }
     // Adaptive proxy: the probe sizes it to the device. An explicit profile is
@@ -227,8 +273,11 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     budget.memoryLocked = locked
     // How `name` was picked — the profile toggle reads this to label its
     // "Auto" option and to know whether the user has already overridden it.
+    // 'auto' only when the capability auto-tier actually RAISED above the lite
+    // floor; an autoTier that resolves to lite (no signal, or capped down) is
+    // just the default floor.
     budget.profileSource = locked
-        ? (manualOverride ? 'manual' : 'default')
+        ? (manualOverride ? 'manual' : (autoTier && autoTier !== 'lite' ? 'auto' : 'default'))
         : (cap ? 'trusted' : 'preset')
     if (cap?.memorySource === 'unknown') budget.memoryUncertain = true
 
