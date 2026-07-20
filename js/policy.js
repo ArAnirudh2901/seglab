@@ -71,14 +71,18 @@ const PRESETS = {
     },
     // The one memory-safe tier an UNVERIFIED device may auto-reach (capability
     // autoTier) and the ceiling for browser-signal auto-climb — pro/ultra stay
-    // trusted-host or manual-override only. Deliberately below `standard`
-    // (24 MP / cache 3): it unlocks a bigger export, sharp HD-decode export,
-    // small-object escalation and a crisper preview, but keeps ONE embedding,
-    // ONE heavy job and a peak a real 8 GB host sustains — and the governor
-    // down-ratchets it if a given device can't.
+    // trusted-host or manual-override only. Deliberately MEMORY-CLOSE to lite:
+    // its whole design is to be safe on the worst device that reaches it (an
+    // 8-core / 8 GB laptop that may be heavily loaded). It takes only the CHEAP
+    // quality wins — a crisper preview and a bigger, HD-decoded EXPORT (a
+    // transient, export-time cost) — and deliberately leaves OFF the expensive
+    // interaction-time native re-decode (`autoEscalate`), which pushed the NEF
+    // import+click peak to ~2.1 GB / ~1.15 GB resident (measured). Escalation and
+    // a larger export come only with a manual override to standard+ (the user
+    // vouching for a device with real headroom), still governor-guarded.
     standard8: {
         profile: 'standard8',
-        memBudgetMB: 2200,
+        memBudgetMB: 1900,
         proxyMax: 1024,          // SlimSAM's native edge; higher only aids precision
         proxyMode: 'auto',
         displayMax: 2560,        // crisper preview (decoupled from the model proxy)
@@ -86,9 +90,9 @@ const PRESETS = {
         directMaxMP: 3,
         directMaxSide: 2560,
         cropMaxSide: 1536,
-        exportMaxSide: 6144,
-        exportMaxMP: 16,         // the visible win: 8 → 16 MP cutouts
-        escalateMaxMP: 16,
+        exportMaxSide: 5120,
+        exportMaxMP: 12,         // the visible win: 8 → 12 MP cutouts (bounded peak)
+        escalateMaxMP: 12,
         draftCacheMax: 1,        // still exactly one resident embedding
         flagshipCacheMax: 0,
         maxResidentHeavy: 1,
@@ -97,8 +101,8 @@ const PRESETS = {
         detectorEvictOnEncode: true,
         detectorIdleMs: 120_000,
         samWebGPU: true,
-        autoEscalate: true,      // native-res recovery for tiny objects
-        hdExportDecode: true,    // sharp native-region export (export-time only)
+        autoEscalate: false,     // interaction-time native re-decode → manual tiers only
+        hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
         detectorDispose: 'idle',
         eagerEncode: true,
         cvRefine: true,

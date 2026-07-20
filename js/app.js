@@ -32,7 +32,7 @@ import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-cli
 // honored even on a memory-locked device (unlike a URL param, which a page
 // could set on its own behalf). 'auto' defers to resolveBudget's estimate.
 const PROFILE_OVERRIDE_KEY = 'seglab.profileOverride'
-const VALID_PROFILES = new Set(['lite', 'standard', 'pro', 'ultra'])
+const VALID_PROFILES = new Set(['lite', 'standard8', 'standard', 'pro', 'ultra'])
 const readProfileOverride = () => {
     try {
         const v = localStorage.getItem(PROFILE_OVERRIDE_KEY)
@@ -189,18 +189,20 @@ const refreshChips = () => {
     if (els.profileSelect) {
         els.profileSelect.value = profileOverride || 'auto'
         const autoOpt = els.profileSelect.querySelector('option[value="auto"]')
-        if (autoOpt) autoOpt.textContent = `Profile: Auto (${profile})`
-        // The estimate is real signal (CPU core count), but it's a guess, not
-        // a verified figure — it's surfaced as a suggestion, never applied on
-        // its own, so every plain browser keeps the same bounded lite floor.
-        const est = capability?.estimatedProfile
-        els.profileSelect.title = (est && est !== profile && !profileOverride)
-            ? `This device's core count suggests it could handle "${est}" — pick it here to try it (you can always switch back)`
-            : 'Resource profile — Auto stays on the safe bounded default; force a tier if you know this device can take it'
+        // Auto now APPLIES the capability auto-tier (from GPU + core signals),
+        // not just a suggestion — show the tier it resolved to.
+        const autoName = BUDGET.memoryLocked ? (capability?.autoTier || 'lite') : profile
+        if (autoOpt) autoOpt.textContent = `Profile: Auto (${autoName})`
+        // Warn when a manual override goes ABOVE the safe auto ceiling — the
+        // user is vouching for this device, past what the signals prove safe.
+        const overAuto = profileOverride && (PROFILE_RANK[profileOverride] || 0) > (PROFILE_RANK[autoName] || 0)
+        els.profileSelect.title = overAuto
+            ? `Forcing "${profileOverride}" above this device's safe auto tier ("${autoName}"). You're vouching for it — the memory governor still steps back down if it can't keep up.`
+            : 'Resource profile — Auto picks the highest tier this device can safely run; force a tier if you know it can take more.'
     }
 }
 
-const PROFILE_RANK = { lite: 0, standard: 1, pro: 2, ultra: 3 }
+const PROFILE_RANK = { lite: 0, standard8: 1, standard: 2, pro: 3, ultra: 4 }
 
 /** A Phosmith WebView can tighten or expand its usable-memory budget after the
  * editor has loaded. Existing image/model allocations are never enlarged in

@@ -381,11 +381,16 @@ try {
     }),
   )
   check(
-    'policy: the standard8 auto-tier is memory-safe by construction — one embedding, one heavy, export ≤ 16 MP, but with HD decode + escalation',
+    // Memory-close to lite by design: the NEF import+click peak with escalation
+    // ON was ~2.1 GB (measured); OFF it is ~1.3 GB, equal to lite. So the auto
+    // tier takes only the cheap wins (12 MP HD-decoded export, crisper preview)
+    // and leaves the interaction-time native re-decode to manually-chosen tiers.
+    'policy: the standard8 auto-tier is memory-safe by construction — one embedding, one heavy, ≤12 MP export, HD decode on, native escalation OFF',
     autoTiered.draftCacheMax === 1 && autoTiered.maxResidentHeavy === 1
-      && autoTiered.exportMaxMP === 16 && autoTiered.hdExportDecode === true
-      && autoTiered.autoEscalate === true && autoTiered.samWebGPU === true
-      && autoTiered.memBudgetMB >= 1800,
+      && autoTiered.exportMaxMP === 12 && autoTiered.hdExportDecode === true
+      && autoTiered.autoEscalate === false && autoTiered.samWebGPU === true
+      && autoTiered.memBudgetMB <= 2000
+      && PROFILE_PRESETS.standard.autoEscalate === true, // escalation available via manual override
     JSON.stringify({ cache: autoTiered.draftCacheMax, exportMP: autoTiered.exportMaxMP, hd: autoTiered.hdExportDecode, esc: autoTiered.autoEscalate }),
   )
   check(
@@ -1093,9 +1098,9 @@ try {
   await pageX8.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoX8.disc.x * geoX8.proxyScale, y: geoX8.disc.y * geoX8.proxyScale })
   const exStd8 = await pageX8.evaluate(() => window.__seglab.exportCutout())
   check(
-    'standard8 export: unlocks a larger, HD-decoded cutout (≤6144 px / ≤16 MP) than lite',
-    budX8.profile === 'standard8' && budX8.exportMaxMP === 16
-      && exStd8 && exStd8.w <= 6144 && (exStd8.w * exStd8.h) <= 16.1e6
+    'standard8 export: unlocks a larger, HD-decoded cutout (≤5120 px / ≤12 MP) than lite',
+    budX8.profile === 'standard8' && budX8.exportMaxMP === 12
+      && exStd8 && exStd8.w <= 5120 && (exStd8.w * exStd8.h) <= 12.1e6
       && (exStd8.w * exStd8.h) > (exLite.w * exLite.h) // genuinely larger than the lite bound
       && exStd8.decoded === true && exStd8.coverage > 0.01,
     `std8 export ${exStd8?.w}×${exStd8?.h} (${((exStd8?.w * exStd8?.h || 0) / 1e6).toFixed(1)} MP, decoded=${exStd8?.decoded}) vs lite ${((exLite.w * exLite.h) / 1e6).toFixed(1)} MP`,

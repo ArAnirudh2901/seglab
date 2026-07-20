@@ -309,9 +309,10 @@
     <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt = exclude · polygon <kbd>Enter</kbd> close</span>
     <span id="chip-mode" class="chip">engine: —</span>
     <span id="chip-device" class="chip">device: —</span>
-    <select id="profile-select" title="Resource profile — Auto picks a safe default from this device's real signals; force a tier if you know better">
+    <select id="profile-select" title="Resource profile — Auto picks the highest tier this device can safely run; force a tier if you know it can take more">
         <option value="auto">Profile: Auto</option>
         <option value="lite">Profile: Lite</option>
+        <option value="standard8">Profile: Standard-8</option>
         <option value="standard">Profile: Standard</option>
         <option value="pro">Profile: Pro</option>
         <option value="ultra">Profile: Ultra</option>
