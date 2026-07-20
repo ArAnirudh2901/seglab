@@ -76,6 +76,24 @@ self.addEventListener('activate', (event) => {
     )
 })
 
+// The page is cross-origin isolated (COEP: require-corp), which blocks any
+// cross-origin subresource that lacks a CORP header. The CDN model *fallback*
+// (HuggingFace/jsDelivr) does not always send one, so re-tag those responses
+// here — the vendored same-origin path already carries CORP from the server.
+const isCrossOrigin = (url) => {
+    try { return new URL(url).origin !== self.location.origin } catch { return false }
+}
+const withCorp = async (response, url) => {
+    if (!isCrossOrigin(url) || !response || !response.ok) return response
+    const headers = new Headers(response.headers)
+    headers.set('Cross-Origin-Resource-Policy', 'cross-origin')
+    headers.set('Cross-Origin-Embedder-Policy', 'require-corp')
+    // Rebuild the response with the augmented headers (body is single-use, so
+    // callers pass a response they no longer need to read themselves).
+    const body = await response.blob()
+    return new Response(body, { status: response.status, statusText: response.statusText, headers })
+}
+
 // ── Fetch: cache-first for model files, passthrough for everything else ───────
 self.addEventListener('fetch', (event) => {
     const { request } = event
@@ -89,7 +107,7 @@ self.addEventListener('fetch', (event) => {
 
             // Cache hit → serve immediately (no network).
             const cached = await cache.match(request)
-            if (cached) return cached
+            if (cached) return withCorp(cached, request.url)
 
             // Cache miss → fetch from network, store, then return.
             try {
@@ -99,7 +117,7 @@ self.addEventListener('fetch', (event) => {
                     // clone() before consuming so we can both cache and return.
                     cache.put(request, response.clone())
                 }
-                return response
+                return withCorp(response, request.url)
             } catch (err) {
                 // Network failure and no cache entry — let the error propagate
                 // so the app can show its own "model load failed" message.

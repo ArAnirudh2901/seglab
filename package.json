@@ -2,7 +2,7 @@
   "name": "seglab",
   "private": true,
   "scripts": {
-    "dev": "python3 -m http.server 8788 --bind 127.0.0.1",
+    "dev": "node scripts/dev-server.mjs",
     "verify": "bun verify.mjs",
     "models": "node scripts/download-models.mjs",
     "models:all": "node scripts/download-models.mjs --detector",

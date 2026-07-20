@@ -1,0 +1,8 @@
+# Netlify (and Cloudflare Pages) static header rules.
+# Cross-origin isolation: unlocks threaded WASM inference + measureUserAgentSpecificMemory.
+# require-corp (not credentialless) so Safari isolates too; the app is vendored-first,
+# and sw.js re-tags the cross-origin CDN model fallback with CORP.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: same-origin

@@ -67,26 +67,34 @@ const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.css': 'text/css', '.json': 'application/json', '.wasm': 'application/wasm',
 }
+// Cross-origin isolation — must match the dev/prod servers so the suite runs
+// under the same crossOriginIsolated + threaded-WASM conditions as production.
+const ISOLATION_HEADERS = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Embedder-Policy': 'require-corp',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+}
 const server = createServer(async (req, res) => {
+  const head = (status, extra = {}) => res.writeHead(status, { ...ISOLATION_HEADERS, ...extra })
   try {
     const url = new URL(req.url, 'http://localhost')
     // Serve the optional RAW fixture to the browser suite (the develop worker
     // fetches it same-origin instead of shuttling megabytes over evaluate()).
     if (url.pathname === '/__raw_fixture' && RAW_FIXTURE && existsSync(RAW_FIXTURE)) {
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+      head(200, { 'Content-Type': 'application/octet-stream' })
       res.end(await readFile(RAW_FIXTURE))
       return
     }
     const rel = url.pathname === '/' ? '/index.html' : url.pathname
     const file = path.join(ROOT, path.normalize(rel))
     if (!file.startsWith(ROOT) || !existsSync(file)) {
-      res.writeHead(404).end('not found')
+      head(404).end('not found')
       return
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' })
+    head(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' })
     res.end(await readFile(file))
   } catch (e) {
-    res.writeHead(500).end(String(e?.message || e))
+    head(500).end(String(e?.message || e))
   }
 })
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
