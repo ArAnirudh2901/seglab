@@ -43,8 +43,12 @@ const ISOLATION_HEADERS = {
 const server = createServer(async (req, res) => {
   const setHeaders = (extra = {}) => {
     for (const [k, v] of Object.entries(ISOLATION_HEADERS)) res.setHeader(k, v)
-    // Dev: never cache, so edits always reflect on reload.
-    res.setHeader('Cache-Control', 'no-store')
+    // Never cache APP code, so edits always reflect on reload. Vendored model
+    // weights + runtimes are immutable (replaced only by re-running
+    // download-models) — long-cache those, or SlimSAM/ORT re-download on
+    // every single page load.
+    const immutable = req.url.startsWith('/models/') || req.url.startsWith('/lib/')
+    res.setHeader('Cache-Control', immutable ? 'public, max-age=31536000, immutable' : 'no-store')
     for (const [k, v] of Object.entries(extra)) res.setHeader(k, v)
   }
   try {

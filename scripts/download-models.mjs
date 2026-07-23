@@ -31,6 +31,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const TRANSFORMERS_VERSION = '4.2.0'
 // Must equal dependencies["onnxruntime-web"] of the pinned transformers build.
 const ORT_VERSION = '1.26.0-dev.20260416-b7804b056c'
+// Standalone onnxruntime-web for the YOLOE text lane (js/yoloe-detect.js) — a
+// separate pin from the transformers-bundled ORT above.
+const ORT_WEB_VERSION = '1.22.0'
 const SLIMSAM = 'Xenova/slimsam-77-uniform'
 // Must equal DETECTORS in js/detect-engine.js (model + weightFile per lane).
 const OWLV2 = 'onnx-community/owlv2-base-patch16-ensemble-ONNX'
@@ -43,6 +46,13 @@ const ORT_FILES = [
     'ort-wasm-simd-threaded.asyncify.wasm',
     'ort-wasm-simd-threaded.mjs',
     'ort-wasm-simd-threaded.wasm',
+]
+// YOLOE lane runtime: the WebGPU ESM bundle + its jsep wasm loader + wasm binary
+// (the bundle still fetches the .jsep.mjs loader at runtime).
+const ORT_WEB_FILES = [
+    'ort.webgpu.bundle.min.mjs',
+    'ort-wasm-simd-threaded.jsep.mjs',
+    'ort-wasm-simd-threaded.jsep.wasm',
 ]
 // fp32 (unsuffixed) serves device:webgpu, q8 (_quantized) serves device:wasm —
 // exactly the dtypes pinned in js/sam-engine.js LANES.draft.
@@ -93,6 +103,10 @@ const jobs = [
         url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/${f}`,
         dest: `lib/ort/${f}`,
     })),
+    ...(withDetector ? ORT_WEB_FILES.map((f) => ({
+        url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_WEB_VERSION}/dist/${f}`,
+        dest: `lib/ort-web/${f}`,
+    })) : []),
     ...hubJobs(SLIMSAM, SLIMSAM_FILES),
     ...(withDetector ? hubJobs(GDINO, GDINO_FILES) : []),
     ...(withDetector ? hubJobs(OWLV2, OWLV2_FILES) : []),
@@ -152,6 +166,7 @@ for (const job of jobs) {
 const manifest = {
     transformers: TRANSFORMERS_VERSION,
     onnxruntimeWeb: ORT_VERSION,
+    onnxruntimeWebYoloe: withDetector ? ORT_WEB_VERSION : null,
     model: SLIMSAM,
     models: withDetector ? [SLIMSAM, GDINO, OWLV2] : [SLIMSAM],
     detector: withDetector ? OWLV2 : null,

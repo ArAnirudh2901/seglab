@@ -103,6 +103,85 @@
     .tolerance input { accent-color: var(--accent); width: 84px; }
     .tolerance output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 20px; }
 
+    /* Text search: input wrapper anchors the autocomplete dropdown. */
+    .textwrap { position: relative; display: inline-flex; }
+    .textwrap[hidden] { display: none; }
+    .autocomplete {
+        position: absolute;
+        top: calc(100% + 5px);
+        left: 0;
+        z-index: 60;
+        min-width: 100%;
+        max-height: 320px;
+        overflow-y: auto;
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+        padding: 4px;
+    }
+    .autocomplete[hidden] { display: none; }
+    .ac-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 7px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 13px;
+        white-space: nowrap;
+    }
+    .ac-row.on, .ac-row:hover { background: var(--accent-dim); }
+    .ac-row .ac-text { display: flex; align-items: center; gap: 7px; }
+    .ac-row .ac-detail {
+        color: var(--dim);
+        font-size: 10.5px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    /* Sub-class refine bar — sits under the header once a search has facets. */
+    .refine {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 16px;
+        padding: 8px 16px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+    }
+    .refine[hidden] { display: none; }
+    .refine .axis { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .refine .axis-label {
+        color: var(--dim);
+        font-size: 10.5px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .refine-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--text);
+        border-radius: 999px;
+        padding: 3px 11px;
+        font-size: 12.5px;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+    }
+    .refine-chip:hover { border-color: var(--accent); }
+    .refine-chip.on { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+    .refine-chip .count { color: var(--dim); font-variant-numeric: tabular-nums; }
+    .refine-chip.on .count { color: var(--accent); }
+    .refine-chip .swatch {
+        width: 11px; height: 11px; border-radius: 50%;
+        border: 1px solid rgba(255, 255, 255, 0.3);
+    }
+    .refine .refine-clear { color: var(--dim); }
+
     main {
         flex: 1;
         display: flex;
@@ -216,7 +295,7 @@
         white-space: nowrap;
     }
     .chip.on { color: var(--accent); border-color: rgba(53, 224, 194, 0.4); }
-    #profile-select {
+    #profile-select, #yoloe-select {
         border: 1px solid var(--line);
         border-radius: 999px;
         padding: 2px 22px 2px 10px;
@@ -228,7 +307,7 @@
         -webkit-appearance: none;
         cursor: pointer;
     }
-    #profile-select:hover { color: var(--text); }
+    #profile-select:hover, #yoloe-select:hover { color: var(--text); }
     #loadbar {
         position: absolute;
         left: 0;
@@ -271,7 +350,10 @@
     </div>
     <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
     <label id="tolerance-wrap" class="tolerance" hidden title="Colour distance for Magic and Color only — it does not change Text detection">Tolerance <input id="tolerance" type="range" min="8" max="160" value="36"><output id="tolerance-value">36</output></label>
-    <input id="textinput" class="textinput" type="text" placeholder="describe an object — e.g. “the red car”, “all bottles”" hidden>
+    <span id="textwrap" class="textwrap" hidden>
+        <input id="textinput" class="textinput" type="text" autocomplete="off" spellcheck="false" placeholder="describe an object — e.g. “flower”, “the red car”, “all bottles”">
+        <div id="autocomplete" class="autocomplete" hidden role="listbox"></div>
+    </span>
     <button id="selectall" class="small" hidden title="Select every match">Select all</button>
     <div class="spacer"></div>
     <button id="undo" class="small" disabled title="Undo last prompt (Z)">Undo</button>
@@ -279,6 +361,8 @@
     <button id="cutout" class="small" disabled title="Download the cutout as transparent PNG">Cutout PNG</button>
     <button id="newimg" class="small">New image</button>
 </header>
+
+<div id="refine" class="refine" hidden></div>
 
 <main id="main">
     <div id="dropzone">
@@ -309,6 +393,7 @@
     <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt = exclude · polygon <kbd>Enter</kbd> close</span>
     <span id="chip-mode" class="chip">engine: —</span>
     <span id="chip-device" class="chip">device: —</span>
+    <span id="chip-model" class="chip">models: —</span>
     <select id="profile-select" title="Resource profile — Auto picks the highest tier this device can safely run; force a tier if you know it can take more">
         <option value="auto">Profile: Auto</option>
         <option value="lite">Profile: Lite</option>
@@ -316,6 +401,13 @@
         <option value="standard">Profile: Standard</option>
         <option value="pro">Profile: Pro</option>
         <option value="ultra">Profile: Ultra</option>
+    </select>
+    <select id="yoloe-select" title="Text-search model — Auto picks a size by device tier; force Small/Medium/Large, or turn the fast YOLOE lane off (falls back to the YOLO-World open-vocab lane)">
+        <option value="auto">Text: Auto</option>
+        <option value="s">Text: Small</option>
+        <option value="m">Text: Medium</option>
+        <option value="l">Text: Large</option>
+        <option value="off">Text: Off</option>
     </select>
     <span id="chip-timing" class="chip">— ms</span>
 </footer>

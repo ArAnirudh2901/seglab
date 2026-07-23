@@ -190,22 +190,6 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
             try { payload?.source?.close?.() } catch { /* already closed */ }
         }
     }
-    if (op === 'detect') {
-        // Inline: nothing transferred, so the frame's pixels are still ours —
-        // they fall out of scope with the payload.
-        const det = await import('./detect-engine.js')
-        const candidates = engine.detectorCandidates()
-        if (candidates.some((candidate) => candidate.detector === 'grounding')) engine.releaseDocument()
-        return withTimeout(det.detect({
-            frame: payload.frame,
-            labels: payload.labels,
-            threshold: payload.threshold,
-            candidates,
-            dispose: engine.getBudget().detectorDispose === 'now',
-            idleMs: engine.getBudget().detectorIdleMs || 0,
-            progress_callback: (info) => onEngineEvent({ type: 'progress', detail: { lane: 'text', status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total } }),
-        }), timeoutMs, label)
-    }
     if (op === 'pressure') return { freed: await engine.relievePressure(payload?.level || 1) }
     if (op === 'releaseDocument') { engine.releaseDocument(); return engine.getEngineState() }
     if (op === 'state') return engine.getEngineState()
@@ -359,12 +343,12 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
  * but reports stale and can never affect the UI. `encoded:false` means the
  * embedding came from memory or OPFS.
  */
-export const encodeImage = async (canvas, { revision, prime = false } = {}) => {
+export const encodeImage = async (canvas, { revision, prime = false, gpuOnly = false } = {}) => {
     if (!canvas?.width || !canvas?.height) return null
     const imageKey = contentKey(canvas)
     const result = await enqueueHeavy('encode-prewarm', async () => {
         const source = await createImageBitmap(canvas)
-        return call('encode', { imageKey, source, revision, prime }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
+        return call('encode', { imageKey, source, revision, prime, gpuOnly }, [source], INFER_TIMEOUT_MS, 'Idle image encode')
     }, { priority: 'idle', revision: revision ?? null })
     return result === STALE ? { stale: true, revision } : result
 }
@@ -373,8 +357,10 @@ export const encodeImage = async (canvas, { revision, prime = false } = {}) => {
  * Original-resolution alpha for one export crop. Thin transport over the
  * worker's `hdExport` op; export-hd.js owns bbox/padding/crop/composite. The
  * crop bitmap transfers zero-copy (worker closes it); the proxy-mask buffer
- * transfers too. Returns { alpha: Uint8ClampedArray, width, height, decoded }
- * or { stale:true }.
+ * transfers too. Export (compose) returns a Blob when emitBlob is set (encoded
+ * in the worker, main thread stays flat) or a cutout buffer otherwise;
+ * escalation returns the mask alpha. Plus width, height and decoded, or
+ * { stale:true }.
  */
 export const hdExport = async (payload, transfer) => {
     const result = await enqueueHeavy(
@@ -383,23 +369,116 @@ export const hdExport = async (payload, transfer) => {
         { priority: 'high', revision: payload?.revision ?? null },
     )
     if (result === STALE || result?.stale) return { stale: true }
-    const alpha = result.alpha instanceof Uint8ClampedArray ? result.alpha : new Uint8ClampedArray(result.alpha)
-    return { alpha, width: result.width, height: result.height, decoded: result.decoded, lane: result.lane }
+    const toU8C = (b) => (b instanceof Uint8ClampedArray ? b : new Uint8ClampedArray(b))
+    const out = { width: result.width, height: result.height, decoded: result.decoded, lane: result.lane }
+    if (result.blob) out.blob = result.blob
+    if (result.cutout) out.cutout = toU8C(result.cutout)
+    if (result.alpha) out.alpha = toU8C(result.alpha)
+    return out
 }
 
-/** Resource-gated text detection over `frame` — { data, width, height } RGB
- *  bytes, already letterboxed into the detector's square. The pixels transfer
- *  (no copy, and `frame.data` is detached here). Returns
- *  { dets:[{box,score,label}] with boxes normalized [0,1] against the square,
- *  backend }. The detector never coexists with another heavy job — it queues
- *  like everything else. */
-export const detectText = async (frame, labels, { threshold = 0.05, revision = null } = {}) => {
+/* ── Disposable YOLO detect worker ───────────────────────────────────────────
+ * Separate from sam-worker so its ORT wasm arena (which only grows) is freed by
+ * TERMINATING the worker after the dispose window — the only true free. */
+let detectWorker = null
+let detectSeq = 0
+const detectPending = new Map()
+let detectIdleTimer = null
+
+const disposeDetectWorker = () => {
+    if (detectIdleTimer) { clearTimeout(detectIdleTimer); detectIdleTimer = null }
+    const w = detectWorker
+    detectWorker = null
+    if (!w) return
+    for (const [, e] of detectPending) e.reject(new Error('detect worker disposed'))
+    detectPending.clear()
+    try { w.terminate() } catch { /* already gone */ }
+    trace('detect-worker-terminated')
+}
+
+const getDetectWorker = () => {
+    if (detectWorker) return detectWorker
+    const w = new Worker(new URL('./detect-worker.js', import.meta.url), { type: 'module' })
+    w.onmessage = (event) => {
+        const data = event.data || {}
+        if (data.type === 'progress') { onEngineEvent(data); return }
+        const entry = detectPending.get(data.id)
+        if (!entry) return
+        detectPending.delete(data.id)
+        if (data.ok) entry.resolve(data.result)
+        else entry.reject(new Error(data.error || 'text detection failed'))
+    }
+    w.onerror = (event) => {
+        for (const [, e] of detectPending) e.reject(new Error(event?.message || 'detect worker crashed'))
+        detectPending.clear()
+        detectWorker = null
+        try { w.terminate() } catch { /* dead */ }
+    }
+    detectWorker = w
+    return w
+}
+
+/** One detect on the disposable worker; terminates it after `idleMs` (0 = now —
+ *  the true wasm-arena free). Inline fallback when a worker can't be built. */
+const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => {
+    let w = null
+    try { w = getDetectWorker() } catch { /* inline below */ }
+    if (!w) {
+        // No worker (e.g. Safari nested-worker limits): run the lane inline. The
+        // ORT arena then lives on this thread, so dispose:true frees it now.
+        if (payload.lane === 'yoloworld') {
+            const [{ detectYoloWorld }, { embedSlots }] = await Promise.all([import('./yolo-world-detect.js'), import('./clip-text.js')])
+            const emb = await embedSlots(payload.phrases)
+            if (!emb) return { dets: [], slotNames: [], backend: null }
+            const r = await withTimeout(detectYoloWorld({ frame: payload.frame, txtFeats: emb.txtFeats, threshold: payload.threshold, scale: payload.scale, dispose: true }), timeoutMs, label)
+            return { ...r, slotNames: emb.slotNames }
+        }
+        const yoloe = await import('./yoloe-detect.js')
+        return withTimeout(yoloe.detectYoloe({ ...payload, dispose: true }), timeoutMs, label)
+    }
+    if (detectIdleTimer) { clearTimeout(detectIdleTimer); detectIdleTimer = null }
+    detectSeq += 1
+    const id = `yoloe-${detectSeq}`
+    const roundtrip = new Promise((resolve, reject) => {
+        detectPending.set(id, { resolve, reject })
+        try { w.postMessage({ id, payload }, transfer || []) } catch (err) { detectPending.delete(id); reject(err) }
+    })
+    try {
+        return await withTimeout(roundtrip, timeoutMs, label)
+    } finally {
+        detectPending.delete(id)
+        if (idleMs > 0) detectIdleTimer = setTimeout(disposeDetectWorker, idleMs)
+        else disposeDetectWorker()
+    }
+}
+
+/** YOLOE baked-vocab detection over a 640² letterboxed RGB frame (`frame.data`
+ *  transfers). Runs in the disposable detect worker; `evict` drops the SAM
+ *  embedding first so they never peak together; `idleMs` (0 = now) sets when the
+ *  worker is terminated to reclaim its wasm arena. */
+export const detectTextYoloe = async (frame, { scale = 's', threshold = 0.25, revision = null, idleMs = 0, evict = false } = {}) => {
+    if (evict) await releaseDocument()
     const result = await enqueueHeavy(
         'detect',
-        () => call('detect', { frame, labels, threshold }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'Text detection'),
+        () => callDetectWorker({ lane: 'yoloe', frame, scale, threshold }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'YOLOE detection', idleMs),
         { priority: 'normal', revision },
     )
     if (result === STALE) return { dets: [], backend: null, stale: true }
+    return result
+}
+
+/** YOLO-World open-vocab detection over a 640² letterboxed RGB frame. `phrases`
+ *  (the phrase + taxonomy synonyms) are CLIP-encoded in the worker to condition
+ *  the vision head; returns { dets:[{box,score,classIdx}], slotNames, backend }
+ *  where slotNames[classIdx] is the phrase a detection matched. */
+export const detectTextYoloWorld = async (frame, phrases, { scale = 's', threshold = 0.25, revision = null, idleMs = 0, evict = false } = {}) => {
+    if (evict) await releaseDocument()
+    const result = await enqueueHeavy(
+        'detect',
+        () => callDetectWorker({ lane: 'yoloworld', frame, phrases, scale, threshold }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs),
+        { priority: 'normal', revision },
+    )
+    if (result === STALE) return { dets: [], slotNames: [], backend: null, stale: true }
     return result
 }
 

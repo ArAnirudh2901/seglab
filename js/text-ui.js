@@ -5,10 +5,22 @@
  * state or DOM here; app.js owns the input, overlay, and selection glue.
  */
 import {
-    collapseToObject, colorEvidenceForBox, DETECTOR_INPUT, DETECTOR_PAD, letterboxPlan, normalizePhrase, rankDetections, scaleBox, unletterboxBox,
+    collapseToObject, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, letterboxPlan, normalizePhrase, rankDetections, scaleBox, unletterboxBox, YOLOE_INPUT,
 } from './text-core.js'
+import { labelMatchesQuery, expandQuery } from './search-taxonomy.js'
 import { getTransform, getBoundedOriginal } from './asset-store.js'
-import { detectText } from './sam-client.js'
+import { detectTextYoloe, detectTextYoloWorld } from './sam-client.js'
+
+/** A ranked detection → an app-facing candidate, tagged with the dominant
+ *  colour bucket in its detector-frame box (the colour sub-class facet).
+ *  `d.box` is still detector-square coords; `kx/ky` map it to proxy coords.
+ *  `d.rawBox` is square-normalized against `frame` (colour is sampled there). */
+const toCandidate = (d, frame, kx, ky) => ({
+    box: scaleBox(d.box, kx, ky),
+    score: d.score,
+    label: d.label,
+    color: (d.rawBox ? dominantColorForBox(frame, d.rawBox)?.color : null) || null,
+})
 
 /** Original → gray-padded square of RGB bytes at the detector's native size.
  *  Only the photo's own rows are read back and the padding is written straight
@@ -63,42 +75,70 @@ const focusRequestedColor = (dets, frame, color) => {
         }))
 }
 
-/** Detect `phrase` in the held original. Returns
- *  { candidates:[{ box:[x0,y0,x1,y1] proxy coords, score, label }], multi,
- *    backend, display } or null when there's no phrase/original. */
-export const detectCandidates = async (phrase, { rankThreshold = 0.12 } = {}) => {
+/** YOLOE baked-vocab candidates: detect everything at 640, keep boxes whose
+ *  label matches the phrase's object, then the shared rank/color/collapse
+ *  pipeline. Returns null when nothing matches → caller falls back to YOLO-World. */
+export const detectCandidatesYoloe = async (phrase, { scale = 's', rankThreshold = 0.25, idleMs = 0, evict = false } = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
-
-    const plan = letterboxPlan(tf.originalW, tf.originalH, DETECTOR_INPUT)
+    const plan = letterboxPlan(tf.originalW, tf.originalH, YOLOE_INPUT)
     const frame = await buildFrame(plan)
     if (!frame) return null
-    const { dets, backend } = await detectText(frame, norm.labels, { threshold: 0.05 })
-
-    // Square-normalized → original px (dropping padding-only boxes), then proxy
-    // px. Reject before ranking so a bogus box can't raise the relative floor.
+    const { dets, backend } = await detectTextYoloe(frame, { scale, threshold: 0.2, idleMs, evict })
+    // Taxonomy-aware: a main-class phrase ("flower") matches its vocab-child
+    // kinds ("rose", "tulip"), which YOLOE labels as separate classes.
+    const matched = (dets || []).filter((d) => labelMatchesQuery(norm.objectCore, d.label))
+    if (matched.length === 0) return null
     const mapped = []
-    for (const d of dets) {
+    for (const d of matched) {
         const box = unletterboxBox(d.box, plan)
         if (box) mapped.push({ box, rawBox: d.box, score: d.score, label: d.label })
     }
+    if (mapped.length === 0) return null
     const kx = tf.proxyW / tf.originalW
     const ky = tf.proxyH / tf.originalH
-    // The fallback detector can emit low-confidence, scene-sized guesses.
-    // Start from its established floor, then demand a much closer score to
-    // the best result; Grounding DINO benefits from the same duplicate guard.
-    const eligible = mapped.filter((d) => d.score >= rankThreshold)
-    const focused = focusRequestedColor(eligible, frame, norm.color)
+    const focused = focusRequestedColor(mapped, frame, norm.color)
     const ranked = rankDetections(focused, {
-        threshold: norm.color && focused !== eligible ? 0 : rankThreshold,
-        iou: 0.5,
-        topK: 5,
-        relative: 0.6,
-    })
-        .map((d) => ({ box: scaleBox(d.box, kx, ky), score: d.score, label: d.label }))
-    // Singular phrase → one object: merge fragments the detector split apart so
-    // a single train isn't two boxes to tap.
+        threshold: norm.color && focused !== mapped ? 0 : rankThreshold,
+        iou: 0.5, topK: 5, relative: 0.5,
+    }).map((d) => toCandidate(d, frame, kx, ky))
     const candidates = norm.multi ? ranked : collapseToObject(ranked)
-    return { candidates, multi: norm.multi, backend, display: norm.display }
+    return { candidates, multi: norm.multi, backend: `yoloe:${backend}`, display: norm.display }
+}
+
+/** YOLO-World open-vocab candidates: CLIP-encode the phrase + taxonomy synonyms
+ *  into the 32 class slots, run the text-conditioned vision head, then the shared
+ *  rank/colour/collapse pipeline. Handles ARBITRARY phrases (unlike the baked
+ *  YOLOE lane), on WASM or WebGPU. Returns null when nothing matches. */
+export const detectCandidatesYoloWorld = async (phrase, { scale = 's', rankThreshold = 0.1, idleMs = 0, evict = false } = {}) => {
+    const norm = normalizePhrase(phrase)
+    const tf = getTransform()
+    if (!norm || !tf) return null
+    const plan = letterboxPlan(tf.originalW, tf.originalH, YOLOE_INPUT)
+    const frame = await buildFrame(plan)
+    if (!frame) return null
+    // Fill the class slots with the full phrase (CLIP reads "red flower"
+    // directly) plus any taxonomy synonyms for the object.
+    const expanded = expandQuery(norm.objectCore)
+    const phrases = [...new Set([norm.core, ...(expanded ? expanded.labels : [norm.objectCore])])]
+    // YOLO-World-v2 scores run lower than YOLOE's baked head; 0.08 is its
+    // usable floor (ref impl uses ~0.05), the shared ranker tightens from there.
+    const { dets, slotNames, backend } = await detectTextYoloWorld(frame, phrases, { scale, threshold: 0.08, idleMs, evict })
+    if (!dets || dets.length === 0) return null
+    const mapped = []
+    for (const d of dets) {
+        const box = unletterboxBox(d.box, plan)
+        if (box) mapped.push({ box, rawBox: d.box, score: d.score, label: slotNames?.[d.classIdx] || norm.objectCore })
+    }
+    if (mapped.length === 0) return null
+    const kx = tf.proxyW / tf.originalW
+    const ky = tf.proxyH / tf.originalH
+    const focused = focusRequestedColor(mapped, frame, norm.color)
+    const ranked = rankDetections(focused, {
+        threshold: norm.color && focused !== mapped ? 0 : rankThreshold,
+        iou: 0.5, topK: 8, relative: 0.5,
+    }).map((d) => toCandidate(d, frame, kx, ky))
+    const candidates = norm.multi ? ranked : collapseToObject(ranked)
+    return { candidates, multi: norm.multi, backend: `yoloworld:${backend}`, display: norm.display }
 }

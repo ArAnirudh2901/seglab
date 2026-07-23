@@ -139,20 +139,6 @@ const activeLaneKey = () => 'draft'
 
 export const getBudget = () => ({ ...state.budget })
 
-// Text-detector ladder. Grounding DINO q4f16/WebGPU leads only on an
-// f16-capable accelerator (gpuTier gate) — faster, smaller, better phrase
-// grounding. Every device keeps OWLv2/WASM as the floor, so the ladder always
-// resolves to a lane that runs, with no GPU and no f16 required.
-export const detectorCandidates = () => {
-    const b = state.budget
-    const accelerated = b.detectorWebGPU === true && b.gpuTier === 'accelerated' && b.forceWasm !== true
-        && ortWebGpuSupported() // pre-26 Safari's ORT build is CPU-only
-    const ladder = []
-    if (accelerated) ladder.push({ detector: 'grounding', device: 'webgpu', dtype: 'q4f16' })
-    ladder.push({ detector: 'owl', device: 'wasm', dtype: 'q8' })
-    return ladder
-}
-
 export const getEngineState = () => ({
     device: state.device,
     forcedWasm: state.forcedWasm,
@@ -311,6 +297,13 @@ const makeCanvas = (w, h) => {
     return c
 }
 
+// PNG via the platform encoder. OffscreenCanvas exposes the async convertToBlob;
+// a DOM canvas exposes the callback toBlob. Runs wherever this engine runs, so
+// the export encode can stay off the main thread inside the worker.
+const canvasToPngBlob = (canvas) => (canvas.convertToBlob
+    ? canvas.convertToBlob({ type: 'image/png' })
+    : new Promise((resolve) => canvas.toBlob(resolve, 'image/png')))
+
 /**
  * Encode `source` once per lane and cache embeddings + a grayscale copy of
  * the photo (the guide image for edge refinement) under `lane:imageKey`.
@@ -342,12 +335,9 @@ const ensureEmbeddings = async (bundle, imageKey, source, { ephemeral = false, p
     }
     if (!source) throw new Error('Embedding cache miss and no image source provided')
     // Sequential-peak guard: detector session and SAM embedding never coexist
-    // on a tight profile. detect() drops the document before grounding; this
-    // drops the detector before the encode a selected box triggers — session
-    // stays warm across searches, never overlaps the encoder. Only a miss pays.
-    if (state.budget.detectorEvictOnEncode) {
-        try { (await import('./detect-engine.js')).disposeDetector() } catch { /* none loaded */ }
-    }
+    // The detectors run in the separate, self-disposing detect-worker (sam-client
+    // terminates it after its idle window / before an encode when evict is set),
+    // so there is no detector session in THIS worker to drop here.
     trace('embedding-miss', { cacheKey, width: source.width, height: source.height, ephemeral })
     const { RawImage } = bundle.transformers
     const w = source.width
@@ -443,17 +433,24 @@ export const releaseDocument = () => {
 
 /**
  * Memory-pressure ladder — dispose the detector first, then (at level 3)
- * release the current embedding. The detector lives in another module, so the
- * dynamic import avoids a static cycle.
+ * release the current embedding AND the ORT session arena. The embedding is
+ * only ~MBs; the resident hog is the session (WASM linear memory ~3 GB, or
+ * the GPU buffers ~0.5 GB), which only session.release() gives back. A level-3
+ * event means the OS is starving, so the arena goes too; the next job rebuilds
+ * via loadBundle (weights from cache, one compile). Serialized so an in-flight
+ * kernel finishes before its session is released. The detector lives in
+ * another module, so the dynamic import avoids a static cycle.
  */
 export const relievePressure = async (level = 1) => {
     const freed = []
-    if (level >= 1) {
-        try { (await import('./detect-engine.js')).disposeDetector(); freed.push('detector') } catch { /* no detector loaded */ }
-    }
+    // The detectors live in the disposable detect-worker (freed by terminating
+    // it, sam-client), not here — so level-1 relief has nothing to drop in this
+    // worker beyond what the cache eviction below handles.
     if (level >= 3) {
         releaseDocument()
         freed.push('embedding')
+        await serialize(async () => { discardBundle(); state.ready = false })
+        freed.push('arena')
     }
     return freed
 }
@@ -673,6 +670,11 @@ export const encodeImage = async (req) => {
         if (isStale(req)) return { stale: true }
         const laneKey = 'draft'
         const bundle = await loadBundle()
+        // Speculative-only guard (gpuOnly): an unverified device must never pay
+        // the WASM lane's multi-GB arena for a prewarm nobody asked for — the
+        // first real click pays that cost knowingly instead. Checked after
+        // loadBundle so the decision uses the device that ACTUALLY loaded.
+        if (req.gpuOnly && state.device !== 'webgpu') return { skipped: 'wasm-lane' }
         const { entry, encoded, save } = await ensureEmbeddings(bundle, req.imageKey, req.source)
         if (isStale(req)) return { stale: true }
         // Prime the decoder session with one throwaway centre-point decode so
@@ -685,6 +687,7 @@ export const encodeImage = async (req) => {
         }
         return { encoded, save, lane: LANES[laneKey].label, device: state.device }
     })
+    if (prepared.skipped) return { skipped: prepared.skipped }
     if (prepared.stale || isStale(req)) return staleResult(req)
     // `await` yields the worker event loop, so segments can enter serialize()
     // while OPFS writes this best-effort revisit cache in the background.
@@ -775,10 +778,45 @@ const hdRefineOnce = async (req) => {
     }
     if (isStale(req)) return staleResult(req)
 
-    // Band scales with the upsampling factor (a 1-proxy-pixel staircase is
-    // upFactor original pixels wide), capped so the edge never goes mushy.
-    const band = Math.max(6, Math.min(16, Math.round(6 * (req.upFactor || 1))))
-    const refined = refineMaskEdgesTiled(rgba, w, h, gray, { band })
+    // Band and guide radius scale with the upsampling factor (a 1-proxy-pixel
+    // staircase is upFactor original pixels wide). The guided filter is
+    // integral-image based, so box windows are O(N) regardless of radius and a
+    // wider higher-quality matting window at native res costs nothing
+    // asymptotically. Export takes the soft matte so antialiased, hair and
+    // translucent edges survive; escalation feeds a downscaled merge and stays
+    // crisp.
+    const upF = req.upFactor || 1
+    const band = Math.max(6, Math.min(16, Math.round(6 * upF)))
+    const snap = req.compose ? 'soft' : 'hard'
+    const radius = req.compose ? Math.max(8, Math.min(16, Math.round(4 * upF))) : 8
+    const refined = refineMaskEdgesTiled(rgba, w, h, gray, { band, radius, snap })
+
+    // Export path: fuse the crop RGB (pixels) with the refined mask into ONE
+    // straight-alpha cutout, reusing the pixels buffer so the alpha channel
+    // takes the mask luma with no extra allocation.
+    if (req.compose) {
+        const src = pixels.data
+        for (let i = 0; i < w * h; i += 1) src[i * 4 + 3] = rgba[i * 4]
+        // Download path: encode the PNG here with the platform encoder so the
+        // main thread never holds a full-frame canvas or the toBlob peak. Paint
+        // the cutout, encode, then drop the canvas. The main thread receives
+        // only a Blob, so its heap stays flat even for a 37 MP export.
+        if (req.emitBlob) {
+            const out = makeCanvas(w, h)
+            out.getContext('2d').putImageData(new ImageData(src, w, h), 0, 0)
+            const blob = await canvasToPngBlob(out)
+            out.width = out.height = 0
+            return {
+                blob, width: w, height: h, decoded,
+                revision: req.revision, lane: decoded ? LANES.draft.label : null, ms: Date.now() - t0,
+            }
+        }
+        return {
+            cutout: src, width: w, height: h, decoded, iou,
+            revision: req.revision, bandPixels: refined.bandPixels,
+            lane: decoded ? LANES.draft.label : null, ms: Date.now() - t0,
+        }
+    }
 
     return {
         alpha: rgba,

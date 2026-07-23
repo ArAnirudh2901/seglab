@@ -16,6 +16,8 @@
 const PRESETS = {
     lite: {
         profile: 'lite',
+        samIdleMs: 300_000,      // idle → release the ORT session arena (the real resident, ~0.5 GB GPU / ~3 GB WASM); next click rebuilds. App shortens to 45 s under pressure ≥ 2.
+        detectorScale: 's', // YOLOE text-lane scale (auto by tier; user-overridable)
         // Soft ceiling (MB) the memory-governor watches measured agent-cluster
         // bytes against (measureUserAgentSpecificMemory: main + workers + WASM).
         // Normal WebGPU work measures well under this; a runaway WASM heap or an
@@ -36,6 +38,7 @@ const PRESETS = {
         cropMaxSide: 1280,
         exportMaxSide: 4096,
         exportMaxMP: 8,
+        exportFullRes: false,    // safety floor: tight cutout, but crop stays cropMaxSide-bounded
         escalateMaxMP: 8,
         draftCacheMax: 1,        // exactly one resident embedding
         flagshipCacheMax: 0,
@@ -55,7 +58,8 @@ const PRESETS = {
         // Baseline default: WASM. resolveBudget() promotes this to WebGPU
         // whenever a usable non-fallback adapter is probed (gpuTier != 'none'),
         // since GPU accel is independent of the memory tier. This false is the
-        // no-GPU / no-probe floor and what memory pressure ratchets back down to.
+        // no-GPU / no-probe floor. Memory pressure does NOT clear it: WASM SlimSAM
+        // pins ~3 GB vs the GPU's ~0.5 GB, so the GPU is the memory-safe lane to keep.
         samWebGPU: false,
         autoEscalate: false,
         hdExportDecode: false,
@@ -82,6 +86,8 @@ const PRESETS = {
     // vouching for a device with real headroom), still governor-guarded.
     standard8: {
         profile: 'standard8',
+        samIdleMs: 300_000,
+        detectorScale: 's',
         memBudgetMB: 1900,
         proxyMax: 1024,          // SlimSAM's native edge; higher only aids precision
         proxyMode: 'auto',
@@ -92,6 +98,7 @@ const PRESETS = {
         cropMaxSide: 1536,
         exportMaxSide: 5120,
         exportMaxMP: 12,         // the visible win: 8 → 12 MP cutouts (bounded peak)
+        exportFullRes: false,    // deliberately bounded (memory-close to lite)
         escalateMaxMP: 12,
         draftCacheMax: 1,        // still exactly one resident embedding
         flagshipCacheMax: 0,
@@ -114,6 +121,8 @@ const PRESETS = {
     },
     standard: {
         profile: 'standard',
+        samIdleMs: 0,            // manual tier = user vouched headroom; no hibernate
+        detectorScale: 's',
         memBudgetMB: 2800,
         proxyMax: 1024,
         proxyMode: 'auto',
@@ -124,6 +133,7 @@ const PRESETS = {
         cropMaxSide: 2048,
         exportMaxSide: 8192,
         exportMaxMP: 24,
+        exportFullRes: true,     // native-res tight cutout (export-time transient, crop-sized)
         escalateMaxMP: 24,
         draftCacheMax: 3,
         flagshipCacheMax: 2,
@@ -150,6 +160,8 @@ const PRESETS = {
     },
     pro: {
         profile: 'pro',
+        samIdleMs: 0,            // trusted big host — no hibernate
+        detectorScale: 'm',
         memBudgetMB: 3600,
         proxyMax: 1280,
         proxyMode: 'auto',
@@ -160,6 +172,7 @@ const PRESETS = {
         cropMaxSide: 3072,
         exportMaxSide: 10000,
         exportMaxMP: 36,
+        exportFullRes: true,
         escalateMaxMP: 36,
         draftCacheMax: 4,
         flagshipCacheMax: 3,
@@ -181,6 +194,8 @@ const PRESETS = {
     },
     ultra: {
         profile: 'ultra',
+        samIdleMs: 0,
+        detectorScale: 'l',
         memBudgetMB: 4600,
         proxyMax: 1536,
         proxyMode: 'auto',
@@ -191,6 +206,7 @@ const PRESETS = {
         cropMaxSide: 4096,
         exportMaxSide: 12000,
         exportMaxMP: 64,
+        exportFullRes: true,
         escalateMaxMP: 64,
         draftCacheMax: 6,
         flagshipCacheMax: 4,
@@ -236,7 +252,7 @@ export const isMemoryLocked = (probed = null) => {
  * `?profile=ultra`, `?working=1` are all refused there.
  * `probed` is the boot capability object or a bare profile string (tests).
  */
-export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null, override = null) => {
+export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null, override = null, scaleOverride = null) => {
     const params = new URLSearchParams(search)
     const cap = (probed && typeof probed === 'object') ? probed : null
     const locked = isMemoryLocked(probed)
@@ -328,6 +344,22 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     if (dq === 'native') budget.displayMode = 'native'
     else if (dq === 'off') budget.displayMode = 'off'
     else if (dq && Number(dq) >= 256) budget.displayMax = Math.min(4096, Math.round(Number(dq)))
+
+    // Export resolution: full opts into a native-res tight cutout (an
+    // export-time transient, not a resident tier), bounded forces the tier
+    // cropMaxSide cap. Raising respects a locked trusted-host contract; lowering
+    // is always allowed.
+    const xq = params.get('export')
+    if (xq === 'bounded') budget.exportFullRes = false
+    else if (!locked && xq === 'full') budget.exportFullRes = true
+
+    // YOLOE text-lane scale: preset detectorScale is the auto pick; a deliberate
+    // user choice (scaleOverride, persisted) or ?yoloe= forces it. 'off' disables
+    // the lane. Safe on a locked budget — every scale's WebGPU footprint is tens
+    // of MB, not a memory tier.
+    const yoloeChoice = scaleOverride || params.get('yoloe')
+    if (yoloeChoice === 'off') budget.yoloe = false
+    else if (['n', 's', 'm', 'l', 'x'].includes(yoloeChoice)) budget.detectorScale = yoloeChoice
     return budget
 }
 
@@ -347,7 +379,10 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.draftCacheMax = Math.min(next.draftCacheMax || 1, 1)
         next.flagshipCacheMax = 0
         next.detectorWebGPU = false
-        next.samWebGPU = false
+        // NB: pressure does NOT demote SlimSAM to WASM. Measured, WASM SlimSAM
+        // pins ~3 GB vs the GPU's ~0.5 GB, so forcing WASM under memory pressure
+        // makes swap WORSE — the GPU is the memory-safe lane and is kept. Device
+        // demotion stays failure-gated in sam-engine (WEBGPU_FAILURE_LIMIT / OOM).
         next.eagerEncode = false
     }
     if (nextLevel >= 2) {
@@ -355,6 +390,7 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.escalateMaxMP = Math.min(next.escalateMaxMP || 8, 8)
         next.displayMax = Math.min(next.displayMax || 1600, 1600)
         next.hdExportDecode = false
+        next.exportFullRes = false // export a bounded (cropMaxSide) cutout under real pressure
         next.cvRefine = false
         next.rawDevelop = false
     }

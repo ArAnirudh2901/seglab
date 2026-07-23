@@ -115,7 +115,7 @@ const boxMean = (sat, w, h, radius, out) => {
  *
  * @returns {{ bandPixels: number }} how many pixels were refined
  */
-export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 1e-3 } = {}) => {
+export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 1e-3, snap = 'hard' } = {}) => {
     const size = w * h
     if (!gray || gray.length !== size) return { bandPixels: 0 }
 
@@ -173,10 +173,15 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
         let q = meanA[i] * gray[i] + meanB[i]
         if (q < 0) q = 0
         else if (q > 1) q = 1
-        // Snap near-extremes so the band doesn't carry a faint fog.
+        // Snap near-extremes so the band does not carry a faint fog. The soft
+        // mode (HD matte) snaps only the true extremes so real antialiased,
+        // hair and translucent edges keep their partial alpha; the hard mode
+        // (preview) is crisper. Fog is killed either way.
         let v = Math.round(q * 255)
-        if (v < 10) v = 0
-        else if (v > 245) v = 255
+        const lo = snap === 'soft' ? 4 : 10
+        const hi = snap === 'soft' ? 251 : 245
+        if (v < lo) v = 0
+        else if (v > hi) v = 255
         const j = i * 4
         rgba[j] = v
         rgba[j + 1] = v
@@ -197,20 +202,25 @@ export const refineMaskEdges = (rgba, w, h, gray, { band = 6, radius = 8, eps = 
  * bandPixels is telemetry-only and may count overlap bands twice.
  */
 export const refineMaskEdgesTiled = (rgba, w, h, gray, {
-    band = 6, radius = 8, eps = 1e-3, tileSide = 1024, overlap = 64,
+    band = 6, radius = 8, eps = 1e-3, snap = 'hard', tileSide = 1024, overlap = 64,
 } = {}) => {
-    if (w <= tileSide && h <= tileSide) return refineMaskEdges(rgba, w, h, gray, { band, radius, eps })
+    if (w <= tileSide && h <= tileSide) return refineMaskEdges(rgba, w, h, gray, { band, radius, eps, snap })
 
+    // The value at a pixel depends on the boundary band (band) then two
+    // sequential box means (2 radius); the halo must cover that whole influence
+    // or seams appear. Widen it with radius so a larger matte window stays
+    // bit-identical.
+    const halo = Math.max(overlap, band + 2 * radius)
     let bandPixels = 0
     for (let ty = 0; ty < h; ty += tileSide) {
         for (let tx = 0; tx < w; tx += tileSide) {
             // Interior this tile owns, plus the halo it reads.
             const ix1 = Math.min(w, tx + tileSide)
             const iy1 = Math.min(h, ty + tileSide)
-            const ex0 = Math.max(0, tx - overlap)
-            const ey0 = Math.max(0, ty - overlap)
-            const ex1 = Math.min(w, ix1 + overlap)
-            const ey1 = Math.min(h, iy1 + overlap)
+            const ex0 = Math.max(0, tx - halo)
+            const ey0 = Math.max(0, ty - halo)
+            const ex1 = Math.min(w, ix1 + halo)
+            const ey1 = Math.min(h, iy1 + halo)
             const ew = ex1 - ex0
             const eh = ey1 - ey0
 
@@ -222,7 +232,7 @@ export const refineMaskEdgesTiled = (rgba, w, h, gray, {
                 tileGray.set(gray.subarray(src, src + ew), y * ew)
             }
 
-            const r = refineMaskEdges(tileRgba, ew, eh, tileGray, { band, radius, eps })
+            const r = refineMaskEdges(tileRgba, ew, eh, tileGray, { band, radius, eps, snap })
             bandPixels += r.bandPixels
 
             // Write back the interior rows only — halo pixels belong to

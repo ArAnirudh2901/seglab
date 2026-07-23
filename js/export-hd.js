@@ -2,13 +2,14 @@
  * export-hd — native-resolution cutout compositing (main thread).
  * Maps the approved ≤1024 proxy mask back onto the original pixels:
  * mask bbox → pad → crop rect → (Std/Pro) one IoU-gated crop re-decode +
- * band-tiled refine in the worker → composite into a full-frame cutout.
- * Outside the padded crop the mask is empty, so the frame is transparent —
- * no seams.
+ * band-tiled refine in the worker, which fuses the crop's own RGB with the
+ * matte and hands back ONE straight-alpha cutout. The deliverable is the tight
+ * crop at native resolution — never a full-frame canvas and never a second
+ * full-original decode, so there is no export memory spike and no MP cap.
  *
- * M3 shares the crop decode with interactive escalation: a small selection
- * re-decodes its crop at interaction time and caches the native alpha as an
- * `hdPatch`; export then just composites that patch (no second decode).
+ * M3 still caches the escalation patch (a mask) for the LIVE overlay, but
+ * export always recomposes fresh at full res so quality is never bounded by an
+ * interaction-time decode.
  */
 
 import { summarizeMaskRGBA, mapPromptsToCrop } from './sam-core.js'
@@ -47,22 +48,31 @@ const cropRectFromBBox = (bbox, tf) => {
     return { x, y, w: Math.max(1, x1 - x), h: Math.max(1, y1 - y) }
 }
 
-// Crop rect → native-res alpha via the worker's hdExport op. `forceDecode`
-// (escalation) re-decodes regardless of the budget flag; a promptless union
-// stays filter-only. A frame-filling crop is already at the proxy ceiling, so
-// it skips the decode. Returns null when the job went stale.
-const decodeCropAlpha = async (proxyMask, prompts, rect, tf, { budget, revision, forceDecode = false, nativeCrop = false }) => {
+// Crop decode caps. Export at full res decodes the crop natively (no MP cap)
+// when the tier allows and memory pressure has not ratcheted it back; otherwise
+// the tier bounded caps apply. Escalation (interaction-time) always passes its
+// own bounded caps.
+const cropCaps = (budget, { fullRes = false } = {}) => {
+    const pressured = (budget?.pressureLevel || 0) >= 2
+    if (fullRes && budget?.exportFullRes && !pressured) return { maxSide: 0, maxMP: 0 }
+    return { maxSide: budget?.cropMaxSide ?? 4096, maxMP: budget?.cropMaxMP ?? 0 }
+}
+
+// Crop rect to native-res cutout or mask via the worker hdExport op. Compose
+// (export) fuses the crop RGB with the matte and returns one cutout buffer, or a
+// blob when emitBlob is set; otherwise (escalation) returns the mask. forceDecode
+// (escalation) re-decodes regardless of the budget flag; a promptless union stays
+// filter-only. A frame-filling crop is already at the proxy ceiling, so it skips
+// the decode. Returns null when the job went stale.
+const decodeCropAlpha = async (proxyMask, prompts, rect, tf, {
+    budget, revision, forceDecode = false, nativeCrop = false, compose = false, emitBlob = false, caps = null,
+}) => {
     const p2o = tf.originalW / tf.proxyW
     const frameArea = tf.originalW * tf.originalH
     const cropArea = rect.w * rect.h
 
-    const cropBitmap = await getCropBitmap(rect, {
-        maxSide: budget?.cropMaxSide ?? 4096,
-        // A long-edge cap normally controls this already; the pixel cap also
-        // protects unusually square crops on constrained devices.
-        maxMP: budget?.cropMaxMP ?? 0,
-        native: nativeCrop,
-    })
+    const c = caps || cropCaps(budget, { fullRes: nativeCrop })
+    const cropBitmap = await getCropBitmap(rect, { maxSide: c.maxSide, maxMP: c.maxMP, native: nativeCrop })
     const cropW = cropBitmap.width
     const bounded = !nativeCrop && !!tf.workingActive
 
@@ -94,9 +104,14 @@ const decodeCropAlpha = async (proxyMask, prompts, rect, tf, { budget, revision,
         prompts: cropPrompts,
         doDecode,
         upFactor,
+        compose,
+        emitBlob,
     }, [cropBitmap, proxyBuf.buffer])
     if (res.stale) return null
-    return { rect, proxySubrect, upFactor, bounded, alpha: res.alpha, width: res.width, height: res.height, decoded: res.decoded }
+    return {
+        rect, proxySubrect, upFactor, bounded,
+        blob: res.blob, cutout: res.cutout, alpha: res.alpha, width: res.width, height: res.height, decoded: res.decoded,
+    }
 }
 
 // Rect-space prompts → the crop bitmap's own pixel space.
@@ -107,40 +122,16 @@ const scaleCropPrompts = (p, ds) => (Math.abs(ds - 1) < 1e-6 ? p : {
     clampMargin: (p.clampMargin || 0) * ds,
 })
 
-// Original photo kept only where the crop alpha is on; outside the rect stays
-// clear (no seams). One full-frame buffer (`out`): the photo goes in, then a
-// single destination-in of the crop mask over the (scaled) rect both applies
-// the mask AND clears everything outside it — no separate mask frame. `alpha`
-// is cloned, never mutated (a reused patch must survive a second export).
-// Both long edge AND total pixel count cap the exported frame. A 8192×8192
-// canvas is 256 MB before its source/mask/PNG buffers — an unnecessary spike
-// no matter the host, even though its long edge is within the 8K limit.
-const compositeCropAlpha = async (alpha, width, height, rect, tf, decoded, { exportMaxSide = 0, exportMaxMP = 0 } = {}) => {
-    const sideScale = exportMaxSide ? exportMaxSide / Math.max(tf.originalW, tf.originalH) : 1
-    const pixelScale = exportMaxMP ? Math.sqrt((exportMaxMP * 1e6) / (tf.originalW * tf.originalH)) : 1
-    const es = Math.min(1, sideScale, pixelScale)
-    const outW = Math.max(1, Math.round(tf.originalW * es))
-    const outH = Math.max(1, Math.round(tf.originalH * es))
-    const { source: original, owned } = await getOriginalForExport({ maxSide: exportMaxSide, maxMP: exportMaxMP })
-    try {
-        const out = makeCanvas(outW, outH)
-        const octx = out.getContext('2d')
-        octx.imageSmoothingEnabled = true
-        octx.imageSmoothingQuality = 'high'
-        octx.drawImage(original, 0, 0, outW, outH)
-
-        const cropMask = makeCanvas(width, height)
-        const cm = new ImageData(new Uint8ClampedArray(alpha), width, height)
-        for (let i = 0; i < cm.data.length; i += 4) cm.data[i + 3] = cm.data[i] // luma → alpha
-        cropMask.getContext('2d').putImageData(cm, 0, 0)
-
-        octx.globalCompositeOperation = 'destination-in'
-        octx.drawImage(cropMask, 0, 0, width, height, rect.x * es, rect.y * es, rect.w * es, rect.h * es)
-
-        return { canvas: out, width: outW, height: outH, decoded }
-    } finally {
-        if (owned) { try { original.close() } catch { /* closed */ } }
-    }
+// The worker already fused the crop RGB with the matte (straight alpha), so the
+// deliverable is just that crop-sized buffer painted to a canvas. No full-frame
+// allocation, no full-original decode, no separate mask frame. The old
+// full-frame path allocated roughly twice the original in RGBA and was the
+// export memory spike. Used by the in-page test hook; the download path takes
+// the worker-encoded Blob instead.
+const cutoutCanvas = (cutout, width, height, decoded, rect) => {
+    const c = makeCanvas(width, height)
+    c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(cutout), width, height), 0, 0)
+    return { canvas: c, width, height, decoded, rect }
 }
 
 const compositeProxyMask = async (proxyMask, tf, { exportMaxSide = 0, exportMaxMP = 0 } = {}) => {
@@ -186,35 +177,60 @@ export const escalateCrop = async (proxyMask, prompts, { budget, revision } = {}
     return crop
 }
 
-/** Full-res cutout for `proxyMask` selected by `prompts` (both proxy-space).
- *  → { canvas (original RGBA, masked alpha), width, height, decoded }, or
- *  null when no original is held (caller falls back to proxy export). */
-export const buildCutout = async (proxyMask, prompts, { budget, revision, preserveShape = false } = {}) => {
+/** Full-res tight cutout for the proxy mask selected by prompts (both in
+ *  proxy-space). Returns width, height, decoded, rect (crop offset in original
+ *  px, single-object only) and bounded (a resolution cap applied), plus either a
+ *  canvas (default, used by the test hook) or a worker-encoded blob (emitBlob,
+ *  the download path). null when no original is held so the caller falls back to
+ *  the proxy export. */
+export const buildCutout = async (proxyMask, prompts, { budget, revision, preserveShape = false, emitBlob = false } = {}) => {
     if (!hasOriginal()) return null
     const tf = getTransform()
     if (!tf) return null
 
-    const exportMaxSide = budget?.exportMaxSide || 0
-    const exportMaxMP = budget?.exportMaxMP || 0
-    if (preserveShape) return compositeProxyMask(proxyMask, tf, { exportMaxSide, exportMaxMP })
-    // Escalation already decoded this selection's crop at native res —
-    // composite that patch instead of decoding again. A working-res patch
-    // (bounded hosts) is interaction-only: export re-decodes natively below.
-    const patch = getHdPatch(revision)
-    if (patch && !patch.bounded) return compositeCropAlpha(patch.alpha, patch.width, patch.height, patch.rect, tf, patch.decoded, { exportMaxSide, exportMaxMP })
+    // A manual union (multiple objects) is not a single crop, so it keeps the
+    // proxy-res full-frame composite, bounded by exportMaxMP with no native decode.
+    if (preserveShape) {
+        return compositeProxyMask(proxyMask, tf, {
+            exportMaxSide: budget?.exportMaxSide || 0,
+            exportMaxMP: budget?.exportMaxMP || 0,
+        })
+    }
 
     const summary = summarizeMaskRGBA(proxyMask.data, proxyMask.width, proxyMask.height)
     if (!summary.bbox) return null
     const rect = cropRectFromBBox(summary.bbox, tf)
-    const crop = await decodeCropAlpha(proxyMask, prompts, rect, tf, { budget, revision, nativeCrop: true })
+    // Always recompose fresh at full res: the worker fuses crop RGB and matte
+    // into one straight-alpha cutout. The escalation patch stays for the live
+    // overlay only, so export quality is never bounded by an interaction decode.
+    // Crop-sized throughout, so there is no full-frame spike. On the download
+    // path the worker also encodes the PNG and returns a blob, keeping the main
+    // thread flat; the test hook takes the buffer and builds a canvas.
+    const crop = await decodeCropAlpha(proxyMask, prompts, rect, tf, {
+        budget, revision, nativeCrop: true, compose: true, emitBlob, caps: cropCaps(budget, { fullRes: true }),
+    })
     if (!crop) return null
-    return compositeCropAlpha(crop.alpha, crop.width, crop.height, rect, tf, crop.decoded, { exportMaxSide, exportMaxMP })
+    // Decoded below the crop native width means a resolution cap applied (bounded
+    // tier or memory pressure), not full sensor resolution.
+    const bounded = crop.width < rect.w - 1
+    if (emitBlob) {
+        if (!crop.blob) return null
+        return { blob: crop.blob, width: crop.width, height: crop.height, decoded: crop.decoded, rect, bounded }
+    }
+    if (!crop.cutout) return null
+    const out = cutoutCanvas(crop.cutout, crop.width, crop.height, crop.decoded, rect)
+    out.bounded = bounded
+    return out
 }
 
-/** buildCutout → PNG Blob (or null when there's no original to export). */
+/** buildCutout to a PNG Blob (or null when there is no original to export). The
+ *  native path is encoded in the worker so the main thread never holds the
+ *  full-frame canvas; the preserveShape path returns a canvas encoded here. */
 export const exportCutoutBlob = async (proxyMask, prompts, opts) => {
-    const res = await buildCutout(proxyMask, prompts, opts)
+    const res = await buildCutout(proxyMask, prompts, { ...opts, emitBlob: true })
     if (!res) return null
-    const blob = await new Promise((r) => res.canvas.toBlob(r, 'image/png'))
-    return { blob, width: res.width, height: res.height, decoded: res.decoded }
+    const blob = res.blob || await new Promise((r) => res.canvas.toBlob(r, 'image/png'))
+    // bounded is undefined for the preserveShape full-frame path, true or false
+    // only for the native tight-crop path (drives the export status wording).
+    return { blob, width: res.width, height: res.height, decoded: res.decoded, bounded: res.bounded }
 }

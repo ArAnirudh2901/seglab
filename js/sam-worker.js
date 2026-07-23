@@ -17,9 +17,8 @@
  */
 
 import {
-    cancelBefore, detectorCandidates, encodeImage, getBudget, getEngineState, hdRefine, relievePressure, releaseDocument, segment, setEventSink, warm,
+    cancelBefore, encodeImage, getBudget, getEngineState, hdRefine, relievePressure, releaseDocument, segment, setEventSink, warm,
 } from './sam-engine.js'
-import { detect } from './detect-engine.js'
 
 const trace = (event, detail = {}) => console.log(`[seglab][worker] ${event}`, detail)
 
@@ -70,35 +69,13 @@ self.onmessage = async (event) => {
             }
             return
         }
-        if (op === 'detect') {
-            const candidates = detectorCandidates()
-            // The accelerated detector is a separate foundation model. Drop
-            // the image embedding before it allocates its WebGPU session so
-            // image encode and text grounding cannot peak together. Selecting
-            // a returned box re-encodes SlimSAM from the bounded proxy.
-            if (candidates.some((candidate) => candidate.detector === 'grounding')) releaseDocument()
-            const progress_callback = (info) => self.postMessage({
-                type: 'progress',
-                detail: { lane: 'text', name: info?.name, status: info?.status, file: info?.file, progress: info?.progress, loaded: info?.loaded, total: info?.total },
-            })
-            const res = await detect({
-                frame: payload.frame,
-                labels: payload.labels,
-                threshold: payload.threshold,
-                candidates,
-                dispose: getBudget().detectorDispose === 'now',
-                idleMs: getBudget().detectorIdleMs || 0,
-                progress_callback,
-            })
-            self.postMessage({ id, ok: true, result: res })
-            return
-        }
         if (op === 'hdExport') {
             const { source } = payload || {}
             try {
                 const result = await hdRefine(payload || {})
-                const transfer = result?.alpha ? [result.alpha.buffer] : []
-                self.postMessage({ id, ok: true, result }, transfer)
+                // Export composites a cutout (one buffer); escalation returns a mask.
+                const back = result?.cutout || result?.alpha
+                self.postMessage({ id, ok: true, result }, back ? [back.buffer] : [])
             } finally {
                 try { source?.close?.() } catch { /* already closed */ }
             }

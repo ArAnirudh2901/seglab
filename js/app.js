@@ -23,8 +23,9 @@ import { saveSession, loadSession, clearSession } from './session-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
-import { detectCandidates } from './text-ui.js'
-import { acceleratedDetectorAvailable, detectorCached, detectorDownloadMB } from './detect-engine.js'
+import { detectCandidatesYoloe, detectCandidatesYoloWorld } from './text-ui.js'
+import { suggest, buildFacets } from './search-taxonomy.js'
+import { modelRegistry, noteModel, isModelNoted, laneOfModel } from './model-registry.js'
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
 import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-client.js'
 
@@ -41,18 +42,27 @@ const readProfileOverride = () => {
 }
 let profileOverride = readProfileOverride()
 
+// The user's persisted YOLOE text-lane scale (parallel to profileOverride): auto
+// defers to the tier's detectorScale; s/m/l force it; 'off' disables the lane.
+const YOLOE_SCALE_KEY = 'seglab.yoloeScale'
+const VALID_YOLOE = new Set(['s', 'm', 'l', 'off'])
+const readYoloeScale = () => {
+    try { const v = localStorage.getItem(YOLOE_SCALE_KEY); return VALID_YOLOE.has(v) ? v : null } catch { return null }
+}
+let yoloeScaleOverride = readYoloeScale()
+
 // Session budget: profile preset + URL overrides. The provisional budget is
 // LITE — nothing above it can be proven before the capability probe, and a
 // plain browser stays lite forever unless a trusted Phosmith hint or the
 // user's own profile toggle raises it.
-let BUDGET = resolveBudget(location.search, null, profileOverride)
+let BUDGET = resolveBudget(location.search, null, profileOverride, yoloeScaleOverride)
 let capability = null
 let pendingPhosmithResources = null
 const bootProbe = probeCapability().then((cap) => {
     capability = pendingPhosmithResources
         ? withPhosmithResources(cap, pendingPhosmithResources)
         : cap
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride), BUDGET.pressureLevel || 0)
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
     refreshChips()
     return cap
 }).catch((err) => {
@@ -80,10 +90,12 @@ const els = {
     pick: $('pick'), newimg: $('newimg'),
     status: $('status'), loadbar: $('loadbar'),
     prep: $('prep'), prepText: $('prep-text'),
-    chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipTiming: $('chip-timing'),
+    chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipModel: $('chip-model'), chipTiming: $('chip-timing'),
     profileSelect: $('profile-select'),
+    yoloeSelect: $('yoloe-select'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
-    signtoggle: $('signtoggle'), textinput: $('textinput'), selectall: $('selectall'),
+    signtoggle: $('signtoggle'), textwrap: $('textwrap'), textinput: $('textinput'), selectall: $('selectall'),
+    autocomplete: $('autocomplete'), refine: $('refine'),
     toleranceWrap: $('tolerance-wrap'), tolerance: $('tolerance'), toleranceValue: $('tolerance-value'),
     modes: {
         click: $('mode-click'), box: $('mode-box'),
@@ -107,7 +119,10 @@ const state = {
     // Per-channel RGB distance used only by Magic and Color. 36 is a useful
     // middle ground for photos; 72 was broad enough to merge unrelated hues.
     wandTolerance: 36,
-    textCandidates: [],       // [{ box, score, label }] proxy coords, from the detector
+    textCandidates: [],       // [{ box, score, label, color }] proxy coords, the visible (facet-filtered) set
+    textAllCandidates: [],    // unfiltered detections behind the refine chips
+    textFacets: null,         // { colour, kind, size, position } sub-class axes (search-taxonomy)
+    textFacetSel: null,       // { axis → Set(value) } chips the user has toggled on
     textMulti: false,         // phrase implied "all/every"
     textBackend: null,        // 'detector:device:dtype' that actually ran the last search
     mask: null,               // DERIVED: baseMask ∪ liveMask — the composed selection
@@ -130,6 +145,7 @@ const state = {
     runQueued: false,
     eagerEncode: null,        // idle-time encode promise; resolves null when input supersedes it
     encodePending: false,     // idle window was not calm enough; next selection will encode normally
+    modelPull: null,          // transient 'slimsam ⬇ 43%' text while weights stream in
     imageEpoch: 0,            // newest requested import; stale queued files never decode
     preprocessEpoch: 0,       // invalidates a queued idle encode on any user input
 }
@@ -180,6 +196,16 @@ const refreshChips = () => {
         : ''
     els.chipDevice.textContent = `device: ${clientState.device || '—'}${vendor} · ${profile} · ${gpu}${memory}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
+    // The registry notepad answers "is it already on this machine?" without
+    // touching Cache Storage — ✓ means no download will happen on next use.
+    if (els.chipModel) {
+        const noted = modelRegistry()
+        const have = ['slimsam', 'yoloe', 'yoloworld'].filter((id) => noted[id])
+        els.chipModel.textContent = state.modelPull
+            ? `models: ${state.modelPull}`
+            : (have.length ? `models: ${have.map((id) => `${id} ✓`).join(' · ')}` : 'models: none cached yet')
+        els.chipModel.classList.toggle('on', have.length > 0 && !state.modelPull)
+    }
     const run = clientState.lastRun
     els.chipTiming.textContent = run
         ? (run.encoded
@@ -200,6 +226,11 @@ const refreshChips = () => {
             ? `Forcing "${profileOverride}" above this device's safe auto tier ("${autoName}"). You're vouching for it — the memory governor still steps back down if it can't keep up.`
             : 'Resource profile — Auto picks the highest tier this device can safely run; force a tier if you know it can take more.'
     }
+    if (els.yoloeSelect) {
+        els.yoloeSelect.value = yoloeScaleOverride || 'auto'
+        const autoOpt = els.yoloeSelect.querySelector('option[value="auto"]')
+        if (autoOpt) autoOpt.textContent = BUDGET.yoloe === false ? 'Text: Auto (off)' : `Text: Auto (${BUDGET.detectorScale || 's'})`
+    }
 }
 
 const PROFILE_RANK = { lite: 0, standard8: 1, standard: 2, pro: 3, ultra: 4 }
@@ -215,7 +246,7 @@ const applyPhosmithResources = (resources = readPhosmithResources()) => {
     const previous = capability
     capability = withPhosmithResources(capability, resources)
     // Pressure is a one-way ratchet: a live budget update never resets it.
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride), BUDGET.pressureLevel || 0)
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
     const memoryReduced = previous.memoryGB > 0 && capability.memoryGB > 0
         && capability.memoryGB < previous.memoryGB
     const needsHeavyRelease = memoryReduced
@@ -247,7 +278,7 @@ const setProfileOverride = (value) => {
         else localStorage.removeItem(PROFILE_OVERRIDE_KEY)
     } catch { /* private browsing / storage disabled — override stays in-memory only */ }
     const previousProfile = BUDGET.profile
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride), BUDGET.pressureLevel || 0)
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
     const needsHeavyRelease = (PROFILE_RANK[BUDGET.profile] || 0) < (PROFILE_RANK[previousProfile] || 0)
     if (needsHeavyRelease) relievePressure(3).catch(() => {})
     refreshChips()
@@ -261,6 +292,21 @@ els.profileSelect?.addEventListener('change', (e) => {
     setProfileOverride(e.target.value === 'auto' ? null : e.target.value)
 })
 
+/** Text-lane scale toggle (parallel to profile): persisted, honored on locked
+ *  budgets. s/m/l force the scale; 'off' → YOLO-World open-vocab fallback. */
+const setYoloeScale = (value) => {
+    yoloeScaleOverride = VALID_YOLOE.has(value) ? value : null
+    try {
+        if (yoloeScaleOverride) localStorage.setItem(YOLOE_SCALE_KEY, yoloeScaleOverride)
+        else localStorage.removeItem(YOLOE_SCALE_KEY)
+    } catch { /* storage disabled — in-memory only */ }
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
+    refreshChips()
+}
+els.yoloeSelect?.addEventListener('change', (e) => {
+    setYoloeScale(e.target.value === 'auto' ? null : e.target.value)
+})
+
 subscribe((event) => {
     if (event.type === 'progress') {
         const d = event.detail || {}
@@ -268,16 +314,30 @@ subscribe((event) => {
             const pct = Math.round((d.loaded / d.total) * 100)
             els.loadbar.style.width = `${pct}%`
             // Progress can be SlimSAM or a text detector — name what's pulling.
-            const model = /grounding/i.test(d.name) ? 'Grounding DINO'
-                : /owl/i.test(d.name) ? 'OWLv2 detector' : 'SlimSAM'
+            const model = /yolo-?world/i.test(d.name) ? 'YOLO-World'
+                : /clip/i.test(d.name) ? 'CLIP text' : /yoloe/i.test(d.name) ? 'YOLOE' : 'SlimSAM'
             const mb = Math.max(1, Math.round(d.total / 1e6))
             setStatus(`Downloading ${model} — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~${mb} MB)`)
         } else if (d.status === 'done') {
             els.loadbar.style.width = '0%'
+            // Weights landed → note them in the registry so every later visit
+            // knows without probing. Then clear the transient pull text.
+            noteModel(laneOfModel(d.name || d.file || ''))
+            state.modelPull = null
+            refreshChips()
+        }
+        if (d.status === 'progress' && d.total) {
+            const lane = laneOfModel(d.name || d.file || '') || 'model'
+            state.modelPull = `${lane} ⬇ ${Math.round((d.loaded / d.total) * 100)}%`
+            refreshChips()
         }
         return
     }
-    if (event.type === 'lane') { refreshChips(); return }
+    if (event.type === 'lane') {
+        noteModel(laneOfModel(event.label || ''))
+        refreshChips()
+        return
+    }
     if (event.type === 'stage') {
         const d = event.detail || {}
         if (state.running && d.revision === state.revision) {
@@ -285,6 +345,9 @@ subscribe((event) => {
             else if (d.stage === 'decode') setStatus(d.encoded ? 'Selecting… tracing the object' : 'Selecting… tracing the object (photo already prepared)')
         }
         return
+    }
+    if (clientState.ready && (!isModelNoted('slimsam') || clientState.device)) {
+        noteModel('slimsam', clientState.device ? { device: clientState.device } : {})
     }
     refreshChips()
     if (clientState.ready && !state.running && !state.hasImage) {
@@ -384,7 +447,15 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
             return null
         }
         // prime: one throwaway decode initializes the decoder session too.
-        const result = await encodeImage(els.view, { revision, prime: true })
+        // gpuOnly on an unverified budget: the engine refuses to pay the WASM
+        // lane's multi-GB arena for a prewarm nobody asked for — the first
+        // real click pays it knowingly.
+        const result = await encodeImage(els.view, { revision, prime: true, gpuOnly: BUDGET.memoryLocked === true })
+        if (result?.skipped) {
+            state.encodePending = true
+            console.log('[seglab] eager encode skipped — wasm lane on an unverified device; first selection will encode')
+            return null
+        }
         if (!current() || result?.stale) return null
         state.encodePending = false
         if (!state.running) setStatus(`${readyStatus} · prepared locally`)
@@ -404,6 +475,7 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
 // bounded regions on demand), so a huge photo never lands in RAM as full-res.
 const showImage = async (source, {
     proxyBlob = null, orientation = null, raw = false, sourceBytes = source?.size || 0,
+    noEagerEncode = false,
 } = {}, imageEpoch) => {
     if (!imageRequestIsCurrent(imageEpoch)) return null
     const epoch = showPrep('Building a lightweight interaction preview…')
@@ -490,17 +562,35 @@ const showImage = async (source, {
     // otherwise be lost to a power cut.
     persistSession({ immediate: true })
     // The proxy is on screen; ONLY NOW does SlimSAM warm (queued — it can
-    // never overlap the decode that just released its bitmaps).
+    // never overlap the decode that just released its bitmaps). On an
+    // UNVERIFIED budget the warm itself waits one settle window too, so
+    // session-create + GPU pipeline compile never bursts while the import is
+    // still flushing — decode → settle → warm → calm → encode, strictly
+    // staggered. Eager encode is chained AFTER warm resolves so the worker
+    // never sees an encode op before its warm op.
     hidePrep(epoch)
-    ensureWarm().catch((err) => {
-        console.warn('[seglab] model warm failed (first selection will retry):', err?.message)
-    })
-    // Speculative encode-at-import: bounded (one embedding, calm-gated) so
-    // even the baseline profile pays the encode before the first click. The
-    // pressure ratchet turns it back off.
-    if (BUDGET.eagerEncode) {
-        scheduleEagerEncode(imageEpoch, state.revision, readyStatus)
+    const startEngine = async () => {
+        if (BUDGET.memoryLocked) await new Promise((resolve) => setTimeout(resolve, 1200))
+        try { await ensureWarm() } catch (err) {
+            console.warn('[seglab] model warm failed (first selection will retry):', err?.message)
+        }
+        if (!imageRequestIsCurrent(imageEpoch)) return null
+        // Speculative encode-at-import: bounded (one embedding, calm-gated,
+        // gpuOnly on locked budgets). The pressure ratchet turns it back off.
+        // A session RESTORE never eager-encodes: after a browser OOM tab-kill
+        // the reload would otherwise auto-repeat the exact allocation that got
+        // the tab killed — the first click pays instead.
+        if (BUDGET.eagerEncode && !noEagerEncode) {
+            scheduleEagerEncode(imageEpoch, state.revision, readyStatus)
+            return state.eagerEncode
+        }
+        if (noEagerEncode) state.encodePending = true
+        return null
     }
+    // Assigned synchronously so the test hook (and any caller) can await the
+    // whole staggered chain; scheduleEagerEncode later swaps in its own promise.
+    state.eagerEncode = startEngine()
+    noteInteraction() // start the idle-hibernate clock for this document
     return transform
 }
 
@@ -648,6 +738,39 @@ const governor = createMemoryGovernor({
 governor.start()
 window.__seglabGovernor = governor // test/debug hook (cycleNow / feedMeasurement)
 
+/* ─── Idle engine hibernate ────────────────────────────────────────────────
+ * The resident hog between interactions is the ORT session arena (~0.5 GB on
+ * WebGPU, ~3 GB on the WASM lane) — NOT the embedding, which is only ~MBs.
+ * Those arena bytes are what hold the Activity-Monitor plateau up while the
+ * user merely deliberates, and the GPU share is invisible to the governor's
+ * measure API. After a long idle window (shorter once the governor has shed)
+ * release the arena via relievePressure(3); the next selection rebuilds the
+ * session (weights from cache — one compile, a few seconds) and re-encodes.
+ * Committed masks live in the overlay, so nothing on screen is lost. Off
+ * (samIdleMs 0) on manually-vouched tiers. */
+let samIdleTimer = null
+const effectiveSamIdleMs = () => {
+    const base = BUDGET.samIdleMs || 0
+    if (!base) return 0
+    return (BUDGET.pressureLevel || 0) >= 2 ? Math.min(base, 45_000) : base
+}
+const hibernateEngine = () => {
+    samIdleTimer = null
+    if (!state.hasImage) return
+    if (state.running) { samIdleTimer = setTimeout(hibernateEngine, 5000); return } // busy — retry
+    relievePressure(3).catch(() => {})
+    state.encodePending = true // next selection rebuilds + re-encodes; status reflects it
+    if (DEBUG) console.log('[seglab] idle hibernate — session arena released; next selection rebuilds')
+}
+const noteInteraction = () => {
+    if (samIdleTimer) { clearTimeout(samIdleTimer); samIdleTimer = null }
+    const ms = effectiveSamIdleMs()
+    if (ms && state.hasImage) samIdleTimer = setTimeout(hibernateEngine, ms)
+}
+for (const ev of ['pointerdown', 'pointerup', 'keydown', 'wheel']) {
+    window.addEventListener(ev, noteInteraction, { passive: true })
+}
+
 /* ─── Modes ──────────────────────────────────────────────────────────────── */
 
 // Modes where include/exclude applies — via the sign toggle or right/Alt-click.
@@ -661,8 +784,9 @@ const setMode = (mode) => {
     }
     els.signtoggle.style.display = SIGN_MODES.has(mode) ? '' : 'none'
     els.toleranceWrap.hidden = mode !== 'magic' && mode !== 'color'
-    els.textinput.hidden = mode !== 'text'
+    els.textwrap.hidden = mode !== 'text'
     els.selectall.hidden = mode !== 'text' || state.textCandidates.length === 0
+    if (mode !== 'text') { hideAutocomplete(); clearRefine() }
     if (mode === 'text') {
         els.textinput.focus()
         void hintTextSearch()
@@ -708,6 +832,7 @@ function clearPrompts() {
     state.manual = null
     state.polygonDraft = []
     state.textCandidates = []
+    clearRefine()
     state.mask = null
     state.maskRaw = null
     state.maskSummary = null
@@ -893,7 +1018,7 @@ const restoreSession = async () => {
         // Claim an epoch: a user drop (or a test's own import) landing mid-restore
         // supersedes us, and we must not write the old ops over their document.
         const epoch = beginImageRequest()
-        await queueImage(new File([saved.blob], saved.name, { type: saved.blob.type }), { sourceBytes: saved.blob.size }, epoch)
+        await queueImage(new File([saved.blob], saved.name, { type: saved.blob.type }), { sourceBytes: saved.blob.size, noEagerEncode: true }, epoch)
         if (!imageRequestIsCurrent(epoch) || !state.hasImage) return false
         // An op stack only composes at the proxy size it was captured at; a
         // different budget on this run means the geometry no longer lines up.
@@ -952,6 +1077,7 @@ const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
     state.box = null
     state.lasso = null
     state.textCandidates = []
+    clearRefine()
     clearLive()
     state.manual = state.baseMask ? { kind, ...geometry } : null
     recomposeMask()
@@ -1024,6 +1150,7 @@ const startBrush = (point, erase) => {
     state.box = null
     state.lasso = null
     state.textCandidates = []
+    clearRefine()
     state.maskRaw = null
     state.showRaw = false
     state.manual = { kind: 'brush' }
@@ -1044,6 +1171,7 @@ const commitBrushMask = () => {
     state.box = null
     state.lasso = null
     state.textCandidates = []
+    clearRefine()
     // The stroke canvas was seeded from the composed mask, so it already IS
     // the final whole-selection result: flatten the stack to this one op.
     state.baseOps = []
@@ -1360,6 +1488,7 @@ async function runNow() {
         setStatus(`Selection failed: ${err?.message}`)
     } finally {
         state.running = false
+        noteInteraction() // a completed selection resets the idle-reclaim clock
         if (state.runQueued) { state.runQueued = false; scheduleRun() }
     }
 }
@@ -1397,6 +1526,7 @@ async function runObjectSubtract(x, y) {
         }
     } finally {
         state.running = false
+        noteInteraction() // a completed selection resets the idle-reclaim clock
         if (state.runQueued) { state.runQueued = false; scheduleRun() }
     }
 }
@@ -1526,61 +1656,69 @@ let detectTimer = null
 
 /** Set expectations before the user types: the detector is a one-time download
  *  and the first search is the slow one. Local state only — no network. */
-async function hintTextSearch() {
-    if (!state.hasImage) return
-    const accelerated = acceleratedDetectorAvailable && BUDGET.detectorWebGPU === true && BUDGET.gpuTier === 'accelerated' && BUDGET.forceWasm !== true
-    const cached = await detectorCached({ accelerated })
-    if (state.mode !== 'text') return // left Text while checking
-    setStatus(cached
-        ? 'Text search ready'
-        : `Text search ready — the first search downloads the detector (~${detectorDownloadMB({ accelerated })} MB), then it's cached`)
+function hintTextSearch() {
+    if (!state.hasImage || state.mode !== 'text') return
+    // Two on-device lanes: YOLOE (fast baked vocab) then YOLO-World (any phrase,
+    // CLIP-conditioned). Both download once, then cache.
+    setStatus('Text search ready — describe any object, e.g. “flower”, “the red car”')
 }
 
 async function runDetect(phrase) {
     if (!state.hasImage || !phrase.trim()) {
         state.textCandidates = []
+        clearRefine()
         els.selectall.hidden = true
         renderOverlay()
         return
     }
     bumpRevision()
     const revision = state.revision
-    const accelerated = acceleratedDetectorAvailable && BUDGET.detectorWebGPU === true && BUDGET.gpuTier === 'accelerated' && BUDGET.forceWasm !== true
-    const detectorMB = detectorDownloadMB({ accelerated })
-    setStatus(await detectorCached({ accelerated })
-        ? `Looking for “${phrase.trim()}”…`
-        : `Downloading the detector (~${detectorMB} MB), then looking for “${phrase.trim()}”…`)
-    if (revision !== state.revision) return // superseded while checking the cache
+    // YOLOE (fast baked vocab) unless turned off; both lanes run on WASM or GPU.
+    const yoloeEnabled = BUDGET.yoloe !== false
+    const yoloeScale = BUDGET.detectorScale || 's'
+    const ywScale = ['s', 'm', 'l', 'x'].includes(yoloeScale) ? yoloeScale : 's'
+    const idleMs = BUDGET.detectorDispose === 'now' ? 0 : (BUDGET.detectorIdleMs || 0)
+    const evict = BUDGET.detectorEvictOnEncode === true
+    setStatus(`Looking for “${phrase.trim()}”… (first search downloads the detector, then it's cached)`)
+    if (revision !== state.revision) return // superseded while checking
     try {
-        const res = await detectCandidates(phrase)
-        if (revision !== state.revision) return // superseded by newer input
+        // Fast baked-vocab YOLOE first; anything its vocab can't name falls to
+        // the open-vocab YOLO-World lane (CLIP-conditioned, arbitrary phrases).
+        let res = null
+        if (yoloeEnabled) {
+            res = await detectCandidatesYoloe(phrase, { scale: yoloeScale, idleMs, evict })
+            if (revision !== state.revision) return
+        }
+        if (!res) {
+            res = await detectCandidatesYoloWorld(phrase, { scale: ywScale, idleMs, evict })
+            if (revision !== state.revision) return // superseded by newer input
+        }
         state.textBackend = res?.backend || null
-        // `accelerated` names the lane the ladder was OFFERED; a returned
-        // backend that isn't grounding means this search (or an earlier one
-        // this session) hit a build/inference failure and demoted — see the
-        // laneFailures sticky-fallback in detect-engine.js. Surfaced once here
-        // instead of only in the console, so "why is this OWLv2" has an answer.
-        const fellBack = accelerated && state.textBackend && !state.textBackend.startsWith('grounding')
-        const fallbackNote = fellBack ? ' · Grounding DINO unavailable this session, using OWLv2' : ''
         refreshChips()
         if (!res || res.candidates.length === 0) {
             state.textCandidates = []
+            clearRefine()
             els.selectall.hidden = true
-            setStatus(`No matches for “${phrase.trim()}”. Try different words.${fallbackNote}`)
+            setStatus(`No matches for “${phrase.trim()}”. Try different words.`)
             renderOverlay()
             return
         }
-        state.textCandidates = res.candidates
         state.textMulti = res.multi
-        els.selectall.hidden = res.candidates.length < 2
-        const n = res.candidates.length
-        // Singular phrase, one object: select it outright — no tap needed.
-        if (!res.multi && n === 1) {
-            setStatus(`Selecting “${phrase.trim()}”…${fallbackNote}`)
+        // Singular phrase, one object: select it outright — no refine, no tap.
+        if (!res.multi && res.candidates.length === 1) {
+            state.textCandidates = res.candidates
+            clearRefine()
+            els.selectall.hidden = true
+            setStatus(`Selecting “${phrase.trim()}”…`)
             selectCandidate(0)
             return
         }
-        setStatus(`${n} match${n > 1 ? `es — tap one or Select all` : ' — tap it'}${fallbackNote}`)
+        // Several instances: group them into sub-class refine chips (one
+        // detection pass, filtering is free) and show every match to start.
+        setupFacets(res.candidates)
+        els.selectall.hidden = state.textCandidates.length < 2
+        const n = state.textCandidates.length
+        setStatus(`${n} match${n > 1 ? 'es — tap one, refine below, or Select all' : ' — tap it'}`)
         renderOverlay()
     } catch (err) {
         if (revision !== state.revision) return
@@ -1600,6 +1738,7 @@ const selectCandidate = (i) => {
     state.lasso = null
     state.manual = null
     state.textCandidates = []
+    clearRefine()
     els.selectall.hidden = true
     bumpRevision()
     scheduleRun()
@@ -1613,6 +1752,7 @@ async function selectAll() {
     const revision = state.revision
     state.running = true
     state.textCandidates = []
+    clearRefine()
     state.manual = null
     els.selectall.hidden = true
     setStatus(`Selecting ${boxes.length} objects…`)
@@ -1644,6 +1784,153 @@ async function selectAll() {
     }
 }
 
+/* ─── Autocomplete (main class → kind browsing) ──────────────────────────── */
+
+let acItems = []
+let acActive = -1
+
+function hideAutocomplete() {
+    if (els.autocomplete.hidden) return
+    els.autocomplete.hidden = true
+    els.autocomplete.replaceChildren()
+    acItems = []
+    acActive = -1
+}
+
+const applySuggestion = (text) => {
+    els.textinput.value = text
+    hideAutocomplete()
+    clearTimeout(detectTimer)
+    runDetect(text)
+}
+
+const renderAutocomplete = () => {
+    const rows = suggest(els.textinput.value, { limit: 8 })
+    acItems = rows
+    acActive = -1
+    if (rows.length === 0) { hideAutocomplete(); return }
+    const frag = document.createDocumentFragment()
+    rows.forEach((row) => {
+        const el = document.createElement('div')
+        el.className = 'ac-row'
+        el.setAttribute('role', 'option')
+        const text = document.createElement('span')
+        text.className = 'ac-text'
+        text.textContent = row.text
+        const detail = document.createElement('span')
+        detail.className = 'ac-detail'
+        detail.textContent = row.group === 'category' ? row.detail : row.group
+        el.append(text, detail)
+        // mousedown (not click) so the input's blur doesn't close the list first.
+        el.addEventListener('mousedown', (e) => { e.preventDefault(); applySuggestion(row.text) })
+        frag.append(el)
+    })
+    els.autocomplete.replaceChildren(frag)
+    els.autocomplete.hidden = false
+}
+
+/** Arrow-key move through the open list; returns false when there's nothing open. */
+const moveAutocomplete = (delta) => {
+    if (els.autocomplete.hidden || acItems.length === 0) return false
+    acActive = (acActive + delta + acItems.length) % acItems.length
+    ;[...els.autocomplete.children].forEach((el, i) => el.classList.toggle('on', i === acActive))
+    return true
+}
+
+/* ─── Sub-class refine chips (colour · kind · size · position) ────────────── */
+
+const REFINE_AXES = [['colour', 'Colour'], ['kind', 'Kind'], ['size', 'Size'], ['position', 'Where']]
+const SWATCH = {
+    red: '#e0403a', orange: '#e07a1e', yellow: '#e0c020', green: '#3fa54a',
+    blue: '#3f7ad0', purple: '#8a4fd0', pink: '#e06aa8', brown: '#8a5a34',
+    white: '#f0f0f0', gray: '#9098a0', black: '#20242a',
+}
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1)
+
+function clearRefine() {
+    state.textFacets = null
+    state.textFacetSel = null
+    state.textAllCandidates = []
+    if (!els.refine.hidden) { els.refine.hidden = true; els.refine.replaceChildren() }
+}
+
+// AND across axes, OR within an axis: a candidate shows when, for every axis
+// that has a chip selected, it belongs to at least one selected chip.
+const applyFacetFilter = () => {
+    const { textFacets: facets, textFacetSel: sel, textAllCandidates: all } = state
+    if (!facets || !sel) { state.textCandidates = all.slice(); return }
+    const keep = all.map(() => true)
+    for (const [axis] of REFINE_AXES) {
+        const chosen = sel[axis]
+        if (!chosen || chosen.size === 0) continue
+        const allowed = new Set()
+        for (const f of facets[axis]) if (chosen.has(f.value)) for (const idx of f.idx) allowed.add(idx)
+        for (let i = 0; i < all.length; i += 1) if (!allowed.has(i)) keep[i] = false
+    }
+    state.textCandidates = all.filter((_, i) => keep[i])
+}
+
+const renderRefine = () => {
+    const facets = state.textFacets
+    const axes = REFINE_AXES.filter(([axis]) => facets?.[axis]?.length)
+    if (!facets || axes.length === 0) { clearRefine(); return }
+    const frag = document.createDocumentFragment()
+    for (const [axis, title] of axes) {
+        const group = document.createElement('div')
+        group.className = 'axis'
+        const label = document.createElement('span')
+        label.className = 'axis-label'
+        label.textContent = title
+        group.append(label)
+        for (const f of facets[axis]) {
+            const chip = document.createElement('button')
+            chip.className = 'refine-chip'
+            if (state.textFacetSel[axis]?.has(f.value)) chip.classList.add('on')
+            if (axis === 'colour' && SWATCH[f.value]) {
+                const sw = document.createElement('span')
+                sw.className = 'swatch'
+                sw.style.background = SWATCH[f.value]
+                chip.append(sw)
+            }
+            const name = document.createElement('span')
+            name.textContent = axis === 'kind' ? f.label : cap(f.label)
+            const count = document.createElement('span')
+            count.className = 'count'
+            count.textContent = String(f.count)
+            chip.append(name, count)
+            chip.addEventListener('click', () => toggleFacet(axis, f.value))
+            group.append(chip)
+        }
+        frag.append(group)
+    }
+    els.refine.replaceChildren(frag)
+    els.refine.hidden = false
+}
+
+const toggleFacet = (axis, value) => {
+    const sel = state.textFacetSel
+    if (!sel[axis]) sel[axis] = new Set()
+    if (sel[axis].has(value)) sel[axis].delete(value)
+    else sel[axis].add(value)
+    applyFacetFilter()
+    els.selectall.hidden = state.textCandidates.length < 2
+    renderRefine()
+    renderOverlay()
+    const n = state.textCandidates.length
+    setStatus(n === 0
+        ? 'No matches with those filters — tap the chips to widen'
+        : `${n} match${n > 1 ? 'es — tap one or Select all' : ' — tap it'}`)
+}
+
+/** Populate the refine bar from a fresh detection and show all candidates. */
+const setupFacets = (candidates) => {
+    state.textAllCandidates = candidates
+    state.textFacets = buildFacets(candidates, { width: els.overlay.width, height: els.overlay.height })
+    state.textFacetSel = {}
+    applyFacetFilter()
+    renderRefine()
+}
+
 /** Candidate index under a proxy-space point, or -1. */
 const candidateAt = (x, y) => {
     for (let i = 0; i < state.textCandidates.length; i += 1) {
@@ -1655,11 +1942,23 @@ const candidateAt = (x, y) => {
 
 els.textinput.addEventListener('input', () => {
     clearTimeout(detectTimer)
+    renderAutocomplete()
     detectTimer = setTimeout(() => runDetect(els.textinput.value), 400)
 })
 els.textinput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { clearTimeout(detectTimer); runDetect(els.textinput.value) }
+    if (e.key === 'ArrowDown' && moveAutocomplete(1)) { e.preventDefault(); return }
+    if (e.key === 'ArrowUp' && moveAutocomplete(-1)) { e.preventDefault(); return }
+    if (e.key === 'Escape') { hideAutocomplete(); return }
+    if (e.key === 'Enter') {
+        // A highlighted suggestion wins; otherwise search the typed text.
+        if (acActive >= 0 && acItems[acActive]) { e.preventDefault(); applySuggestion(acItems[acActive].text); return }
+        clearTimeout(detectTimer)
+        hideAutocomplete()
+        runDetect(els.textinput.value)
+    }
 })
+els.textinput.addEventListener('focus', renderAutocomplete)
+els.textinput.addEventListener('blur', () => setTimeout(hideAutocomplete, 120))
 els.selectall.addEventListener('click', selectAll)
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
@@ -1904,9 +2203,14 @@ els.cutout.addEventListener('click', async () => {
         a.download = 'seglab-cutout.png'
         a.click()
         setTimeout(() => URL.revokeObjectURL(a.href), 5000)
-        const tf = getTransform()
-        const reduced = wasNative && tf && (out.width < tf.originalW || out.height < tf.originalH)
-        setStatus(`Exported ${out.width}×${out.height} cutout${out.decoded ? ' · HD re-decode' : ''}${reduced ? ` · reduced from ${tf.originalW}×${tf.originalH} for this device’s safe memory profile` : ''}`)
+        // The native cutout is a tight crop (out.width < originalW by design), so
+        // dimensions no longer signal loss. bounded does: false is full sensor
+        // resolution, true is a memory cap that shrank the crop, undefined is the
+        // proxy or preserveShape path.
+        const note = out.bounded === false ? ' · full resolution'
+            : out.bounded === true ? ' · bounded for this device’s safe memory profile'
+                : ''
+        setStatus(`Exported ${out.width}×${out.height} cutout${out.decoded ? ' · HD re-decode' : ''}${note}`)
     } catch (err) {
         console.error('[seglab] export failed:', err)
         setStatus(`Export failed: ${err?.message}`)
@@ -1931,6 +2235,16 @@ const waitForRun = async () => {
 
 window.__seglab = {
     loadDemo: async (longSide) => { await queueImage(buildDemoScene(longSide)) },
+    // Import a same-origin URL through the REAL upload path (blob custody,
+    // raw-preview extraction, proxy decode) — scripted checks can use the
+    // canonical NEF instead of a synthetic scene.
+    importUrl: async (url) => {
+        const blob = await (await fetch(url)).blob()
+        const name = String(url).split('/').pop() || 'import.bin'
+        // loadFile, not queueImage: it owns raw detection (.nef → preview path).
+        await loadFile(new File([blob], name, { type: blob.type }))
+        return { hasImage: state.hasImage, w: els.view.width, h: els.view.height }
+    },
     // Demo scene through the real UPLOAD path (Blob custody, proxy decode,
     // working copy) instead of the resident-drawable demo path.
     loadDemoBlob: async (longSide) => {
@@ -2050,11 +2364,15 @@ window.__seglab = {
             preserveShape: Boolean(state.manual),
         })
         if (!res) return null
-        const { canvas, width, height, decoded } = res
+        const { canvas, width, height, decoded, rect } = res
         const d = canvas.getContext('2d').getImageData(0, 0, width, height).data
+        // The native cutout is a tight crop offset by rect; probe coords are in
+        // ORIGINAL px, so shift them into crop space (rect absent ⇒ full-frame).
+        const ox = rect ? rect.x : 0
+        const oy = rect ? rect.y : 0
         const alphaAt = (x, y) => {
-            const xi = Math.round(x)
-            const yi = Math.round(y)
+            const xi = Math.round(x - ox)
+            const yi = Math.round(y - oy)
             if (xi < 0 || yi < 0 || xi >= width || yi >= height) return 0
             return d[(yi * width + xi) * 4 + 3]
         }
@@ -2083,6 +2401,17 @@ window.__seglab = {
             out.outsideTransparent = alphaAt(probe.cx + probe.r * 1.3, probe.cy) < 16
         }
         return out
+    },
+    // Real download path: worker-encoded PNG blob (main thread stays flat).
+    // Reports the blob size and type plus the cutout metadata so a gate can
+    // confirm the encoder produced a valid file at the expected resolution.
+    exportBlobInfo: async () => {
+        if (!state.mask) return null
+        const r = await exportCutoutBlob(state.mask, currentPrompts(), {
+            budget: BUDGET, revision: state.revision, preserveShape: Boolean(state.manual),
+        })
+        if (!r) return null
+        return { size: r.blob.size, type: r.blob.type, width: r.width, height: r.height, decoded: r.decoded, bounded: r.bounded }
     },
     // Crop-escalation probe. Measures the current small-object boundary in
     // ORIGINAL px against a synthetic disc `probe` {cx,cy,r}: the native patch
@@ -2209,6 +2538,30 @@ window.__seglab = {
         if (boxes.length === 1) { selectCandidate(0); await waitForRun() } else { await selectAll() }
         const s = window.__seglab.state()
         return { ...s, ...(window.__seglab.maskStats() || {}) }
+    },
+    // Direct YOLO-World lane probe (bypasses runDetect revision/evict churn) —
+    // returns raw candidate count + backend for scripted validation.
+    testYoloWorld: async (phrase) => {
+        try {
+            const res = await detectCandidatesYoloWorld(phrase, { scale: 's', idleMs: 0, evict: false })
+            return res
+                ? { n: res.candidates.length, backend: res.backend, labels: res.candidates.map((c) => c.label).slice(0, 6) }
+                : { n: 0, backend: null }
+        } catch (err) { return { error: String(err?.message || err) } }
+    },
+    // Deterministic REFINE-CHIP plumbing (no detector): feed pre-tagged
+    // candidates [{ box, score, label, color }] through the real facet build +
+    // render path, so scripted checks can assert the sub-class bar without the
+    // slow open-vocab lane. Returns the facet axes that rendered.
+    previewCandidates: (cands) => {
+        setupFacets(cands)
+        els.selectall.hidden = state.textCandidates.length < 2
+        renderOverlay()
+        return {
+            visible: state.textCandidates.length,
+            axes: Object.fromEntries(['colour', 'kind', 'size', 'position']
+                .map((a) => [a, (state.textFacets?.[a] || []).map((f) => `${f.label}:${f.count}`)])),
+        }
     },
     // Crash/power-cut persistence (verify.mjs): a real cut fires no unload, so
     // the gate reloads without one and asserts the work came back.

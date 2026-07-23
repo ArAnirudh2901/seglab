@@ -10,6 +10,13 @@ models/
 # Pinned LibRaw source cache for scripts/build-libraw-wasm.sh (refetched on demand).
 # The built artifact (public/wasm/raw-develop.*) IS committed, like cv-refine.
 build/
+# YOLOE export scratch: the .pt/.onnx the export script emits at the repo root
+# (the runtime copies live under the gitignored models/yoloe/), and the
+# standalone feasibility spike — all large, regenerated on demand.
+/yoloe-26*.onnx
+/yoloe-26*.pt
+spikes/
+
 # Test media dropped in for debugging (screen recordings, sample RAW/photos)
 *.mp4
 *.mov
@@ -22,3 +29,4 @@ build/
 *.raf
 *.orf
 *.rw2
+*.pt

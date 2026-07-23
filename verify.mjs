@@ -24,8 +24,11 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  bareLabel, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, unletterboxBox,
+  bareLabel, classifyPixelColor, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, unletterboxBox,
 } from './js/text-core.js'
+import {
+  buildFacets, expandQuery, labelMatchesQuery, regionOf, suggest,
+} from './js/search-taxonomy.js'
 import { classifyCapability } from './js/capability.js'
 import { refineMaskEdges } from './js/edge-refine.js'
 import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
@@ -253,6 +256,75 @@ try {
     `merged=[${merged.box}] distinct kept ${twoTrains.length}`,
   )
 
+  // Search taxonomy: main class → kind recall expansion.
+  const flowerExp = expandQuery('flower')
+  const roseExp = expandQuery('rose')
+  check(
+    'taxonomy: main class expands to its kinds; a kind stays specific; unknown → null',
+    flowerExp?.main === 'flower' && flowerExp.labels.includes('rose') && flowerExp.labels.includes('tulip')
+      && roseExp?.main === 'flower' && roseExp.labels.length === 1 && roseExp.labels[0] === 'rose'
+      && expandQuery('spaceship') === null,
+    `flower=${flowerExp?.labels.length} rose=[${roseExp?.labels}]`,
+  )
+  check(
+    'taxonomy: label match is class-aware, else falls back to flat whole-word',
+    labelMatchesQuery('flower', 'rose') && labelMatchesQuery('flower', 'tulip') && !labelMatchesQuery('flower', 'car')
+      && labelMatchesQuery('rose', 'rose') && !labelMatchesQuery('rose', 'tulip')
+      && labelMatchesQuery('bottle', 'water bottle') && !labelMatchesQuery('bottle', 'bottleneck'),
+    'expansion + fallback',
+  )
+
+  // Region axis (size/position) from a proxy box in a 1000×1000 image.
+  const big = regionOf([100, 100, 700, 700], 1000, 1000) // 36% area, centered
+  const tiny = regionOf([10, 10, 90, 90], 1000, 1000) // 0.6% area, top-left
+  const low = regionOf([300, 650, 800, 980], 1000, 1000) // large & low → foreground
+  check(
+    'taxonomy: regionOf buckets size + position, flags large-and-low as foreground',
+    big.size === 'large' && big.where === 'center' && tiny.size === 'small' && tiny.where === 'left'
+      && low.foreground === true,
+    `${big.size}/${big.where} ${tiny.size}/${tiny.where} fg=${low.foreground}`,
+  )
+
+  // Facets from ranked candidates (colour tagged by caller, region derived here).
+  const cands = [
+    { box: [0, 0, 400, 400], label: 'rose', color: 'red' },
+    { box: [500, 0, 900, 400], label: 'rose', color: 'red' },
+    { box: [0, 500, 400, 900], label: 'tulip', color: 'purple' },
+  ]
+  const facets = buildFacets(cands, { width: 1000, height: 1000 })
+  const redFacet = facets.colour.find((f) => f.value === 'red')
+  check(
+    'taxonomy: buildFacets groups colour + kind axes with correct member indices',
+    facets.colour.length === 2 && redFacet.count === 2 && redFacet.idx.join() === '0,1'
+      && facets.kind.length === 2 && facets.kind.find((f) => f.value === 'tulip').idx.join() === '2'
+      && buildFacets([cands[0]]).colour.length === 0,
+    `colour=${facets.colour.length} kind=${facets.kind.length}`,
+  )
+
+  // Autocomplete: main classes, kinds, colour combos; colour prefix carries.
+  const acFlo = suggest('flo')
+  const acRedFlo = suggest('red flo')
+  const acRose = suggest('ros')
+  check(
+    'taxonomy: suggest surfaces categories, kinds, and colour combos; empty → []',
+    acFlo.some((r) => r.text === 'flower' && r.group === 'category')
+      && acRedFlo.some((r) => r.text === 'red flower')
+      && acRose.some((r) => r.text === 'rose' && r.group === 'kind')
+      && suggest('').length === 0,
+    `flo=${acFlo.length} redflo=${acRedFlo.length} ros=${acRose.length}`,
+  )
+
+  // Pixel colour classifier + dominant-colour box sampling.
+  const redFrame = { data: new Uint8ClampedArray(4 * 4 * 3), width: 4, height: 4, contentWidth: 4, contentHeight: 4 }
+  for (let i = 0; i < redFrame.data.length; i += 3) { redFrame.data[i] = 220; redFrame.data[i + 1] = 20; redFrame.data[i + 2] = 20 }
+  const dom = dominantColorForBox(redFrame, [0, 0, 1, 1])
+  check(
+    'taxonomy: classifyPixelColor + dominantColorForBox agree on a red field',
+    classifyPixelColor(230, 20, 20) === 'red' && classifyPixelColor(248, 248, 248) === 'white'
+      && classifyPixelColor(8, 8, 8) === 'black' && dom?.color === 'red',
+    `dom=${dom?.color}`,
+  )
+
   // Edge refiner: boundary-local soft alpha (unchanged contract).
   const ew = 37
   const eh = 29
@@ -449,10 +521,14 @@ try {
     JSON.stringify({ ultraFlagship: ultraBudget.flagship, p2: pressured.cvRefine, p3: pressured3.exportMaxMP }),
   )
   check(
-    'policy: pressure ratchet drops SAM WebGPU and lowers the display ceiling',
-    applyMemoryPressure(ultraBudget, 1).samWebGPU === false
+    // Pressure keeps SlimSAM on the GPU: WASM SlimSAM pins ~3 GB vs the GPU's
+    // ~0.5 GB (measured), so demoting to WASM under memory pressure makes swap
+    // WORSE. Device demotion is failure-gated in sam-engine, never pressure-gated.
+    'policy: pressure keeps SAM on the memory-safe GPU lane and lowers the display ceiling',
+    applyMemoryPressure(liteDefault, 3).samWebGPU === true
+      && applyMemoryPressure(ultraBudget, 1).samWebGPU === ultraBudget.samWebGPU
       && pressured.displayMax === 1600 && pressured3.displayMax === 1280,
-    JSON.stringify({ p1sam: applyMemoryPressure(ultraBudget, 1).samWebGPU, p2disp: pressured.displayMax, p3disp: pressured3.displayMax }),
+    JSON.stringify({ p3sam: applyMemoryPressure(liteDefault, 3).samWebGPU, p2disp: pressured.displayMax, p3disp: pressured3.displayMax }),
   )
   check(
     'policy: every tier declares a memBudgetMB the governor watches',
@@ -466,17 +542,26 @@ try {
   check(
     // The measured signal SEES a runaway WASM heap (the 3 GB failure) that the
     // old JS-heap watchdog was blind to; deep headroom under budget is the only
-    // thing that emits a climb signal; drift alone sheds without any byte reading.
-    'governor: WASM-scale bytes shed to L3; proven headroom climbs; drift sheds signal-less',
+    // thing that emits a climb signal. Drift is the unified-memory swap signal
+    // (GPU bytes are invisible to the measure API) and MUST catch onset early:
+    // it sheds at a few hundred ms, not after the multi-second freeze the old
+    // 2.5/5 s thresholds waited through — while ignoring normal foreground jitter.
+    'governor: WASM-scale bytes shed to L3; proven headroom climbs; drift catches swap ONSET',
     decidePressure({ bytesMB: 3000, budgetMB: 1800 }).level === 3
       && decidePressure({ bytesMB: 500, budgetMB: 1800 }).headroom === true
       && decidePressure({ bytesMB: 1600, budgetMB: 1800 }).level === 1
-      && decidePressure({ bytesMB: 0, driftMs: 6000 }).level === 2
+      && decidePressure({ bytesMB: 0, driftMs: 6000 }).level === 3   // unambiguous multi-second OS freeze → free the arena
+      && decidePressure({ bytesMB: 0, driftMs: 2000 }).level === 2   // a lone ~2 s spike can be GC/compile jank → defer work, keep the session
+      && decidePressure({ bytesMB: 0, driftMs: 1000 }).level === 2   // sustained stall caught early
+      && decidePressure({ bytesMB: 0, driftMs: 500 }).level === 1    // onset caught (was silent under 2.5 s)
+      && decidePressure({ bytesMB: 0, driftMs: 300 }).level === 0    // normal foreground jitter ignored
       && decidePressure({ bytesMB: 1200, budgetMB: 1800 }).headroom === false, // under budget but not deep → no climb
     JSON.stringify({
       wasm: decidePressure({ bytesMB: 3000, budgetMB: 1800 }).level,
       headroom: decidePressure({ bytesMB: 500, budgetMB: 1800 }).headroom,
-      drift: decidePressure({ bytesMB: 0, driftMs: 6000 }).level,
+      driftDeep: decidePressure({ bytesMB: 0, driftMs: 6000 }).level,
+      driftOnset: decidePressure({ bytesMB: 0, driftMs: 500 }).level,
+      driftJitter: decidePressure({ bytesMB: 0, driftMs: 300 }).level,
     }),
   )
 
@@ -642,7 +727,7 @@ try {
   {
     const jsFiles = ['app.js', 'asset-store.js', 'image-io.js', 'capability.js', 'policy.js',
       'sam-client.js', 'sam-worker.js', 'sam-engine.js', 'sam-core.js', 'edge-refine.js',
-      'export-hd.js', 'detect-engine.js', 'detect-worker.js', 'embed-store.js', 'text-core.js',
+      'export-hd.js', 'yolo-world-detect.js', 'detect-worker.js', 'embed-store.js', 'text-core.js',
       'text-ui.js', 'image-raw.js', 'heavy-job-queue.js', 'decode-worker.js', 'decode-client.js',
       'decode-core.js', 'proxy-plan.js', 'cv-refine-client.js', 'cv-refine-worker.js',
       'raw-develop-client.js', 'raw-develop-worker.js']
@@ -675,11 +760,11 @@ try {
       'gated',
     )
     check(
-      'static: SAM device pick is budget-gated — samWebGPU decides, pressure still forces WASM',
+      'static: SAM device pick is budget-gated — samWebGPU decides; pressure keeps the GPU (never the 3 GB WASM lane)',
       /state\.budget\.samWebGPU !== true/.test(sources['sam-engine.js'])
         && /budget\.samWebGPU = cap\.gpuTier !== 'none'/.test(sources['policy.js'])
-        && /next\.samWebGPU = false/.test(sources['policy.js']),
-      'pickDevice honors samWebGPU; a probed GPU sets it, the pressure ratchet clears it',
+        && !/next\.samWebGPU = false/.test(sources['policy.js']),
+      'pickDevice honors samWebGPU; a probed GPU sets it; memory pressure no longer demotes it to WASM',
     )
     check(
       // Memory lesson (measured): SlimSAM on WASM holds a ~3 GB ORT heap that
@@ -841,8 +926,14 @@ try {
   const engEager = await page.evaluate(() => window.__seglab.engineState())
   const chipDevice = await page.evaluate(() => document.getElementById('chip-device')?.textContent || '')
   check(
-    'lite: bounded eager encode lands before the first selection (one embedding)',
-    eager && eager.stale !== true && engEager.cachedImages === 1,
+    // On webgpu the prewarm lands (one embedding). On a wasm lane the engine
+    // REFUSES the speculative encode on an unverified budget (gpuOnly guard:
+    // a prewarm nobody asked for must not allocate the multi-GB WASM arena);
+    // the first real click pays it knowingly.
+    'lite: eager encode lands on webgpu; wasm lane defers it to the first selection (gpuOnly guard)',
+    engEager.device === 'webgpu'
+      ? (eager && eager.stale !== true && engEager.cachedImages === 1)
+      : engEager.cachedImages === 0,
     JSON.stringify({ eager, cached: engEager?.cachedImages, device: engEager?.device }),
   )
   // Chrome ≥149 headless ships a real hardware adapter, so the probe may
@@ -860,9 +951,11 @@ try {
   const sA = await page.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geo.disc.x * p, y: geo.disc.y * p })
   checkDisc('lite draft', sA, geo.disc.x * p, geo.disc.y * p, DISC_FRAC)
   check(
-    'first click is decode-only (the eager embedding served it)',
-    sA.lastRun && sA.lastRun.encoded === false,
-    `encoded=${sA.lastRun?.encoded}, decode ${sA.lastRun?.decodeMs}ms`,
+    // webgpu: the eager embedding serves it (decode-only). wasm: the gpuOnly
+    // guard deferred the prewarm, so the first click pays the encode knowingly.
+    'first click uses the eager embedding (webgpu) or pays the deferred encode (wasm)',
+    sA.lastRun && sA.lastRun.encoded === (engEager.device === 'webgpu' ? false : true),
+    `device=${engEager.device}, encoded=${sA.lastRun?.encoded}, decode ${sA.lastRun?.decodeMs}ms`,
   )
   const statsA = await page.evaluate(() => window.__seglab.maskStats())
   check('hygiene: single component, no crumbs', statsA && statsA.components === 1, `components=${statsA?.components}`)
@@ -1221,8 +1314,10 @@ try {
   )
   const freed = await pageW.evaluate(() => window.__seglab.relievePressure(3))
   check(
-    'pressure ladder: level 3 frees detector and the current embedding',
-    Array.isArray(freed) && ['detector', 'embedding'].every((f) => freed.includes(f)),
+    // 'arena' is the fix that matters: the ORT session (WASM linear memory /
+    // GPU buffers) is the multi-GB resident; the embedding is only ~MBs.
+    'pressure ladder: level 3 frees detector, embedding AND the session arena',
+    Array.isArray(freed) && ['detector', 'embedding', 'arena'].every((f) => freed.includes(f)),
     `freed=${JSON.stringify(freed)}`,
   )
   const releasedAll = await pageW.evaluate(() => window.__seglab.releaseMemory().then(() => window.__seglab.engineState()))

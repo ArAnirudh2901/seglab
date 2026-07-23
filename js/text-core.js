@@ -12,6 +12,7 @@
  *  (0.5 in rescaled space). */
 export const DETECTOR_INPUT = 960
 export const DETECTOR_PAD = 128
+export const YOLOE_INPUT = 640 // YOLOE-26 fixed square input
 
 const ARTICLES = /^(a|an|the|some|all|every|any)\s+/i
 const COUNT_INTENT = /^(all|every|both|each|multiple|several)\b/i
@@ -69,6 +70,18 @@ export const normalizePhrase = (raw) => {
  *  Strip back to the bare noun phrase for the grounding lane. */
 export const bareLabel = (label) => String(label).toLowerCase().trim()
     .replace(/^a photo of (a|an|the) /, '').replace(/\.+$/, '')
+
+/** True when a baked-vocab `label` satisfies the phrase's object `core`
+ *  (normalizePhrase.objectCore). Single-word core: whole-word match incl. plural
+ *  forms. Multi-word core: substring. Powers the YOLOE lane's label filter. */
+export const phraseMatchesLabel = (core, label) => {
+    if (!core || !label) return false
+    const l = String(label).toLowerCase()
+    if (l === core) return true
+    if (core.includes(' ')) return l.includes(core)
+    const forms = new Set([core, `${core}s`, `${core}es`])
+    return l.split(/\s+/).some((w) => forms.has(w))
+}
 
 /** True when a detector filled its top-k cap with a near-uniform score band —
  *  a collapsed alignment head (seen on q4f16 Grounding DINO on some GPUs).
@@ -174,19 +187,42 @@ const rgbToHsv = (r, g, b) => {
 
 const hueDistance = (a, b) => Math.min(Math.abs(a - b), 360 - Math.abs(a - b))
 
+// [hueCenter, hueTol, minS, minV, maxV] per chromatic colour.
+const COLOR_RULES = {
+    red: [0, 28, 0.36, 0.16, 1], orange: [26, 24, 0.38, 0.2, 1],
+    yellow: [55, 30, 0.3, 0.24, 1], green: [122, 54, 0.28, 0.14, 1],
+    blue: [218, 44, 0.28, 0.15, 1], purple: [280, 43, 0.25, 0.12, 1],
+    pink: [338, 40, 0.22, 0.35, 1], brown: [26, 32, 0.25, 0.1, 0.68],
+}
+
 const isRequestedColor = (r, g, b, color) => {
     const { h, s, v } = rgbToHsv(r, g, b)
     if (color === 'white') return s <= 0.22 && v >= 0.65
     if (color === 'black') return v <= 0.2
     if (color === 'gray') return s <= 0.16 && v > 0.18 && v < 0.8
-    const rules = {
-        red: [0, 28, 0.36, 0.16, 1], orange: [26, 24, 0.38, 0.2, 1],
-        yellow: [55, 30, 0.3, 0.24, 1], green: [122, 54, 0.28, 0.14, 1],
-        blue: [218, 44, 0.28, 0.15, 1], purple: [280, 43, 0.25, 0.12, 1],
-        pink: [338, 40, 0.22, 0.35, 1], brown: [26, 32, 0.25, 0.1, 0.68],
-    }
-    const rule = rules[color]
+    const rule = COLOR_RULES[color]
     return !!rule && hueDistance(h, rule[0]) <= rule[1] && s >= rule[2] && v >= rule[3] && v <= rule[4]
+}
+
+/** Winner-take-all colour bucket for one pixel, or null if it matches none.
+ *  Achromatic (white/black/gray) checked first; otherwise the chromatic rule
+ *  with the closest hue that also clears its s/v gates. Unlike isRequestedColor
+ *  (a per-colour tolerance test for ranking) this assigns each pixel ONE name,
+ *  so a box can be tallied into dominant-colour buckets in a single pass. */
+export const classifyPixelColor = (r, g, b) => {
+    const { h, s, v } = rgbToHsv(r, g, b)
+    if (v <= 0.2) return 'black'
+    if (s <= 0.16 && v >= 0.65) return 'white'
+    if (s <= 0.16) return 'gray'
+    let best = null
+    let bestDist = Infinity
+    for (const name in COLOR_RULES) {
+        const [hc, tol, minS, minV, maxV] = COLOR_RULES[name]
+        if (s < minS || v < minV || v > maxV) continue
+        const d = hueDistance(h, hc)
+        if (d <= tol && d < bestDist) { best = name; bestDist = d }
+    }
+    return best
 }
 
 /** Fraction of sampled pixels inside a normalized candidate box that match a
@@ -214,6 +250,40 @@ export const colorEvidenceForBox = (frame, box, color, { maxSamples = 4096 } = {
         }
     }
     return sampled ? matches / sampled : 0
+}
+
+/** Dominant colour bucket inside a normalized box → { color, frac } or null.
+ *  Tallies each sampled pixel into a single bucket (classifyPixelColor) and
+ *  returns the winner when it covers at least `minFrac`. Drives the colour
+ *  sub-class facet: label a detection's box without a second detector. */
+export const dominantColorForBox = (frame, box, { maxSamples = 4096, minFrac = 0.15 } = {}) => {
+    if (!frame?.data) return null
+    const { data, width, height } = frame
+    const usableW = Math.min(width, frame.contentWidth || width)
+    const usableH = Math.min(height, frame.contentHeight || height)
+    const x0 = clamp(Math.floor(box[0] * width), 0, usableW)
+    const y0 = clamp(Math.floor(box[1] * height), 0, usableH)
+    const x1 = clamp(Math.ceil(box[2] * width), 0, usableW)
+    const y1 = clamp(Math.ceil(box[3] * height), 0, usableH)
+    const area = Math.max(0, x1 - x0) * Math.max(0, y1 - y0)
+    if (!area) return null
+    const step = Math.max(1, Math.ceil(Math.sqrt(area / maxSamples)))
+    const tally = new Map()
+    let sampled = 0
+    for (let y = y0; y < y1; y += step) {
+        for (let x = x0; x < x1; x += step) {
+            const i = (y * width + x) * 3
+            const c = classifyPixelColor(data[i], data[i + 1], data[i + 2])
+            if (c) tally.set(c, (tally.get(c) || 0) + 1)
+            sampled += 1
+        }
+    }
+    if (!sampled) return null
+    let color = null
+    let top = 0
+    for (const [c, n] of tally) if (n > top) { top = n; color = c }
+    const frac = top / sampled
+    return color && frac >= minFrac ? { color, frac } : null
 }
 
 /** Square-normalized ([0,1]) box → source px, clipped to the frame. Null when
