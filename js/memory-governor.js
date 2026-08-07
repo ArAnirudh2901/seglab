@@ -1,42 +1,40 @@
 /**
  * memory-governor — keep the whole app under a hard RAM ceiling
  * ----------------------------------------------------------------
- * SEGLAB now has three heavy things that all want to be resident at once:
- * the SlimSAM draft encoder, the SAM3 flagship encoder (~302 MB of weights
- * plus 33 MB of embeddings per image), and the OWLv2 text encoder (~155 MB
- * quantized, and an ONNX Runtime arena several times that at 960²). Add a
- * decoded 24–45 MP photo — 96 MB for a 6000×4000 RGBA buffer alone — and a
- * naive "load everything" policy blows past 2.2 GB on the normal laptops
- * this is built for.
+ * The app runs ONE model (YOLOE-26), which is most of why a 1 GB ceiling is
+ * reachable at all: a single ~50 MB network plus its ONNX Runtime arena,
+ * rather than the ~470 MB of encoders a SAM-family stack needs. What still
+ * threatens the ceiling is the PHOTO. A 45 MP file is ~340 MB of decoded
+ * RGBA once you count the working copy, which on its own is a third of the
+ * budget — so the governor tracks the image, not just the weights.
  *
- * The policy here is deliberately blunt because blunt is what holds:
- *   ONE heavy encoder is resident at a time. Loading another disposes the
- *   idle one's ONNX session first.
- * Everything else (cache sizes, whether the flagship lane is allowed to load
- * at all) is derived from a live budget rather than hardcoded, so a 4 GB
+ * The policy is deliberately blunt because blunt is what holds:
+ *   ONE heavy model is resident at a time, and a load only counts as
+ *   affordable if it still leaves the safety margin intact.
+ * Cache sizes derive from a live budget rather than constants, so a 4 GB
  * Chromebook and a 64 GB workstation each get a policy that fits.
  *
- * This module owns policy only — it never imports transformers.js. Callers
- * register their own dispose hooks, which keeps it unit-testable headless.
+ * This module owns policy only — it never imports a runtime. Callers register
+ * their own dispose hooks, which keeps it unit-testable headless.
  */
 
 const MB = 1024 * 1024
 
 /** Declared cost of each heavy resident, in MB. Weights + typical arena. */
 export const RESIDENT_COST = {
-    draft: 80,        // SlimSAM 14 MB + activations
-    flagship: 900,    // SAM3-tracker q4f16 302 MB + arena
-    text: 550,        // OWLv2 quantized 155 MB + arena at 960²
+    // YOLOE-26-s/m fp16 ONNX plus an ORT arena at 640². The whole model —
+    // detection, masks and the folded-in open vocabulary — is this one entry.
+    yoloe: 220,
 }
 
 const state = {
-    ceilingMB: 2200,
-    reservedMB: 300,        // browser/tab baseline we never get to spend
+    ceilingMB: 1000,
+    reservedMB: 250,        // browser/tab baseline we never get to spend
     // ONNX Runtime's arena fragments and overshoots its nominal footprint,
     // and a decoded photo spikes during draw/readback. Filling the ceiling
     // exactly is how you get an OOM tab, so a load must leave this much
     // slack or it does not count as affordable.
-    marginMB: 250,
+    marginMB: 120,
     imageMB: 0,             // decoded source currently held
     residents: new Map(),   // key → { costMB, dispose }
 }
@@ -62,7 +60,7 @@ export const adoptDeviceCeiling = (nav = typeof navigator !== 'undefined' ? navi
     if (!Number.isFinite(gb)) return budget()
     // Never claim more than ~35% of system RAM for one tab.
     const cap = Math.round(gb * 1024 * 0.35)
-    state.ceilingMB = Math.min(state.ceilingMB, Math.max(600, cap))
+    state.ceilingMB = Math.min(state.ceilingMB, Math.max(500, cap))
     return budget()
 }
 
@@ -127,7 +125,7 @@ export const evict = async (key) => {
  * `protect` names residents the caller still needs (typically the decoder
  * that will turn this lane's boxes into masks).
  */
-export const makeRoomFor = async (key, { protect = [], costMB = RESIDENT_COST[key] || 0, order = ['flagship', 'text', 'draft'] } = {}) => {
+export const makeRoomFor = async (key, { protect = [], costMB = RESIDENT_COST[key] || 0, order = ['yoloe'] } = {}) => {
     if (isResident(key)) return true
     for (const victim of order) {
         if (canAfford(key, costMB)) break
@@ -150,7 +148,7 @@ export const embeddingCacheMax = (perImageMB, hardMax) => {
 export const reset = () => {
     state.residents.clear()
     state.imageMB = 0
-    state.ceilingMB = 2200
-    state.reservedMB = 300
-    state.marginMB = 250
+    state.ceilingMB = 1000
+    state.reservedMB = 250
+    state.marginMB = 120
 }

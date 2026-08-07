@@ -7,8 +7,11 @@ precise, clean-edged mask, in real time.
 
 **Hard constraints (non-negotiable):**
 - Zero cloud — no image ever leaves the device. No server fallback, ever.
-- Any device — weak phones get a working tool, strong devices get flagship quality.
-- Free — open weights, free CDN delivery, user's own compute.
+- **Under 1 GB RAM for the whole app**, on a normal laptop, with a DSLR file open.
+- **One model.** Every mode is a query over the same instance set — no lanes,
+  no per-capability network, no way for two modes to disagree.
+- Any device — one model means one quality tier; weak devices pay in time, not
+  in mask quality.
 - Every phase ships with a headless verify gate (`bun verify.mjs`) before it counts as done.
 
 ---
@@ -19,26 +22,32 @@ One reference frame: photo → ≤1024 canonical canvas. All prompts, masks, and
 exports live there; display scaling is CSS.
 
 ```
-app.js (UI: modes, prompts, overlay, replay)
-  └─ sam-client.js (worker transport, sticky inline fallback)
-      └─ sam-worker.js (dedicated worker — UI never blocks)
-          └─ sam-engine.js (TWO LANES, one segment() contract)
-              ├─ draft:    SlimSAM-77 quantized (~14 MB, Apache-2.0) — everywhere, loads in seconds
-              ├─ flagship: SAM3-tracker q4f16 (297+5.4 MB, SAM License) — WebGPU, background download, hot-swap + prompt replay
-              └─ post pipeline (model-agnostic, every decode):
-                   lasso clamp → seeded component cleanup + hole fill (sam-core.js)
+app.js (UI: modes, interaction, overlay, cutout)
+  └─ engine-client.js (worker transport, sticky inline fallback)
+      └─ engine-worker.js (dedicated worker — UI never blocks)
+          └─ engine.js (ONE contract: analyze → select → polish)
+              ├─ yoloe-engine.js  THE model — YOLOE-26-seg via onnxruntime-web
+              │                   (WebGPU → WASM), ONE forward per image
+              ├─ yoloe-core.js    pure: letterbox, tensor decode, mask assembly
+              ├─ select-core.js   pure: click / box / lasso / text → which instances
+              └─ post pipeline (model-agnostic, every instance):
+                   seeded component cleanup + hole fill (mask-core.js)
                    → guided-filter edge-band refinement (edge-refine.js)
 ```
 
-**Why two lanes:** encoders are heavy, decoders are tiny. The draft lane makes the
-tool instantly usable; the flagship encodes once per image (~5.6 s, cached) and
-then every click is a ~630 ms decode. Weak devices pay in background seconds,
-not in quality ceiling. The user's clicks are *prompts*, so they replay
-losslessly when a better lane arrives.
+**Why one model:** YOLOE-26 is end-to-end and NMS-free, so a single forward
+yields boxes, labels AND instance masks. That is the difference between an
+encoder/decoder architecture — where every interaction is another decode and
+every capability is another network — and this one, where the model runs once
+per photo and interaction never touches it again. Click, box, lasso and text
+resolve to the same instance set, so they cannot disagree about the same object.
 
-**Why post-pipeline instead of bigger models only:** the 256² mask grid is a
-model-family limit. Hygiene + image-guided edge refinement fix artifacts that
-NO encoder size fixes, and they upgrade every current and future lane.
+**Why post-pipeline is now load-bearing, not a nicety:** YOLO-family masks come
+from 32 prototype basis functions at ~160×160. Detection is excellent; the
+boundary is the weak part (~48–50 AP lost as IoU tightens, vs ~4 for SAM3).
+Guided-filter refinement re-derives that boundary from the photo itself. The
+model finds things; the post pipeline makes the edges good. Neither half is
+optional.
 
 ---
 
@@ -52,117 +61,103 @@ NO encoder size fixes, and they upgrade every current and future lane.
 | 3 | Mask hygiene: keep clicked components + ≥1%-of-largest, fill pinholes | components = 1 on disc (crumbs gone) |
 | 4 | Edge-band refinement: gray guided filter, ±6 px band, soft output, E toggle | 3131 soft boundary px; post ~110 ms |
 | 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 confirmed headless; encode 5581 ms / decode 630 ms |
-| 6 | Text lane (OWLv2-q → same decoder → same post pipeline), memory governor, post-pipeline rewrite | 487/487 exact vs naive reference; 12-instance query 2795→97 ms (28.7×); 74 unit assertions green |
+| 6 | Post-pipeline rewrite (guide hoisting, bbox confinement, buffer pooling) | 487/487 exact vs naive reference; 12-instance query 2795→97 ms (28.7×) |
+| 7 | **Unification on YOLOE-26** — one model replaces the whole SAM stack; click/box/lasso/text become queries over one instance set; 1 GB governor | 138 pure assertions green; SlimSAM + SAM3 + OWLv2 removed |
 
-### P6 as built — and why it isn't SAM3 PCS
+### P7 — why one model, and why this one
 
-The plan below called for OWLv2 as stage 1 and true concept segmentation as
-stage 2. Stage 2 got *closer* than expected — `rusen/sam3-browser-int8` is a
-browser-ready INT8 SAM3 split into image encoder / language encoder / decoder,
-with quality parity (0.9495 int8 vs 0.9471 fp32) — but it is **ruled out by a
-2.2 GB whole-app RAM ceiling**: ~900 MB of weights before any ONNX Runtime
-arena, alongside a decoded 45 MP photo, does not fit on a normal laptop.
-So P6 ships OWLv2-base-patch16 quantized (155 MB, Apache-2.0, WASM-capable)
-and P10 is now gated on the ceiling lifting or on EfficientSAM3's ONNX export
-landing upstream (weights are out under Apache-2.0; the export is still a TODO).
+The plan below staged text prompts as OWLv2 (stage 1) then SAM3 concepts
+(stage 2). Both are gone. Two constraints killed them:
 
-**The optimization that mattered** was not the model. A text query decodes N
-masks, so the per-mask post pipeline is multiplied by N — it was 223 ms/mask,
-i.e. ~2.8 s for a twelve-instance query, before any model got faster. Three
-structural changes (guide invariants hoisted to once-per-image, both stages
-confined to each mask's bbox, all scratch buffers pooled across the query)
-took that to 97 ms total, verified bit-exact against a naive reference.
+- **1 GB whole-app ceiling.** SAM3 promptable concept segmentation has a
+  browser-ready INT8 export at quality parity, but it is ~900 MB of weights
+  before any ONNX Runtime arena. OWLv2-q was 155 MB *plus* SlimSAM *plus*
+  SAM3-tracker — ~470 MB of encoders for three capabilities.
+- **One unified workflow.** Three models meant three code paths, three failure
+  modes, and modes that could disagree with each other about the same object.
 
----
+**YOLOE-26** (YOLO26 + YOLOE, arXiv 2602.00168) collapses all of it: one
+end-to-end, NMS-free network giving boxes, labels and instance masks in a
+single forward. `yoloe26-n-seg` is 4.8M params; `s`/`m` are the browser sweet
+spot. Open-vocabulary modules are **re-parameterized into the network at export
+time**, so there is no text encoder at runtime — an arbitrary phrase costs
+nothing but a string comparison against the exported vocabulary.
+
+The architectural payoff is that interaction leaves the model entirely. Analyze
+once, then click / box / lasso / text are pure arithmetic over the cached
+instance set. The modes cannot disagree, because they resolve to the same
+instances.
+
+**The honest cost:** YOLO-family masks are prototype-based and their boundaries
+are materially weaker than SAM's — ~48–50 points of AP lost as IoU tightens,
+against ~4 for SAM3. The guided-filter refinement in `edge-refine.js` is the
+counterweight, and the P6 optimization is what makes it affordable on every
+instance of every selection. **This pairing is the whole design.**
+
+**Licence:** YOLOE-26 is AGPL-3.0. Weights are not committed; see
+`models/README.md`.
 
 ## Remaining phases (in order)
 
-### P6a — Text lane follow-ups (the parts not yet built)
-- **Split the OWLv2 graph.** The stock export is one fused `model.onnx` taking
-  `input_ids` AND `pixel_values`, so every query re-encodes the image. The two
-  towers are independent and the head is a dot product, so a split export gives:
-  vision once per image, text once per PHRASE (cached across images), head a
-  3600×512 matmul. A repeat phrase on a warm image would cost ~nothing.
-  `js/text-engine.js` already has the cache shape and a `TEXT_MODEL.split` slot;
-  the export itself needs `optimum` on a machine with HuggingFace access.
-- **Zoom-crop re-encode for small text hits.** `text-core.js` ships
-  `needsZoomRefine`/`zoomCropRect`; wiring them into `segmentText` is P8's work
-  applied to detections, and it is the single biggest accuracy lever on DSLR files.
-- **Persist the phrase cache to OPFS** (P9's sibling). Phrase embeddings are a
-  few KB each — hundreds of them cost megabytes and never need recomputing.
-- **Gate:** the real-photo numbers come from `bun bench.mjs`, which already
-  measures per-stage latency, peak RSS against the 2.2 GB ceiling, and the
-  absent-phrase false-positive rate.
+### P8 — Zoom-crop re-analysis (the DSLR equalizer)
+- **Step:** when a selected instance's bbox diagonal is <~15% of the frame
+  diagonal, re-run the model on a padded NATIVE-RESOLUTION crop around it and
+  replace the instance with the sharper result. `select-core.js` already ships
+  `needsZoomRefine` / `zoomCropRect`; the wiring is what is missing.
+- **Why:** a 200 px bird in a 6000 px frame is 34 px after the canonical
+  downscale and ~21 px at the model's 640 input. No network segments that well.
+  This is worth more accuracy on DSLR files than any model swap.
+- **Gate:** synthetic 6000×4000 scene with a 60 px object — boundary-F improves
+  vs no-crop, and peak RSS stays under the ceiling.
 
-### P7 — Candidate cycling + first-click granularity
-- **Step:** keep all 3 decoder candidates; Tab cycles part → whole → sub-part;
-  on a single first click, prefer the largest high-scoring candidate.
-- **Why:** the #1 cause of wasted corrective clicks is the model picking "part"
-  when the user meant "whole" (bike test: cost ~3 clicks).
-- **Gate:** verify asserts the 3 candidates differ and cycling changes the rendered mask.
+### P9 — Analysis persistence (OPFS)
+- **Step:** persist the instance set (compact planes + labels) to OPFS keyed by
+  content hash; analyze at import rather than at first interaction.
+- **Why:** kills the last wait. Reopening a photo is instant selection with no
+  model run at all. Instance planes are small, unlike SAM embeddings — this is
+  much cheaper here than it would have been in the old architecture.
+- **Gate:** second page-load of the same image selects with `analyzed=false`.
 
-### P8 — Zoom-crop re-encode (minute-object equalizer)
-- **Step:** when the active selection bbox < ~15% of frame diagonal, re-encode a
-  padded crop around it at full 1024 and decode there; paste refined result back.
-- **Why:** a 100 px object in a 4000 px photo lands on ~25 px of encoder input —
-  no model segments that well. Cropping is up to ~10× effective resolution on
-  exactly the thing being selected. This, not model choice, is the real
-  "minute thing" solution for large photos.
-- **Gate:** synthetic scene at 4000 px with a 60 px object: boundary-F improves vs no-crop.
-
-### P9 — Embedding persistence + encode-at-import (OPFS)
-- **Step:** persist flagship embeddings (~33 MB/image) to OPFS keyed by content
-  hash; start encoding at photo import (not first click); load embeddings on
-  revisit instead of re-encoding.
-- **Why:** kills the last wait. Reopening a photo = flagship-quality clicks with
-  ZERO encode wait, even on weak devices. Nobody in browser segmentation does this.
-- **Gate:** second page-load of same image: first click decodes with `encoded=false`.
-
-### P10 — Text prompts, stage 2: true concept segmentation on-device (the flag-plant)
-- **Step:** quantize the SAM3 text stack (354M text encoder + ~30M detector) to
-  4-bit via the calibrated-WOQ recipe (per-block sensitivity scan, mixed
-  precision), targeting <300 MB for the full text lane. Primary vehicle:
-  **EfficientSAM3 / SAM3-LiteText** (Apache-2.0, weights released, ONNX export
-  still an upstream TODO — we do the export = first in a browser). Fallback
-  vehicle: samexporter on facebook/sam3 + custom quantization.
-- **Why:** "every zebra in one prompt" at SAM3 quality, fully local — no shipped
-  product has this in a browser. Odds: 60–75% the export+quant clears the
-  gates; if it misses, OWLv2 (P6) remains the text path and nothing regresses.
-- **Gate (hard, from the approved plan):** vs fp16 reference — mean mIoU ≥ 0.98
-  (min 0.95/fixture) AND boundary-F(2 px) ≥ 0.95, offline eval BEFORE any UI work.
+### P10 — Granularity
+- **Step:** YOLOE returns whole objects from its vocabulary. Clicking a shirt
+  selects the person. Add Tab-cycling through containing instances (shirt →
+  person → group) using the nesting already computed by `pickByPoint`.
+- **Why:** the honest capability gap vs SAM, which offers part/whole/sub-part
+  candidates per click. Nesting recovers most of it without another model.
+- **Gate:** Tab on an overlapping region changes the rendered mask.
 
 ### P11 — Erase / edit actions on the mask (deferred by design)
 - **Step:** consume the mask: erase (LaMa-class inpainting ONNX in-browser),
   cutout compositing, background swap.
-- **Why:** deferred earlier ("forget about erasing, we will do it later") — the
-  segmentation contract (mask ImageData + soft edges) is already the right input.
+- **Why:** deferred earlier — the segmentation contract (mask ImageData + soft
+  edges) is already the right input.
 - **Gate:** erase the demo disc → background continuity metric on the hole region.
 
 ### P12 — Platform slots (when the web catches up)
-- **COOP/COEP headers** if a hosted deployment wants multi-threaded WASM (faster
-  draft lane on weak devices). Local `http.server` skips this.
-- **WebNN execution provider** the day it ships stable (verified: Chrome origin
-  trial only, Android excluded, realistic 2027) — one config line in the EP
-  ladder, unlocks phone NPUs. Do not build on it before then.
-
----
+- **COOP/COEP headers** if a hosted deployment wants multi-threaded WASM.
+- **WebNN execution provider** the day it ships stable — one line in the EP
+  ladder in `yoloe-engine.js`, unlocks phone NPUs. Do not build on it before then.
 
 ## Device tier matrix (end state)
 
-| Device | Click/box/lasso | Text | Feel |
-|---|---|---|---|
-| WebGPU (desktops, M-Macs, iOS 26 Safari, Chrome/Android 12+) | SAM3 q4f16 | LiteText (P10) or OWLv2 | flagship |
-| WASM-only (old phones, exotic browsers) | SlimSAM + full post pipeline | OWLv2 | draft lane, same UX, softer masks |
-| Any, revisited photo | cached embeddings (P9) | same | instant |
+| Device | All four modes | Feel |
+|---|---|---|
+| WebGPU (desktops, M-Macs, iOS 26 Safari, Chrome/Android 12+) | YOLOE-26-s/m fp16 | analyze once, then instant |
+| WASM-only (old phones, exotic browsers) | same model, same masks | slower first analysis, identical afterwards |
+| Any, revisited photo | cached analysis (P9) | instant, no model run |
+
+There is no quality tier any more. One model means every device gets the same
+masks; weak devices only pay in the one-time analysis.
 
 ## Risks (with odds)
 
 | Risk | Odds | Mitigation |
 |---|---|---|
-| EfficientSAM3 ONNX export fights back | ~30% | fallback: SAM2.1 ONNX (proven in-browser) for the mid lane; OWLv2 keeps text alive |
-| q4 text-stack quality below gates | ~25–40% | gates decide — ship OWLv2 as text default, keep flagship clicks |
-| WebGPU driver flakiness in the wild | ongoing | already handled: sticky lane demote + WASM fallback, user never sees a dead click |
-| SAM License (flagship lane) vs product plans | low | tracker lane is commercial-OK; Apache alternatives (SlimSAM/EfficientSAM3) exist for every lane |
+| YOLOE-26 boundaries too coarse for cutout-grade work | ~35% | guided-filter refinement is the counterweight; P8 zoom-crop for small objects; measure with `bun bench.mjs` before believing either way |
+| AGPL-3.0 blocks a distribution plan | real, not probabilistic | decide before building on it; the engine boundary is one file (`yoloe-engine.js`) if a swap is ever needed |
+| ONNX export shape differs from what `yoloe-core` expects | ~30% | both tensor layouts handled and unit-tested; mismatched dims throw loudly rather than decode garbage |
+| Vocabulary too narrow for open-ended phrases | ~40% | ship the RAM++ 4,585-tag set; text honestly reports "no vocabulary" rather than matching nothing |
+| No part/sub-part granularity vs SAM | certain | P10 nesting recovers most of it; a real capability loss otherwise |
 
 ## Working rules
 - Every phase lands with a `verify.mjs` check before it's called done.

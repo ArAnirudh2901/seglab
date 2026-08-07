@@ -1,20 +1,25 @@
 /**
  * edge-refine — guided-filter boundary snapping (pure, no DOM)
  * --------------------------------------------------------------
- * SAM-family masks decode at 256×256 and get bilinearly upsampled, so the
- * boundary is a ~4px staircase that ignores the actual image edges. This
- * pass re-derives the edge FROM THE IMAGE: a guided filter (He et al.) with
- * the grayscale photo as guide, applied only inside a ±band around the mask
- * boundary. Inside the band the mask becomes soft (0..255) and hugs image
- * gradients; outside it stays exactly the decoder's binary decision.
+ * YOLOE-26's instance masks are built from 32 prototype basis functions at
+ * ~160×160 and upsampled, so their boundaries are the weak part of an
+ * otherwise excellent detector — published comparisons show YOLO-class masks
+ * shedding ~48–50 AP as the IoU threshold tightens, against ~4 for SAM3.
  *
- * Three structural properties keep this cheap enough to run on EVERY mask,
- * which matters because text prompts produce N masks per query, not one:
+ * This pass re-derives the edge FROM THE IMAGE: a guided filter (He et al.)
+ * with the grayscale photo as guide, applied only inside a ±band around the
+ * mask boundary. Inside the band the mask becomes soft (0..255) and hugs image
+ * gradients; outside it stays exactly the model's binary decision. It is
+ * model-agnostic — it is what makes a fast coarse detector produce masks worth
+ * cutting out, and it would upgrade any successor network too.
+ *
+ * Three structural properties keep it cheap enough to run on EVERY instance of
+ * EVERY selection, which matters because one query routinely yields a dozen:
  *
  *   1. GUIDE INVARIANTS ARE PER-IMAGE, NOT PER-MASK. mean(I) and var(I)
  *      depend only on the photo, so `buildGuide` computes them once per
- *      image and every mask on that image reuses them (see sam-engine's
- *      embedding cache). Only mean(p) and mean(I·p) are per-mask.
+ *      image and every mask on that image reuses them (see engine.js's
+ *      analysis cache). Only mean(p) and mean(I·p) are per-mask.
  *   2. WORK IS CONFINED TO THE MASK'S BBOX. The band lives within
  *      bbox ⊕ band, so everything runs on that rect dilated by band + 2·radius
  *      (the guided filter's reach) instead of the full frame. A 200px object

@@ -1,21 +1,24 @@
 /**
  * app — SEGLAB interface
  * ------------------------
- * Import a photo → select anything with clicks (+/−), a box, or a rough
- * lasso that snaps to the object. All inference on-device (sam-client →
- * worker → SlimSAM); this module owns only UI state, prompt collection,
- * overlay rendering, and the lasso clamp.
+ * Import a photo → select anything by clicking, dragging a box, drawing a
+ * lasso, or describing it in words. All inference on-device (engine-client →
+ * worker → YOLOE-26); this module owns only UI state, interaction, overlay
+ * rendering, and export.
+ *
+ * ONE ANALYSIS, MANY SELECTIONS. The model runs once per photo and finds every
+ * instance in it. Each mode is then a query over that set, so switching
+ * between clicking and describing is instant and they always agree with each
+ * other — a click and the phrase for the same object return the same pixels,
+ * because they return the same instance.
  *
  * One reference frame: the photo is downscaled once into a ≤1024 canonical
- * canvas (#view). Prompts, masks, overlay, and the cutout all live in that
- * frame — display scaling is pure CSS, undone at the pointer.
+ * canvas (#view). Interactions, masks, overlay, and the cutout all live in
+ * that frame — display scaling is pure CSS, undone at the pointer.
  */
 
-import { countMaskComponents, lassoToPrompts } from './sam-core.js'
-import { clientState, segment, segmentText, subscribe, warmUp, warmUpText } from './sam-client.js'
-
-// ?flagship=0 keeps the session on the 14 MB draft lane (tests, data saver).
-const FLAGSHIP_ENABLED = new URLSearchParams(location.search).get('flagship') !== '0'
+import { countMaskComponents } from './mask-core.js'
+import { clientState, select, subscribe, warmUp } from './engine-client.js'
 
 const CANON_MAX = 1024
 const ACCENT = '#35e0c2'
@@ -43,20 +46,20 @@ const els = {
 
 const state = {
     hasImage: false,
-    mode: 'click',            // 'click' | 'box' | 'lasso'
+    mode: 'click',            // 'click' | 'box' | 'lasso' | 'text'
     sign: 1,                  // primary-tap label for touch devices
-    clicks: [],               // [[x, y, label], ...] canonical coords
-    box: null,                // [x0, y0, x1, y1] canonical
-    lasso: null,              // { poly, box, point, margin } from lassoToPrompts
-    query: '',                // active text phrase ('' when not a text selection)
-    instances: [],            // [{phrase, score, plane, x0, y0, w, h, on}] from the text lane
-    mask: null,               // refined ImageData (white-on-black), canonical size
-    maskRaw: null,            // decoder output before hygiene/refinement (E toggle)
+    selected: [],             // instance indices currently selected
+    marks: [],                // [[x, y, label]] click markers, for the overlay
+    lastRegion: null,         // { kind: 'box'|'lasso', box?, poly? } for the overlay
+    query: '',                // active text phrase
+    instances: [],            // descriptors of the selected instances
+    detected: 0,              // how many the model found in this photo
+    mask: null,               // refined ImageData (white-on-black)
+    maskRaw: null,            // pre-refinement mask (E toggle)
     showRaw: false,
     maskSummary: null,
-    score: 0,
-    drag: null,               // in-progress interaction {kind, points|start}
-    runSeq: 0,                // stale-result guard
+    drag: null,
+    runSeq: 0,
     running: false,
     runQueued: false,
 }
@@ -69,49 +72,25 @@ const overlayCtx = els.overlay.getContext('2d')
 const setStatus = (msg) => { els.status.textContent = msg }
 
 const refreshChips = () => {
-    const lane = clientState.lane ? ` · ${clientState.lane}` : ''
-    els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}`
+    els.chipMode.textContent = `engine: ${clientState.mode || '—'} · yoloe26`
     els.chipDevice.textContent = `device: ${clientState.device || '—'}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
     const run = clientState.lastRun
-    if (!run) {
-        els.chipTiming.textContent = '— ms'
-    } else if (run.detectMs !== undefined) {
-        els.chipTiming.textContent = `detect ${run.detectMs}ms · ${run.instances}× decode ${run.decodeMs}ms · post ${run.postMs}ms`
-    } else {
-        els.chipTiming.textContent = run.encoded
-            ? `encode ${run.encodeMs}ms · decode ${run.decodeMs}ms · post ${run.postMs}ms`
-            : `decode ${run.decodeMs}ms · post ${run.postMs}ms (cached)`
-    }
+    els.chipTiming.textContent = run
+        ? (run.analyzed
+            ? `analyze ${run.analyzeMs}ms · ${run.detected} found · post ${run.postMs}ms`
+            : `select ${run.selectMs}ms · post ${run.postMs}ms (cached)`)
+        : '— ms'
 }
 
 subscribe((event) => {
     if (event.type === 'progress') {
         const d = event.detail || {}
         if (d.status === 'progress' && d.total) {
-            const pct = Math.round((d.loaded / d.total) * 100)
-            els.loadbar.style.width = `${pct}%`
-            // Flagship downloads in the background — say so without hiding
-            // that the tool is already usable on the draft lane.
-            if (d.lane === 'flagship') {
-                if (!state.running) setStatus(`Ready on SlimSAM — upgrading to SAM3 in the background, ${pct}% of ~300 MB (one-time)`)
-            } else {
-                setStatus(`Downloading model — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~14 MB)`)
-            }
+            els.loadbar.style.width = `${Math.round((d.loaded / d.total) * 100)}%`
+            setStatus(`Loading the model — ${Math.round((d.loaded / d.total) * 100)}% (one-time)`)
         } else if (d.status === 'done') {
             els.loadbar.style.width = '0%'
-        }
-        return
-    }
-    if (event.type === 'lane') {
-        refreshChips()
-        if (event.label === 'sam3') {
-            setStatus('Upgraded to SAM3 — masks are sharper from here on')
-            // Prompt replay: silently re-run the current selection at
-            // flagship quality (first replay re-encodes the image).
-            if (state.hasImage && (state.clicks.length || state.box || state.lasso)) scheduleRun()
-        } else {
-            setStatus('SAM3 unavailable — continuing on SlimSAM')
         }
         return
     }
@@ -134,14 +113,13 @@ const showImage = (bitmapOrCanvas) => {
     viewCtx.drawImage(bitmapOrCanvas, 0, 0, els.view.width, els.view.height)
 
     state.hasImage = true
-    clearPrompts()
+    clearSelection()
     els.dropzone.style.display = 'none'
     els.stage.classList.add('visible')
     setStatus(clientState.ready
-        ? 'Ready — click any object'
+        ? 'Ready — click any object, or describe it'
         : 'Preparing the model in the background — you can aim already')
-    // Start the one-time model download NOW, while the user is aiming.
-    warmUp({ flagship: FLAGSHIP_ENABLED }).catch((err) => setStatus(`Model load failed: ${err?.message}`))
+    warmUp().catch((err) => setStatus(`Model load failed: ${err?.message}`))
 }
 
 const loadFile = async (file) => {
@@ -156,8 +134,7 @@ const loadFile = async (file) => {
     }
 }
 
-/** Synthetic scene with known answers — instant demo, and what the headless
- *  verify drives: big disc, rounded square, and a MINUTE dot (r=9). */
+/** Synthetic scene with known answers — instant demo and headless fixture. */
 const buildDemoScene = () => {
     const w = 900
     const h = 620
@@ -190,7 +167,7 @@ els.file.addEventListener('change', () => loadFile(els.file.files?.[0]))
 els.demo.addEventListener('click', () => showImage(buildDemoScene()))
 els.newimg.addEventListener('click', () => {
     state.hasImage = false
-    clearPrompts()
+    clearSelection()
     els.stage.classList.remove('visible')
     els.dropzone.style.display = ''
     setStatus('Idle — import a photo to begin')
@@ -218,16 +195,11 @@ const setMode = (mode) => {
     els.signtoggle.style.display = mode === 'click' ? '' : 'none'
     els.textbar.classList.toggle('visible', mode === 'text')
     els.overlay.style.cursor = mode === 'text' ? 'default' : 'crosshair'
-    if (mode === 'text') {
-        els.textq.focus()
-        // Start the one-time detector download while the user is still typing.
-        warmUpText().catch((err) => setStatus(`Text model load failed: ${err?.message}`))
-    }
+    if (mode === 'text') els.textq.focus()
 }
-els.modes.click.addEventListener('click', () => setMode('click'))
-els.modes.box.addEventListener('click', () => setMode('box'))
-els.modes.lasso.addEventListener('click', () => setMode('lasso'))
-els.modes.text.addEventListener('click', () => setMode('text'))
+for (const name of ['click', 'box', 'lasso', 'text']) {
+    els.modes[name].addEventListener('click', () => setMode(name))
+}
 
 els.signtoggle.addEventListener('click', () => {
     state.sign = state.sign ? 0 : 1
@@ -236,58 +208,58 @@ els.signtoggle.addEventListener('click', () => {
     els.signtoggle.classList.toggle('neg', !state.sign)
 })
 
-/* ─── Prompt state ───────────────────────────────────────────────────────── */
+/* ─── Selection state ────────────────────────────────────────────────────── */
 
 const refreshButtons = () => {
-    const any = state.clicks.length > 0 || state.box || state.lasso || state.instances.length > 0
+    const any = state.selected.length > 0 || state.marks.length > 0
     els.undo.disabled = !any
     els.reset.disabled = !any
     els.cutout.disabled = !state.mask
 }
 
-function clearPrompts() {
-    state.clicks = []
-    state.box = null
-    state.lasso = null
+function clearSelection() {
+    state.selected = []
+    state.marks = []
+    state.lastRegion = null
     state.query = ''
     state.instances = []
-    renderInstances()
     state.mask = null
     state.maskRaw = null
     state.maskSummary = null
-    state.score = 0
     state.drag = null
     state.runSeq += 1 // orphan any in-flight result
+    renderInstances()
     renderOverlay()
     refreshButtons()
 }
 
-const undoPrompt = () => {
-    if (state.clicks.length > 0) state.clicks.pop()
-    else if (state.box) state.box = null
-    else if (state.lasso) state.lasso = null
-    if (state.clicks.length === 0 && !state.box && !state.lasso) {
-        state.mask = null
-        state.maskRaw = null
-        state.maskSummary = null
+const undoLast = () => {
+    if (state.marks.length > 0) state.marks.pop()
+    if (state.selected.length > 0) state.selected.pop()
+    if (state.selected.length === 0) {
+        clearMask()
+        state.lastRegion = null
         state.runSeq += 1
+        renderInstances()
         renderOverlay()
         refreshButtons()
         setStatus('Cleared')
         return
     }
-    scheduleRun()
+    runSelection({ mode: 'indices', indices: state.selected })
 }
 
-els.undo.addEventListener('click', undoPrompt)
-els.reset.addEventListener('click', () => { clearPrompts(); setStatus('Cleared') })
+els.undo.addEventListener('click', undoLast)
+els.reset.addEventListener('click', () => { clearSelection(); setStatus('Cleared') })
 window.addEventListener('keydown', (e) => {
-    if (e.key === 'z' || e.key === 'Z') undoPrompt()
-    if (e.key === 'r' || e.key === 'R') { clearPrompts(); setStatus('Cleared') }
+    if (e.target === els.textq) return
+    if (e.key === 'z' || e.key === 'Z') undoLast()
+    if (e.key === 'r' || e.key === 'R') { clearSelection(); setStatus('Cleared') }
+    if (e.key === 'a' || e.key === 'A') runSelection({ mode: 'all' })
     if (e.key === 'e' || e.key === 'E') {
         state.showRaw = !state.showRaw
         renderOverlay()
-        setStatus(state.showRaw ? 'Showing RAW decoder mask (E to toggle back)' : 'Showing refined mask')
+        setStatus(state.showRaw ? 'Showing RAW model mask (E to toggle back)' : 'Showing refined mask')
     }
 })
 
@@ -304,7 +276,7 @@ const toCanvas = (e) => {
 els.overlay.addEventListener('contextmenu', (e) => e.preventDefault())
 
 els.overlay.addEventListener('pointerdown', (e) => {
-    if (!state.hasImage) return
+    if (!state.hasImage || state.mode === 'text') return
     e.preventDefault()
     els.overlay.setPointerCapture(e.pointerId)
     const [x, y] = toCanvas(e)
@@ -325,9 +297,8 @@ els.overlay.addEventListener('pointermove', (e) => {
         if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > 4) state.drag.moved = true
         return
     }
-    if (state.drag.kind === 'box') {
-        state.drag.now = [x, y]
-    } else if (state.drag.kind === 'lasso') {
+    if (state.drag.kind === 'box') state.drag.now = [x, y]
+    else if (state.drag.kind === 'lasso') {
         const pts = state.drag.points
         const [lx, ly] = pts[pts.length - 1]
         if (Math.hypot(x - lx, y - ly) > 3) pts.push([x, y])
@@ -342,115 +313,126 @@ els.overlay.addEventListener('pointerup', (e) => {
     const [x, y] = toCanvas(e)
 
     if (drag.kind === 'tap' && !drag.moved) {
-        const label = drag.negative || state.sign === 0 ? 0 : 1
-        state.clicks.push([x, y, label])
-        scheduleRun()
+        const include = !(drag.negative || state.sign === 0)
+        state.marks.push([x, y, include ? 1 : 0])
+        runSelection({ mode: 'click', point: [x, y], include })
     } else if (drag.kind === 'box') {
         const [sx, sy] = drag.start
         // Discard degenerate boxes (a stray click instead of a drag).
         if (Math.abs(x - sx) > 8 && Math.abs(y - sy) > 8) {
-            state.box = [Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)]
-            state.lasso = null // a box replaces a lasso region
-            scheduleRun()
+            const box = [Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)]
+            state.lastRegion = { kind: 'box', box }
+            runSelection({ mode: 'box', box })
         }
-    } else if (drag.kind === 'lasso') {
-        const prompts = lassoToPrompts(drag.points)
-        if (prompts) {
-            // A fresh lasso is a fresh selection: it replaces earlier
-            // prompts (the reference interaction), and later clicks refine
-            // INSIDE it (the clamp keeps everything within lasso ∪ margin).
-            state.lasso = { poly: drag.points, ...prompts }
-            state.clicks = []
-            state.box = null
-            scheduleRun()
-        }
+    } else if (drag.kind === 'lasso' && drag.points.length >= 3) {
+        state.lastRegion = { kind: 'lasso', poly: drag.points }
+        runSelection({ mode: 'lasso', poly: drag.points })
     }
     renderOverlay()
     refreshButtons()
 })
 
-/* ─── Segmentation pipeline ──────────────────────────────────────────────── */
+els.textbar.addEventListener('submit', (e) => {
+    e.preventDefault()
+    const q = els.textq.value.trim()
+    if (q) runSelection({ mode: 'text', query: q })
+})
 
-let debounceTimer = null
-const scheduleRun = () => {
-    clearTimeout(debounceTimer)
-    debounceTimer = setTimeout(runNow, 80)
-}
+/* ─── Selection pipeline ─────────────────────────────────────────────────── */
 
-async function runNow() {
+const sameSet = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
+
+/**
+ * One path for every mode.
+ *
+ * The interaction resolves to a set of instance indices; that set is the
+ * selection. When folding it into what was already selected changes nothing
+ * (a first click, a box, a phrase), the result just rendered IS the answer
+ * and there is no second call. Only corrective interactions — a negative
+ * click, an undo, dropping a chip — need a replay, and that replay is an
+ * `indices` query, which never re-runs the model.
+ */
+async function runSelection(request) {
     if (!state.hasImage) return
-    if (state.running) { state.runQueued = true; return }
-    const clicks = state.lasso ? [state.lasso.point, ...state.clicks] : state.clicks
-    const box = state.lasso ? state.lasso.box : state.box
-    if (clicks.length === 0 && !box) return
+    if (state.running) { state.runQueued = request; return }
 
     const seq = ++state.runSeq
     state.running = true
     setStatus(clientState.ready ? 'Selecting…' : 'Selecting… (first run loads the model)')
     try {
-        // The engine runs the whole post pipeline (lasso clamp → hygiene →
-        // edge refinement) off-thread and returns both masks.
-        const res = await segment(els.view, {
-            clicks,
-            box,
-            clampPoly: state.lasso?.poly || null,
-            clampMargin: state.lasso?.margin || 0,
-        })
-        if (seq !== state.runSeq) return // superseded — a newer prompt owns the state
+        let res = await select(els.view, request)
+        if (seq !== state.runSeq) return
+        state.detected = res.detected
 
-        if (!res.usable) {
-            state.mask = null
-            state.maskRaw = null
-            state.maskSummary = null
-            setStatus(`No selection — ${res.reason}. Try another click.`)
+        // Fold this interaction into the running selection.
+        const before = state.selected
+        let next
+        if (request.mode === 'click') {
+            const hit = res.indices[0]
+            if (hit === undefined) {
+                setStatus(`Nothing detected there — ${res.detected} objects found in this photo`)
+                return
+            }
+            next = request.include
+                ? (before.includes(hit) ? before : [...before, hit])
+                : before.filter((i) => i !== hit)
+        } else if (request.mode === 'indices') {
+            next = res.indices
         } else {
-            state.mask = res.imageData
-            state.maskRaw = res.rawImageData
-            state.maskSummary = res.summary
-            state.score = res.score
-            setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(res.summary.coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}`)
+            next = res.indices
         }
-        renderOverlay()
-        refreshButtons()
+        state.selected = next
+        state.query = request.mode === 'text' ? request.query : ''
+
+        // Only replay when the folded set differs from what we just rendered.
+        if (!sameSet(next, res.indices)) {
+            if (next.length === 0) {
+                clearMask()
+                setStatus('Cleared')
+                return
+            }
+            res = await select(els.view, { mode: 'indices', indices: next })
+            if (seq !== state.runSeq) return
+        }
+
+        state.mask = res.imageData
+        state.maskRaw = res.rawImageData
+        state.maskSummary = res.summary
+        state.instances = res.instances
+
+        if (!res.instances.length) {
+            clearMask()
+            setStatus(state.query
+                ? `Nothing matched “${state.query}” — ${res.reason || 'not in this photo'}`
+                : `Nothing selected — ${res.reason || 'try again'}`)
+            return
+        }
+        const n = res.instances.length
+        const what = state.query ? `“${state.query}”` : `${n} ${n === 1 ? 'object' : 'objects'}`
+        setStatus(`Selected ${what} — ${((res.summary?.coverage || 0) * 100).toFixed(1)}% of frame · ${res.detected} found in photo${res.analyzed ? '' : ' · cached'}`)
     } catch (err) {
         if (seq !== state.runSeq) return
         console.error('[seglab] selection failed:', err)
         setStatus(`Selection failed: ${err?.message}`)
     } finally {
         state.running = false
-        if (state.runQueued) { state.runQueued = false; scheduleRun() }
+        renderInstances()
+        renderOverlay()
+        refreshButtons()
+        const queued = state.runQueued
+        state.runQueued = null
+        if (queued) runSelection(queued)
     }
 }
 
-/* ─── Text search ────────────────────────────────────────────────────────── */
-
-/**
- * Recomposite the union mask from whichever instances are toggled on. Each
- * instance is a bbox-cropped plane, so this touches only the pixels the
- * objects actually cover — a text result with a dozen instances still costs
- * one full-frame buffer, not a dozen.
- */
-const compositeInstances = () => {
-    const w = els.view.width
-    const h = els.view.height
-    const on = state.instances.filter((i) => i.on)
-    if (on.length === 0) { state.mask = null; state.maskRaw = null; return }
-    const data = new Uint8ClampedArray(w * h * 4)
-    for (let i = 0; i < w * h; i += 1) data[i * 4 + 3] = 255
-    for (const inst of on) {
-        for (let y = 0; y < inst.h; y += 1) {
-            const src = y * inst.w
-            const dst = (inst.y0 + y) * w + inst.x0
-            for (let x = 0; x < inst.w; x += 1) {
-                if (!inst.plane[src + x]) continue
-                const j = (dst + x) * 4
-                data[j] = 255; data[j + 1] = 255; data[j + 2] = 255
-            }
-        }
-    }
-    state.mask = new ImageData(data, w, h)
-    state.maskRaw = state.mask
+const clearMask = () => {
+    state.mask = null
+    state.maskRaw = null
+    state.maskSummary = null
+    state.instances = []
 }
+
+/* ─── Instance chips ─────────────────────────────────────────────────────── */
 
 function renderInstances() {
     els.instances.innerHTML = ''
@@ -458,67 +440,16 @@ function renderInstances() {
     if (state.instances.length <= 1) return
     state.instances.forEach((inst, idx) => {
         const chip = document.createElement('span')
-        chip.className = `inst${inst.on ? ' on' : ''}`
-        chip.textContent = `${inst.phrase} ${(inst.score * 100).toFixed(0)}%`
-        chip.title = 'Click to include/exclude this instance'
+        chip.className = 'inst on'
+        chip.textContent = `${inst.label} ${(inst.score * 100).toFixed(0)}%`
+        chip.title = 'Click to drop this object from the selection'
         chip.addEventListener('click', () => {
-            state.instances[idx].on = !state.instances[idx].on
-            compositeInstances()
-            renderInstances()
-            renderOverlay()
-            refreshButtons()
+            const next = state.selected.filter((_, i) => i !== idx)
+            runSelection({ mode: 'indices', indices: next })
         })
         els.instances.appendChild(chip)
     })
 }
-
-async function runTextNow(query) {
-    if (!state.hasImage || !query.trim()) return
-    if (state.running) { state.runQueued = false }
-    const seq = ++state.runSeq
-    state.running = true
-    setStatus(clientState.text?.status === 'ready'
-        ? 'Searching…'
-        : 'Searching… (first run downloads the text model, ~155 MB one-time)')
-    try {
-        const res = await segmentText(els.view, query)
-        if (seq !== state.runSeq) return
-
-        state.query = query
-        state.clicks = []
-        state.box = null
-        state.lasso = null
-        state.instances = res.instances.map((i) => ({ ...i, on: true }))
-
-        if (!res.usable) {
-            state.mask = null
-            state.maskRaw = null
-            state.maskSummary = null
-            // Finding nothing is a real answer, not an error.
-            setStatus(`Nothing matched “${query}” — ${res.reason}`)
-        } else {
-            compositeInstances()
-            state.maskSummary = res.summary
-            state.score = res.instances[0]?.score || 0
-            const n = res.instances.length
-            setStatus(`Found ${n} ${n === 1 ? 'match' : 'matches'} for “${query}” — ${res.lane} · ${(res.summary.coverage * 100).toFixed(1)}% of frame${res.detectCached ? ' · cached' : ''}`)
-        }
-        renderInstances()
-        renderOverlay()
-        refreshButtons()
-    } catch (err) {
-        if (seq !== state.runSeq) return
-        console.error('[seglab] text search failed:', err)
-        setStatus(`Text search failed: ${err?.message}`)
-    } finally {
-        state.running = false
-    }
-}
-
-els.textbar.addEventListener('submit', (e) => {
-    e.preventDefault()
-    runTextNow(els.textq.value)
-})
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
@@ -526,11 +457,8 @@ els.textbar.addEventListener('submit', (e) => {
 const buildMaskLayers = (mask) => {
     const { width, height } = mask
     const raw = new OffscreenCanvas(width, height)
-    const rawCtx = raw.getContext('2d')
-    rawCtx.putImageData(mask, 0, 0)
+    raw.getContext('2d').putImageData(mask, 0, 0)
 
-    // Only the white pixels, as accent color (black pixels are opaque in the
-    // ImageData, so tint via source-in on a luma→alpha copy).
     const alpha = new OffscreenCanvas(width, height)
     const alphaCtx = alpha.getContext('2d', { willReadFrequently: true })
     alphaCtx.drawImage(raw, 0, 0)
@@ -538,8 +466,8 @@ const buildMaskLayers = (mask) => {
     const img = alphaCtx.getImageData(0, 0, width, height)
     const d = img.data
     for (let i = 0; i < d.length; i += 4) {
-        d[i + 3] = d[i] // alpha = luma
-        d[i] = 53; d[i + 1] = 224; d[i + 2] = 194 // accent RGB
+        d[i + 3] = d[i]
+        d[i] = 53; d[i + 1] = 224; d[i + 2] = 194
     }
     alphaCtx.putImageData(img, 0, 0)
 
@@ -572,27 +500,25 @@ function renderOverlay() {
 
     const markerR = Math.max(4, Math.min(width, height) * 0.009)
 
-    // Persisted box (dashed).
-    if (state.box) {
+    if (state.lastRegion?.kind === 'box') {
+        const b = state.lastRegion.box
         ctx.setLineDash([7, 5])
         ctx.strokeStyle = ACCENT
         ctx.lineWidth = 1.75
-        ctx.strokeRect(state.box[0], state.box[1], state.box[2] - state.box[0], state.box[3] - state.box[1])
+        ctx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1])
         ctx.setLineDash([])
     }
-
-    // Lasso region (kept faint once the mask lands, so the clamp is visible).
-    if (state.lasso) {
+    if (state.lastRegion?.kind === 'lasso') {
+        const poly = state.lastRegion.poly
         ctx.beginPath()
-        ctx.moveTo(state.lasso.poly[0][0], state.lasso.poly[0][1])
-        for (const [px, py] of state.lasso.poly.slice(1)) ctx.lineTo(px, py)
+        ctx.moveTo(poly[0][0], poly[0][1])
+        for (const [px, py] of poly.slice(1)) ctx.lineTo(px, py)
         ctx.closePath()
         ctx.strokeStyle = state.mask ? 'rgba(53,224,194,0.25)' : 'rgba(90,160,255,0.9)'
         ctx.lineWidth = 2.5
         ctx.stroke()
     }
 
-    // In-progress drags.
     if (state.drag?.kind === 'box') {
         const [sx, sy] = state.drag.start
         const [nx, ny] = state.drag.now
@@ -615,8 +541,7 @@ function renderOverlay() {
         ctx.fill()
     }
 
-    // Click markers.
-    for (const [x, y, label] of state.clicks) {
+    for (const [x, y, label] of state.marks) {
         ctx.beginPath()
         ctx.arc(x, y, markerR, 0, Math.PI * 2)
         ctx.fillStyle = label ? POS_COLOR : NEG_COLOR
@@ -653,11 +578,10 @@ els.cutout.addEventListener('click', async () => {
     setTimeout(() => URL.revokeObjectURL(a.href), 5000)
 })
 
-/* ─── Headless test hooks (verify.mjs) ───────────────────────────────────── */
+/* ─── Headless test hooks (verify.mjs, bench.mjs) ────────────────────────── */
 
 const waitForRun = async () => {
-    // Wait out the debounce + the run; poll because runs can chain.
-    await new Promise((res) => setTimeout(res, 120))
+    await new Promise((res) => setTimeout(res, 60))
     while (state.running || state.runQueued) {
         await new Promise((res) => setTimeout(res, 40))
     }
@@ -665,6 +589,28 @@ const waitForRun = async () => {
 
 window.__seglab = {
     loadDemo: () => { showImage(buildDemoScene()) },
+    reset: () => clearSelection(),
+    warm: () => warmUp(),
+    state: () => ({
+        ready: clientState.ready,
+        device: clientState.device,
+        mode: clientState.mode,
+        lastRun: clientState.lastRun,
+        maskSummary: state.maskSummary,
+        detected: state.detected,
+        selected: state.selected.length,
+        query: state.query,
+        instances: state.instances,
+    }),
+    maskStats: () => {
+        if (!state.mask) return null
+        const { data, width, height } = state.mask
+        let soft = 0
+        for (let i = 0; i < data.length; i += 4) {
+            if (data[i] > 16 && data[i] < 240) soft += 1
+        }
+        return { components: countMaskComponents(data, width, height), softPixels: soft }
+    },
     /** Load an image from a data/blob URL — how bench.mjs feeds in DSLR files. */
     loadURL: async (url) => {
         const blob = await (await fetch(url)).blob()
@@ -674,10 +620,7 @@ window.__seglab = {
         bmp.close()
         return dims
     },
-    /**
-     * Synthetic scene at an arbitrary (DSLR) resolution with analytically
-     * known object masks — the reproducible half of the accuracy benchmark.
-     */
+    /** Synthetic scene at an arbitrary (DSLR) resolution. */
     loadSynthetic: ({ w = 6000, h = 4000, objects = [] } = {}) => {
         const c = document.createElement('canvas')
         c.width = w
@@ -698,58 +641,41 @@ window.__seglab = {
         showImage(c)
         return { width: w, height: h, canonW: els.view.width, canonH: els.view.height }
     },
-    reset: () => clearPrompts(),
-    state: () => ({
-        ready: clientState.ready,
-        device: clientState.device,
-        mode: clientState.mode,
-        lane: clientState.lane,
-        lastRun: clientState.lastRun,
-        maskSummary: state.maskSummary,
-        score: state.score,
-        clicks: state.clicks.length,
-        query: state.query,
-        instances: state.instances.map((i) => ({
-            phrase: i.phrase, score: i.score, box: i.box, area: i.area,
-            bbox: [i.x0, i.y0, i.x0 + i.w - 1, i.y0 + i.h - 1],
-        })),
-        text: clientState.text,
-    }),
-    maskStats: () => {
-        if (!state.mask) return null
-        const { data, width, height } = state.mask
-        let soft = 0
-        for (let i = 0; i < data.length; i += 4) {
-            if (data[i] > 16 && data[i] < 240) soft += 1
-        }
-        return { components: countMaskComponents(data, width, height), softPixels: soft }
-    },
-    /** Drive the text lane headlessly. Resolves once the search has settled. */
-    textSearch: async (query) => {
-        setMode('text')
-        await runTextNow(query)
+    clickAt: async (x, y, negative = false) => {
+        setMode('click')
+        state.marks.push([x, y, negative ? 0 : 1])
+        runSelection({ mode: 'click', point: [x, y], include: !negative })
         await waitForRun()
         return window.__seglab.state()
     },
-    warmText: () => warmUpText(),
-    clickAt: async (x, y, negative = false) => {
-        state.clicks.push([x, y, negative ? 0 : 1])
-        scheduleRun()
+    boxAt: async (x0, y0, x1, y1) => {
+        setMode('box')
+        const box = [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)]
+        state.lastRegion = { kind: 'box', box }
+        runSelection({ mode: 'box', box })
         await waitForRun()
         return window.__seglab.state()
     },
     lassoCircle: async (cx, cy, r, n = 28) => {
+        setMode('lasso')
         const poly = []
         for (let i = 0; i < n; i += 1) {
             const a = (i / n) * Math.PI * 2
             poly.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r])
         }
-        const prompts = lassoToPrompts(poly)
-        if (!prompts) throw new Error('degenerate test lasso')
-        state.lasso = { poly, ...prompts }
-        state.clicks = []
-        state.box = null
-        scheduleRun()
+        state.lastRegion = { kind: 'lasso', poly }
+        runSelection({ mode: 'lasso', poly })
+        await waitForRun()
+        return window.__seglab.state()
+    },
+    textSearch: async (query) => {
+        setMode('text')
+        runSelection({ mode: 'text', query })
+        await waitForRun()
+        return window.__seglab.state()
+    },
+    selectAll: async () => {
+        runSelection({ mode: 'all' })
         await waitForRun()
         return window.__seglab.state()
     },

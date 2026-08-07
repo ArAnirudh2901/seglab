@@ -2,7 +2,7 @@
 /**
  * Correctness gate for the optimized post pipeline.
  *
- * `edge-refine.js` and `sam-core.js` were rewritten for speed: the guided
+ * `edge-refine.js` and `mask-core.js` were rewritten for speed: the guided
  * filter's image-only terms are hoisted out per image, both stages are
  * confined to the mask's bounding box, morphology became a separable box
  * count, per-pixel `Set` lookups became label-indexed LUTs, and every working
@@ -17,7 +17,7 @@
  * Usage: bun test-post-pipeline.mjs
  */
 import { buildGuide, makeScratch, refineMaskEdges } from './js/edge-refine.js'
-import { cleanupMaskRGBA, countMaskComponents, makeMaskScratch } from './js/sam-core.js'
+import { cleanupMaskRGBA, countMaskComponents, makeMaskScratch } from './js/mask-core.js'
 
 /* ─── Reference implementation (naive on purpose) ────────────────────────── */
 

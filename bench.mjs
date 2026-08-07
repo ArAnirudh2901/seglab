@@ -1,25 +1,23 @@
 #!/usr/bin/env bun
 /**
- * SEGLAB text-search benchmark — accuracy, latency, and resource utilisation.
+ * SEGLAB benchmark — accuracy, latency, and resource utilisation.
  *
  * Drives the REAL app in headless Chromium against real photographs, and
- * reports what a text query actually costs and how good the mask actually is.
+ * reports what a selection actually costs and how good the mask actually is.
  *
  * WHAT IT MEASURES
- *   latency   per-stage — image encode, text detect, per-instance decode,
- *             post pipeline — as P50/P95 over repeats, in all four cache
- *             quadrants (phrase warm/cold × image warm/cold).
+ *   latency   split the way the architecture is: ANALYZE (the one YOLOE-26
+ *             forward per photo) vs SELECT (a pure query over the cached
+ *             instance set) vs POST (hygiene + edge refinement). The cold
+ *             number includes analysis; the warm number is what the user
+ *             feels on every interaction after the first, and it should not
+ *             involve the model at all.
  *   memory    peak JS heap (CDP Performance.getMetrics) and peak OS-level RSS
- *             of the whole browser process tree. The 2.2 GB ceiling is a HARD
+ *             of the whole browser process tree. The 1 GB ceiling is a HARD
  *             GATE: exceed it and this exits non-zero.
- *   accuracy  on synthetic fixtures, exact mIoU + boundary-F1 against
- *             analytically known masks. On your own photos there is no ground
- *             truth, so it reports two GT-free proxies instead:
- *               · click-vs-text agreement — click the object, then describe
- *                 it; IoU between the two masks. The click lane is already
- *                 verified by verify.mjs, so it is a legitimate reference.
- *               · phrasing stability — "car" vs "the car" vs "automobile"
- *                 should select the same pixels.
+ *   accuracy  instance counts and coverage per phrase. On your own photos
+ *             there is no ground truth, so the meaningful check is the
+ *             absent-phrase control below plus the contact sheets.
  *   controls  absent-phrase false positives. Querying something that is NOT
  *             in the photo must return nothing. Detectors fail this quietly.
  *
@@ -36,7 +34,7 @@
  *   bun bench.mjs --images ~/Pictures/test
  *   bun bench.mjs --phrases "all the birds,the red door,giraffe"
  *   bun bench.mjs --synthetic              # skip real photos entirely
- *   bun bench.mjs --repeats 5 --ceiling 2200
+ *   bun bench.mjs --repeats 5 --ceiling 1000
  *
  * Results land in bench-out/: report.json, report.md, and a PNG contact sheet
  * per image so the masks can be eyeballed, not just scored.
@@ -67,7 +65,7 @@ const CFG = {
     phrases: arg('phrases', '').split(',').map((s) => s.trim()).filter(Boolean),
     repeats: Number(arg('repeats', 3)),
     maxImages: Number(arg('max-images', 4)),
-    ceilingMB: Number(arg('ceiling', 2200)),
+    ceilingMB: Number(arg('ceiling', 1000)),
     synthetic: flag('synthetic'),
     timeoutMs: Number(process.env.HARNESS_TIMEOUT_MS || 12 * 60 * 1000),
 }
@@ -102,6 +100,7 @@ try {
 const MIME = {
     '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
     '.css': 'text/css', '.json': 'application/json', '.wasm': 'application/wasm',
+    '.onnx': 'application/octet-stream',
 }
 const server = createServer(async (req, res) => {
     try {
@@ -167,25 +166,6 @@ const heapMB = async (cdp) => {
     } catch { return 0 }
 }
 
-/** IoU between two mask bboxes-with-areas reported by the page. */
-const iouFromPage = (page) => page.evaluate(() => {
-    const s = window.__benchMasks
-    if (!s?.a || !s?.b) return null
-    const { a, b } = s
-    let inter = 0
-    let ua = 0
-    let ub = 0
-    for (let i = 0; i < a.length; i += 4) {
-        const A = a[i] >= 128 ? 1 : 0
-        const B = b[i] >= 128 ? 1 : 0
-        if (A) ua += 1
-        if (B) ub += 1
-        if (A && B) inter += 1
-    }
-    const union = ua + ub - inter
-    return union > 0 ? inter / union : null
-})
-
 /* ─── Run ───────────────────────────────────────────────────────────────── */
 
 await mkdir(OUT, { recursive: true })
@@ -222,11 +202,11 @@ try {
         peakHeap = Math.max(peakHeap, await heapMB(cdp))
     }
 
-    // Warm the text detector once; its download is not a per-query cost.
-    log('warming the text detector (first run downloads ~155 MB)…')
+    // Warm the model once; its load is not a per-query cost.
+    log('loading YOLOE-26…')
     const tWarm = Date.now()
-    await page.evaluate(() => window.__seglab.warmText())
-    log(`text detector ready in ${((Date.now() - tWarm) / 1000).toFixed(1)}s`)
+    await page.evaluate(() => window.__seglab.warm())
+    log(`model ready in ${((Date.now() - tWarm) / 1000).toFixed(1)}s`)
     await sample()
 
     /* --- pick the images --- */
@@ -286,10 +266,10 @@ try {
                 const lr = s.lastRun || {}
                 runs.push({
                     wall,
-                    detectMs: lr.detectMs ?? 0,
-                    decodeMs: lr.decodeMs ?? 0,
+                    analyzeMs: lr.analyzeMs ?? 0,
+                    selectMs: lr.selectMs ?? 0,
                     postMs: lr.postMs ?? 0,
-                    encodeMs: lr.encodeMs ?? 0,
+                    detected: lr.detected ?? 0,
                     instances: s.instances?.length ?? 0,
                 })
                 last = s
@@ -303,13 +283,14 @@ try {
                 coldMs: runs[0].wall,
                 warmP50: pct(runs.slice(1).map((x) => x.wall), 0.5),
                 warmP95: pct(runs.slice(1).map((x) => x.wall), 0.95),
-                detectP50: pct(runs.map((x) => x.detectMs), 0.5),
-                decodeP50: pct(runs.map((x) => x.decodeMs), 0.5),
+                analyzeP50: pct(runs.map((x) => x.analyzeMs), 0.5),
+                selectP50: pct(runs.map((x) => x.selectMs), 0.5),
                 postP50: pct(runs.map((x) => x.postMs), 0.5),
+                detected: runs[0].detected,
                 topScore: last?.instances?.[0]?.score ?? 0,
             }
             entry.phrases.push(row)
-            log(`   "${phrase}" → ${row.instances} inst · cold ${row.coldMs}ms · warm p50 ${row.warmP50}ms (detect ${row.detectP50} / decode ${row.decodeP50} / post ${row.postP50})`)
+            log(`   "${phrase}" → ${row.instances} inst · cold ${row.coldMs}ms · warm p50 ${row.warmP50}ms (analyze ${row.analyzeP50} / select ${row.selectP50} / post ${row.postP50})`)
         }
 
         // Absent-phrase controls: any instance here is a false positive.
@@ -340,7 +321,9 @@ try {
     const fpRate = allAbsent.length ? allAbsent.filter((a) => a.falsePositive).length / allAbsent.length : 0
     gate('absent-phrase false-positive rate ≤ 20%', fpRate <= 0.2, `${(fpRate * 100).toFixed(0)}% (${allAbsent.filter((a) => a.falsePositive).length}/${allAbsent.length})`)
     const warm = report.images.flatMap((i) => i.phrases.map((p) => p.warmP50)).filter(Boolean)
-    gate('warm query p50 under 1.5 s', warm.length === 0 || pct(warm, 0.5) <= 1500, `${pct(warm, 0.5)} ms`)
+    // Warm queries never touch the model — they are pure arithmetic over a
+// cached instance set, so the bar is interaction latency, not inference.
+gate('warm query p50 under 150 ms', warm.length === 0 || pct(warm, 0.5) <= 150, `${pct(warm, 0.5)} ms`)
 
     await page.close()
 } catch (err) {
@@ -371,10 +354,10 @@ if (report.peak) {
 for (const img of report.images) {
     md.push(`## ${img.label}`, '',
         `Source ${img.source?.width}×${img.source?.height} → canonical ${img.source?.canonW}×${img.source?.canonH}`, '',
-        '| phrase | instances | cold | warm p50 | warm p95 | detect | decode | post | coverage |',
+        '| phrase | instances | cold | warm p50 | warm p95 | analyze | select | post | coverage |',
         '|---|---|---|---|---|---|---|---|---|')
     for (const p of img.phrases) {
-        md.push(`| ${p.phrase} | ${p.instances} | ${p.coldMs} ms | ${p.warmP50} ms | ${p.warmP95} ms | ${p.detectP50} ms | ${p.decodeP50} ms | ${p.postP50} ms | ${(p.coverage * 100).toFixed(1)}% |`)
+        md.push(`| ${p.phrase} | ${p.instances} | ${p.coldMs} ms | ${p.warmP50} ms | ${p.warmP95} ms | ${p.analyzeP50} ms | ${p.selectP50} ms | ${p.postP50} ms | ${(p.coverage * 100).toFixed(1)}% |`)
     }
     md.push('', '**Absent-phrase controls** (any instance is a false positive):', '')
     for (const a of img.absent) md.push(`- \`${a.phrase}\` → ${a.instances} instance(s) ${a.falsePositive ? '❌ FALSE POSITIVE' : '✅'}`)

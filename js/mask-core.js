@@ -1,101 +1,18 @@
 /**
- * sam-core (pure — no DOM, no transformers.js)
- * ----------------------------------------------
- * Prompt/mask math for the on-device segmentation engine: mapping click/box
- * coordinates into the model's reshaped input space, building prompt tensor
- * payloads, picking the best of SAM's three candidate masks, and converting
- * a mask tensor into RGBA. Dependency-free so it can be unit-tested headless.
+ * mask-core (pure — no DOM, no model)
+ * --------------------------------------
+ * Model-agnostic mask hygiene: connected components, crumb removal, pinhole
+ * filling, coverage/bbox summaries. Nothing here knows which network produced
+ * the mask, which is the point — it cleaned up SAM's output before, it cleans
+ * up YOLOE-26's prototype masks now, and it would clean up whatever comes
+ * next. Dependency-free so it can be unit-tested headless.
  *
- * Coordinate model: SAM resizes the source so its longest side hits the
- * model input size (1024) — `reshaped_input_sizes` is that resized [h, w].
- * Prompts must be expressed in THAT space, while post_process_masks returns
- * masks back in the source's own size. All helpers here take the source
- * dims + reshaped pair so both ends agree on one reference frame.
+ * The hot paths are shaped for MULTI-INSTANCE work, because one query now
+ * routinely yields a dozen masks: every stage is confined to the mask's own
+ * bounding box, component bookkeeping uses label-indexed lookup tables rather
+ * than per-pixel `Set` probes, and all working buffers come from a caller-
+ * supplied pool (`makeMaskScratch`) so N instances allocate once, not N times.
  */
-
-/** Scale one source-space point into reshaped-input space. */
-export const scalePointToReshaped = (x, y, srcW, srcH, reshaped) => [
-    (x * reshaped[1]) / srcW,
-    (y * reshaped[0]) / srcH,
-]
-
-/**
- * Build the point-prompt payload from `[x, y, label]` clicks (label 1 =
- * include, 0 = exclude). Returns plain arrays + dims; the engine wraps them
- * in Tensors (this module stays transformers-free).
- *
- * @param {Array<[number, number, 0|1]>} clicks  source-space clicks
- * @param {number} srcW
- * @param {number} srcH
- * @param {[number, number]} reshaped  [h, w] model-input size
- */
-export const buildPointPrompt = (clicks, srcW, srcH, reshaped) => {
-    if (!Array.isArray(clicks) || clicks.length === 0) return null
-    const n = clicks.length
-    const points = new Float32Array(n * 2)
-    const labels = new BigInt64Array(n)
-    for (let i = 0; i < n; i += 1) {
-        const [x, y, label] = clicks[i]
-        const [rx, ry] = scalePointToReshaped(x, y, srcW, srcH, reshaped)
-        points[i * 2] = rx
-        points[i * 2 + 1] = ry
-        labels[i] = BigInt(label ? 1 : 0)
-    }
-    return {
-        points,
-        pointDims: [1, 1, n, 2],
-        labels,
-        labelDims: [1, 1, n],
-    }
-}
-
-/**
- * Build the box-prompt payload from a source-space `[x0, y0, x1, y1]` box.
- * Also reports the box centre (source space): when the prompt is ONLY a box,
- * the engine adds the centre as a positive click, both because whole-object
- * box selection benefits from an interior anchor and because the
- * transformers.js SAM forward() derives default labels from `input_points`
- * and cannot run point-free.
- */
-export const buildBoxPrompt = (box, srcW, srcH, reshaped) => {
-    if (!Array.isArray(box) || box.length !== 4) return null
-    const [x0, y0, x1, y1] = box
-    const [rx0, ry0] = scalePointToReshaped(Math.min(x0, x1), Math.min(y0, y1), srcW, srcH, reshaped)
-    const [rx1, ry1] = scalePointToReshaped(Math.max(x0, x1), Math.max(y0, y1), srcW, srcH, reshaped)
-    return {
-        box: new Float32Array([rx0, ry0, rx1, ry1]),
-        boxDims: [1, 1, 4],
-        center: [(Math.min(x0, x1) + Math.max(x0, x1)) / 2, (Math.min(y0, y1) + Math.max(y0, y1)) / 2],
-    }
-}
-
-/** Index of the best of SAM's three candidate masks (argmax IoU score). */
-export const pickBestMask = (scores) => {
-    let best = 0
-    for (let i = 1; i < scores.length; i += 1) {
-        if (scores[i] > scores[best]) best = i
-    }
-    return best
-}
-
-/**
- * Extract one channel of a post-processed bool mask tensor ([1, C, H, W],
- * Uint8 0/1 data) as opaque white-on-black RGBA.
- */
-export const maskChannelToRGBA = (maskData, width, height, channel) => {
-    const size = width * height
-    const offset = channel * size
-    const rgba = new Uint8ClampedArray(size * 4)
-    for (let i = 0; i < size; i += 1) {
-        const v = maskData[offset + i] ? 255 : 0
-        const j = i * 4
-        rgba[j] = v
-        rgba[j + 1] = v
-        rgba[j + 2] = v
-        rgba[j + 3] = 255
-    }
-    return rgba
-}
 
 /** Coverage + bbox of a white-on-black RGBA mask (reads the R channel). */
 export const summarizeMaskRGBA = (rgba, width, height) => {
@@ -363,62 +280,4 @@ export const countMaskComponents = (rgba, w, h) => {
     const bin = new Uint8Array(w * h)
     for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
     return labelComponents(bin, w, h).areas.length
-}
-
-/**
- * Lasso stroke → SAM prompts. The lasso is a PROMPT GENERATOR, not a
- * geometric cut: its bounding box becomes the box prompt and its centroid a
- * positive point, then the decoder snaps to the true object boundary inside.
- * The polygon itself is kept so the caller can clamp the result to
- * lasso ∪ margin (the "can never bleed onto the second zebra" guarantee).
- *
- * @param {Array<[number, number]>} poly  closed freehand stroke, source space
- * @returns {{ box: number[], point: [number, number, 1], margin: number } | null}
- */
-export const lassoToPrompts = (poly) => {
-    if (!Array.isArray(poly) || poly.length < 3) return null
-    let minX = Infinity
-    let minY = Infinity
-    let maxX = -Infinity
-    let maxY = -Infinity
-    // Polygon centroid (shoelace) — falls back to bbox centre for degenerate
-    // (near-zero-area) scribbles.
-    let areaSum = 0
-    let cx = 0
-    let cy = 0
-    for (let i = 0; i < poly.length; i += 1) {
-        const [x, y] = poly[i]
-        const [nx, ny] = poly[(i + 1) % poly.length]
-        const cross = x * ny - nx * y
-        areaSum += cross
-        cx += (x + nx) * cross
-        cy += (y + ny) * cross
-        if (x < minX) minX = x
-        if (x > maxX) maxX = x
-        if (y < minY) minY = y
-        if (y > maxY) maxY = y
-    }
-    if (!(maxX > minX) || !(maxY > minY)) return null
-    const area = areaSum / 2
-    let centre
-    if (Math.abs(area) > 1e-3) {
-        centre = [cx / (6 * area), cy / (6 * area)]
-    } else {
-        centre = [(minX + maxX) / 2, (minY + maxY) / 2]
-    }
-    // A concave stroke can put the centroid outside the polygon; the bbox
-    // centre is no better in general, but SAM tolerates near-boundary
-    // anchors — clamp into the bbox to keep the prompt sane.
-    centre = [
-        Math.min(maxX, Math.max(minX, centre[0])),
-        Math.min(maxY, Math.max(minY, centre[1])),
-    ]
-    const diag = Math.hypot(maxX - minX, maxY - minY)
-    return {
-        box: [minX, minY, maxX, maxY],
-        point: [centre[0], centre[1], 1],
-        // Clamp margin: forgiving of a sloppy stroke, but tight enough that
-        // a neighbouring object outside the lasso stays out.
-        margin: Math.max(8, diag * 0.04),
-    }
 }
