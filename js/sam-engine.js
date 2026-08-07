@@ -31,10 +31,20 @@ import {
     buildBoxPrompt,
     buildPointPrompt,
     cleanupMaskRGBA,
+    makeMaskScratch,
     maskChannelToRGBA,
     pickBestMask,
 } from './sam-core.js'
-import { refineMaskEdges } from './edge-refine.js'
+import { buildGuide, makeScratch, refineMaskEdges } from './edge-refine.js'
+import {
+    cropMaskPlane,
+    detectionToPrompt,
+    maskNMS,
+    parseQuery,
+    selectDetections,
+} from './text-core.js'
+import { detect as detectText, disposeText, warmText } from './text-engine.js'
+import * as governor from './memory-governor.js'
 
 // Pinned CDN build of transformers.js (ESM single file, CORS-enabled) —
 // version-locked so a CDN-side major bump can never break the app.
@@ -83,8 +93,44 @@ const state = {
 let transformersPromise = null
 const bundles = { draft: null, flagship: null }
 
-/** `${lane}:${imageKey}` → { embeddings, original_sizes, reshaped_input_sizes, gray, w, h } */
+/** `${lane}:${imageKey}` → { embeddings, original_sizes, reshaped_input_sizes, gray, w, h, guide } */
 const embedCache = new Map()
+
+/**
+ * Post-pipeline working buffers, reused across every mask of every query.
+ * A text prompt decodes N masks at once, so allocating per mask was the
+ * pipeline's real memory cost — these are allocated once and grown on demand.
+ */
+const postScratch = { edge: makeScratch(), mask: null, w: 0, h: 0 }
+const maskScratchFor = (w, h) => {
+    if (!postScratch.mask || postScratch.w !== w || postScratch.h !== h) {
+        postScratch.mask = makeMaskScratch(w, h)
+        postScratch.w = w
+        postScratch.h = h
+    }
+    return postScratch.mask
+}
+
+/**
+ * The guided filter's image-only terms (mean/var of the grayscale guide).
+ * They depend on the photo alone, so they are built once per cached image and
+ * every mask decoded on it — click, box, lasso, or any of a text prompt's N
+ * instances — reuses them.
+ */
+const ensureGuide = (entry) => {
+    entry.guide ??= buildGuide(entry.gray, entry.w, entry.h)
+    return entry.guide
+}
+
+/** Shared post pipeline: hygiene → edge refinement, bbox-threaded. */
+const runPostPipeline = (rgba, w, h, entry, seeds) => {
+    const hygiene = cleanupMaskRGBA(rgba, w, h, seeds, maskScratchFor(w, h))
+    const refined = refineMaskEdges(rgba, w, h, ensureGuide(entry), {
+        scratch: postScratch.edge,
+        bbox: hygiene.bbox,
+    })
+    return { hygiene, bandPixels: refined.bandPixels }
+}
 
 // Event sink — the worker shell points this at postMessage; the inline
 // fallback points it at the client's emitter. Events: {type:'progress'|'lane'}.
@@ -189,7 +235,22 @@ const maybeStartFlagship = () => {
                 state.flagship = 'unavailable'
                 return
             }
+            // 300 MB of weights plus its arena is the single biggest thing
+            // the app can load. On a machine (or a photo) that cannot spare
+            // the room, the draft lane stays — a working tool beats an OOM.
+            if (!governor.canAfford('flagship')) {
+                console.warn('[seglab] flagship lane skipped — not enough memory budget:', JSON.stringify(governor.budget()))
+                state.flagship = 'unavailable'
+                return
+            }
             await loadBundle('flagship')
+            governor.register('flagship', async () => {
+                try { await (await bundles.flagship)?.model?.dispose?.() } catch { /* already gone */ }
+                bundles.flagship = null
+                purgeLane('flagship')
+                state.flagship = 'idle'
+                emitEvent({ type: 'lane', lane: 'draft', label: LANES.draft.label })
+            })
             state.flagship = 'ready'
             emitEvent({ type: 'lane', lane: 'flagship', label: LANES.flagship.label })
         } catch (err) {
@@ -206,8 +267,15 @@ const maybeStartFlagship = () => {
  * and as a data-saver escape hatch).
  */
 export const warm = async ({ flagship = true } = {}) => {
+    governor.adoptDeviceCeiling()
     await loadBundle('draft')
     state.ready = true
+    governor.register('draft', async () => {
+        try { await (await bundles.draft)?.model?.dispose?.() } catch { /* already gone */ }
+        bundles.draft = null
+        purgeLane('draft')
+        state.ready = false
+    })
     if (flagship) maybeStartFlagship()
     else if (state.flagship === 'idle') state.flagship = 'unavailable'
     return getEngineState()
@@ -244,6 +312,10 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
 
     // One draw, one readback: pixels feed BOTH the model input and the
     // grayscale guide used by edge refinement.
+    // Tell the governor what this photo costs before anything heavy loads —
+    // a 45 MP file is ~340 MB of the ceiling on its own.
+    governor.setImageFootprint(w, h)
+
     const canvas = makeCanvas(w, h)
     canvas.getContext('2d').drawImage(source, 0, 0)
     const pixels = canvas.getContext('2d').getImageData(0, 0, w, h)
@@ -312,15 +384,14 @@ const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
     }
 }
 
-const segmentOnce = async (req) => {
-    const t0 = Date.now()
-    const laneKey = req.lane || activeLaneKey()
-    const bundle = await loadBundle(laneKey)
+/**
+ * Run the prompt decoder once against cached embeddings. Shared by the click
+ * lane and by every instance a text prompt produces, so the two lanes can
+ * never drift apart in mask quality — text search is the same decoder, just
+ * driven by a detector instead of a finger.
+ */
+const decodeMask = async (bundle, entry, clicks, box) => {
     const { Tensor } = bundle.transformers
-    const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
-    const tEncoded = Date.now()
-
-    const { clicks, box } = req
     const reshaped = entry.reshaped_input_sizes[0]
     const boxPrompt = buildBoxPrompt(box, entry.w, entry.h, reshaped)
     // Box with no clicks: anchor with the box centre as a positive point —
@@ -362,6 +433,17 @@ const segmentOnce = async (req) => {
     const [, , mh, mw] = masks[0].dims
     if (!mw || !mh) throw new Error('Decoder returned a malformed mask')
     const rawRgba = maskChannelToRGBA(masks[0].data, mw, mh, best)
+    return { rawRgba, mw, mh, score: Number(scores[best]) || 0, effectiveClicks }
+}
+
+const segmentOnce = async (req) => {
+    const t0 = Date.now()
+    const laneKey = req.lane || activeLaneKey()
+    const bundle = await loadBundle(laneKey)
+    const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+    const tEncoded = Date.now()
+
+    const { rawRgba, mw, mh, score, effectiveClicks } = await decodeMask(bundle, entry, req.clicks, req.box)
     const tDecoded = Date.now()
 
     // Shared post pipeline: clamp → hygiene → edge refinement. `rawRgba`
@@ -371,15 +453,14 @@ const segmentOnce = async (req) => {
         clampRGBAToPolygon(rgba, mw, mh, req.clampPoly, req.clampMargin || 8)
     }
     const seeds = effectiveClicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
-    const hygiene = cleanupMaskRGBA(rgba, mw, mh, seeds)
-    const refined = refineMaskEdges(rgba, mw, mh, entry.gray)
+    const { hygiene, bandPixels } = runPostPipeline(rgba, mw, mh, entry, seeds)
 
     return {
         rgba,
         rawRgba,
         width: mw,
         height: mh,
-        score: Number(scores[best]) || 0,
+        score,
         device: state.device,
         lane: LANES[laneKey].label,
         encoded,
@@ -387,7 +468,7 @@ const segmentOnce = async (req) => {
         decodeMs: tDecoded - tEncoded,
         postMs: Date.now() - tDecoded,
         hygiene,
-        bandPixels: refined.bandPixels,
+        bandPixels,
     }
 }
 
@@ -426,4 +507,141 @@ export const segment = async (req) => {
         embedCache.clear()
         return segmentOnce({ ...req, lane: 'draft' })
     }
+}
+
+/* ─── Text lane ──────────────────────────────────────────────────────────── */
+
+/**
+ * Select every object matching a free-form phrase, as MASKS.
+ *
+ * The phrase produces boxes (text-engine), the boxes drive the same SAM
+ * decoder the click lane uses, and every mask goes through the same post
+ * pipeline — so a text selection is exactly as clean-edged as a clicked one.
+ * Boxes never surface: the result is a union mask plus one compact plane per
+ * instance.
+ *
+ * Memory: instance masks are bbox-cropped `Uint8` planes, not full-frame RGBA.
+ * At DSLR scale a full-frame RGBA mask is ~96 MB EACH, so "all the birds"
+ * would be gigabytes; the union buffer is the only full-frame allocation.
+ *
+ * @param {{ imageKey: string, source: ImageBitmap|OffscreenCanvas|HTMLCanvasElement,
+ *           query: string, maxInstances?: number, maskNmsIoU?: number }} req
+ */
+export const segmentText = async (req) => {
+    const t0 = Date.now()
+    const concepts = parseQuery(req.query)
+    if (concepts.length === 0) {
+        return { instances: [], rgba: null, width: 0, height: 0, reason: 'no concept in that phrase', query: req.query }
+    }
+
+    // The detector and the flagship encoder must not be resident together.
+    await governor.makeRoomFor('text', { protect: ['draft'] })
+
+    const laneKey = activeLaneKey()
+    const bundle = await loadBundle(laneKey)
+    const { entry, encoded } = await ensureEmbeddings(bundle, req.imageKey, req.source)
+    const tEncoded = Date.now()
+
+    const det = await detectText({
+        imageKey: req.imageKey,
+        source: req.source,
+        phrases: concepts.map((c) => c.phrase),
+        emit: emitEvent,
+    })
+    governor.register('text', disposeText)
+    const tDetected = Date.now()
+
+    let mw = 0
+    let mh = 0
+    let decodeMs = 0
+    let postMs = 0
+    const found = []
+    for (const concept of concepts) {
+        const chosen = selectDetections(det.byPhrase[concept.phrase] || [], {
+            wantsAll: concept.wantsAll,
+            maxInstances: req.maxInstances || 24,
+        })
+        for (const d of chosen) {
+            const prompt = detectionToPrompt(d.box)
+            const tD = Date.now()
+            const dec = await decodeMask(bundle, entry, prompt.clicks, prompt.box)
+            decodeMs += Date.now() - tD
+
+            const tP = Date.now()
+            const rgba = dec.rawRgba
+            const seeds = prompt.clicks.map((c) => [c[0], c[1]])
+            const { hygiene } = runPostPipeline(rgba, dec.mw, dec.mh, entry, seeds)
+            postMs += Date.now() - tP
+
+            const plane = cropMaskPlane(rgba, dec.mw, dec.mh, hygiene.bbox)
+            if (!plane || plane.area === 0) continue
+            mw = dec.mw
+            mh = dec.mh
+            found.push({ phrase: concept.phrase, score: d.score, maskScore: dec.score, box: d.box, plane })
+        }
+    }
+
+    // Two phrases can land on the same object ("dog" and "puppy"); mask-level
+    // NMS is the honest de-duplication, box overlap is not.
+    const kept = maskNMS(found, req.maskNmsIoU ?? 0.7)
+    kept.sort((a, b) => b.score - a.score)
+
+    // One full-frame buffer for the whole selection.
+    let union = null
+    if (kept.length && mw && mh) {
+        union = new Uint8ClampedArray(mw * mh * 4)
+        for (let i = 0; i < mw * mh; i += 1) union[i * 4 + 3] = 255
+        for (const inst of kept) {
+            const p = inst.plane
+            for (let y = 0; y < p.h; y += 1) {
+                const src = y * p.w
+                const dst = (p.y0 + y) * mw + p.x0
+                for (let x = 0; x < p.w; x += 1) {
+                    if (!p.plane[src + x]) continue
+                    const j = (dst + x) * 4
+                    union[j] = 255; union[j + 1] = 255; union[j + 2] = 255
+                }
+            }
+        }
+    }
+
+    return {
+        rgba: union,
+        width: mw,
+        height: mh,
+        query: req.query,
+        concepts: concepts.map((c) => ({ phrase: c.phrase, wantsAll: c.wantsAll })),
+        instances: kept.map((i) => ({
+            phrase: i.phrase,
+            score: i.score,
+            maskScore: i.maskScore,
+            box: i.box,
+            plane: i.plane.plane,
+            x0: i.plane.x0,
+            y0: i.plane.y0,
+            w: i.plane.w,
+            h: i.plane.h,
+            area: i.plane.area,
+        })),
+        // An empty result for a phrase that genuinely is not in the photo is
+        // the CORRECT answer, not a failure — say so plainly.
+        reason: kept.length ? null : 'no confident match for that phrase in this photo',
+        device: state.device,
+        lane: LANES[laneKey].label,
+        encoded,
+        encodeMs: tEncoded - t0,
+        detectMs: tDetected - tEncoded,
+        detectCached: det.cached,
+        decodeMs,
+        postMs,
+        totalMs: Date.now() - t0,
+    }
+}
+
+/** Warm the text detector (background download), independent of the SAM lanes. */
+export const warmTextLane = async () => {
+    await governor.makeRoomFor('text', { protect: ['draft'] })
+    const s = await warmText(emitEvent)
+    if (s.status === 'ready') governor.register('text', disposeText)
+    return s
 }

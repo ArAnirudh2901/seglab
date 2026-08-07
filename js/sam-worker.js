@@ -17,7 +17,7 @@
  * when worker construction fails (see sam-client.js).
  */
 
-import { getEngineState, segment, setEventSink, warm } from './sam-engine.js'
+import { getEngineState, segment, segmentText, setEventSink, warm, warmTextLane } from './sam-engine.js'
 
 setEventSink((event) => {
     try { self.postMessage(event) } catch { /* non-cloneable — best-effort */ }
@@ -41,6 +41,23 @@ self.onmessage = async (event) => {
                 // The transferred bitmap is this side's to release.
                 try { source?.close?.() } catch { /* already closed */ }
             }
+            return
+        }
+        if (op === 'segmentText') {
+            const { source } = payload || {}
+            try {
+                const result = await segmentText(payload || {})
+                // Zero-copy back: the union mask plus each instance's plane.
+                const transfer = result.rgba ? [result.rgba.buffer] : []
+                for (const inst of result.instances) transfer.push(inst.plane.buffer)
+                self.postMessage({ id, ok: true, result }, transfer)
+            } finally {
+                try { source?.close?.() } catch { /* already closed */ }
+            }
+            return
+        }
+        if (op === 'warmText') {
+            self.postMessage({ id, ok: true, result: await warmTextLane() })
             return
         }
         if (op === 'state') {

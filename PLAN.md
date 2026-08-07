@@ -52,20 +52,47 @@ NO encoder size fixes, and they upgrade every current and future lane.
 | 3 | Mask hygiene: keep clicked components + ≥1%-of-largest, fill pinholes | components = 1 on disc (crumbs gone) |
 | 4 | Edge-band refinement: gray guided filter, ±6 px band, soft output, E toggle | 3131 soft boundary px; post ~110 ms |
 | 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 confirmed headless; encode 5581 ms / decode 630 ms |
+| 6 | Text lane (OWLv2-q → same decoder → same post pipeline), memory governor, post-pipeline rewrite | 487/487 exact vs naive reference; 12-instance query 2795→97 ms (28.7×); 74 unit assertions green |
+
+### P6 as built — and why it isn't SAM3 PCS
+
+The plan below called for OWLv2 as stage 1 and true concept segmentation as
+stage 2. Stage 2 got *closer* than expected — `rusen/sam3-browser-int8` is a
+browser-ready INT8 SAM3 split into image encoder / language encoder / decoder,
+with quality parity (0.9495 int8 vs 0.9471 fp32) — but it is **ruled out by a
+2.2 GB whole-app RAM ceiling**: ~900 MB of weights before any ONNX Runtime
+arena, alongside a decoded 45 MP photo, does not fit on a normal laptop.
+So P6 ships OWLv2-base-patch16 quantized (155 MB, Apache-2.0, WASM-capable)
+and P10 is now gated on the ceiling lifting or on EfficientSAM3's ONNX export
+landing upstream (weights are out under Apache-2.0; the export is still a TODO).
+
+**The optimization that mattered** was not the model. A text query decodes N
+masks, so the per-mask post pipeline is multiplied by N — it was 223 ms/mask,
+i.e. ~2.8 s for a twelve-instance query, before any model got faster. Three
+structural changes (guide invariants hoisted to once-per-image, both stages
+confined to each mask's bbox, all scratch buffers pooled across the query)
+took that to 97 ms total, verified bit-exact against a naive reference.
 
 ---
 
 ## Remaining phases (in order)
 
-### P6 — Text prompts, stage 1: OWLv2 → boxes → same decoder
-- **Step:** add `Xenova/owlv2-base-patch16-ensemble` (Apache-2.0, in transformers.js)
-  as a `detect(text)` op in the engine; each detected box feeds the existing
-  SAM decoder; union masks for multi-instance ("all zebras").
-- **Why:** works on EVERY device today (no new licensing, no export work), and
-  reuses the whole existing mask pipeline. Enables the disabled Text button.
-- **Gate:** demo scene gains labeled objects; text "red circle" → same bbox/coverage
-  bars as the click test; multi-instance returns N components.
-- **Honest limit:** weaker than true SAM3 concepts on rare/tiny objects — stage 2 fixes that.
+### P6a — Text lane follow-ups (the parts not yet built)
+- **Split the OWLv2 graph.** The stock export is one fused `model.onnx` taking
+  `input_ids` AND `pixel_values`, so every query re-encodes the image. The two
+  towers are independent and the head is a dot product, so a split export gives:
+  vision once per image, text once per PHRASE (cached across images), head a
+  3600×512 matmul. A repeat phrase on a warm image would cost ~nothing.
+  `js/text-engine.js` already has the cache shape and a `TEXT_MODEL.split` slot;
+  the export itself needs `optimum` on a machine with HuggingFace access.
+- **Zoom-crop re-encode for small text hits.** `text-core.js` ships
+  `needsZoomRefine`/`zoomCropRect`; wiring them into `segmentText` is P8's work
+  applied to detections, and it is the single biggest accuracy lever on DSLR files.
+- **Persist the phrase cache to OPFS** (P9's sibling). Phrase embeddings are a
+  few KB each — hundreds of them cost megabytes and never need recomputing.
+- **Gate:** the real-photo numbers come from `bun bench.mjs`, which already
+  measures per-stage latency, peak RSS against the 2.2 GB ceiling, and the
+  absent-phrase false-positive rate.
 
 ### P7 — Candidate cycling + first-click granularity
 - **Step:** keep all 3 decoder candidates; Tab cycles part → whole → sub-part;

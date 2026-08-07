@@ -12,7 +12,7 @@
  */
 
 import { countMaskComponents, lassoToPrompts } from './sam-core.js'
-import { clientState, segment, subscribe, warmUp } from './sam-client.js'
+import { clientState, segment, segmentText, subscribe, warmUp, warmUpText } from './sam-client.js'
 
 // ?flagship=0 keeps the session on the 14 MB draft lane (tests, data saver).
 const FLAGSHIP_ENABLED = new URLSearchParams(location.search).get('flagship') !== '0'
@@ -31,6 +31,8 @@ const els = {
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipTiming: $('chip-timing'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
     signtoggle: $('signtoggle'),
+    textbar: $('textbar'), textq: $('textq'), textgo: $('textgo'),
+    instances: $('instances'),
     modes: {
         click: $('mode-click'), box: $('mode-box'),
         lasso: $('mode-lasso'), text: $('mode-text'),
@@ -46,6 +48,8 @@ const state = {
     clicks: [],               // [[x, y, label], ...] canonical coords
     box: null,                // [x0, y0, x1, y1] canonical
     lasso: null,              // { poly, box, point, margin } from lassoToPrompts
+    query: '',                // active text phrase ('' when not a text selection)
+    instances: [],            // [{phrase, score, plane, x0, y0, w, h, on}] from the text lane
     mask: null,               // refined ImageData (white-on-black), canonical size
     maskRaw: null,            // decoder output before hygiene/refinement (E toggle)
     showRaw: false,
@@ -70,11 +74,15 @@ const refreshChips = () => {
     els.chipDevice.textContent = `device: ${clientState.device || '—'}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
     const run = clientState.lastRun
-    els.chipTiming.textContent = run
-        ? (run.encoded
+    if (!run) {
+        els.chipTiming.textContent = '— ms'
+    } else if (run.detectMs !== undefined) {
+        els.chipTiming.textContent = `detect ${run.detectMs}ms · ${run.instances}× decode ${run.decodeMs}ms · post ${run.postMs}ms`
+    } else {
+        els.chipTiming.textContent = run.encoded
             ? `encode ${run.encodeMs}ms · decode ${run.decodeMs}ms · post ${run.postMs}ms`
-            : `decode ${run.decodeMs}ms · post ${run.postMs}ms (cached)`)
-        : '— ms'
+            : `decode ${run.decodeMs}ms · post ${run.postMs}ms (cached)`
+    }
 }
 
 subscribe((event) => {
@@ -208,10 +216,18 @@ const setMode = (mode) => {
         btn.classList.toggle('active', name === mode)
     }
     els.signtoggle.style.display = mode === 'click' ? '' : 'none'
+    els.textbar.classList.toggle('visible', mode === 'text')
+    els.overlay.style.cursor = mode === 'text' ? 'default' : 'crosshair'
+    if (mode === 'text') {
+        els.textq.focus()
+        // Start the one-time detector download while the user is still typing.
+        warmUpText().catch((err) => setStatus(`Text model load failed: ${err?.message}`))
+    }
 }
 els.modes.click.addEventListener('click', () => setMode('click'))
 els.modes.box.addEventListener('click', () => setMode('box'))
 els.modes.lasso.addEventListener('click', () => setMode('lasso'))
+els.modes.text.addEventListener('click', () => setMode('text'))
 
 els.signtoggle.addEventListener('click', () => {
     state.sign = state.sign ? 0 : 1
@@ -223,7 +239,7 @@ els.signtoggle.addEventListener('click', () => {
 /* ─── Prompt state ───────────────────────────────────────────────────────── */
 
 const refreshButtons = () => {
-    const any = state.clicks.length > 0 || state.box || state.lasso
+    const any = state.clicks.length > 0 || state.box || state.lasso || state.instances.length > 0
     els.undo.disabled = !any
     els.reset.disabled = !any
     els.cutout.disabled = !state.mask
@@ -233,6 +249,9 @@ function clearPrompts() {
     state.clicks = []
     state.box = null
     state.lasso = null
+    state.query = ''
+    state.instances = []
+    renderInstances()
     state.mask = null
     state.maskRaw = null
     state.maskSummary = null
@@ -403,6 +422,104 @@ async function runNow() {
     }
 }
 
+/* ─── Text search ────────────────────────────────────────────────────────── */
+
+/**
+ * Recomposite the union mask from whichever instances are toggled on. Each
+ * instance is a bbox-cropped plane, so this touches only the pixels the
+ * objects actually cover — a text result with a dozen instances still costs
+ * one full-frame buffer, not a dozen.
+ */
+const compositeInstances = () => {
+    const w = els.view.width
+    const h = els.view.height
+    const on = state.instances.filter((i) => i.on)
+    if (on.length === 0) { state.mask = null; state.maskRaw = null; return }
+    const data = new Uint8ClampedArray(w * h * 4)
+    for (let i = 0; i < w * h; i += 1) data[i * 4 + 3] = 255
+    for (const inst of on) {
+        for (let y = 0; y < inst.h; y += 1) {
+            const src = y * inst.w
+            const dst = (inst.y0 + y) * w + inst.x0
+            for (let x = 0; x < inst.w; x += 1) {
+                if (!inst.plane[src + x]) continue
+                const j = (dst + x) * 4
+                data[j] = 255; data[j + 1] = 255; data[j + 2] = 255
+            }
+        }
+    }
+    state.mask = new ImageData(data, w, h)
+    state.maskRaw = state.mask
+}
+
+function renderInstances() {
+    els.instances.innerHTML = ''
+    els.instances.classList.toggle('visible', state.instances.length > 1)
+    if (state.instances.length <= 1) return
+    state.instances.forEach((inst, idx) => {
+        const chip = document.createElement('span')
+        chip.className = `inst${inst.on ? ' on' : ''}`
+        chip.textContent = `${inst.phrase} ${(inst.score * 100).toFixed(0)}%`
+        chip.title = 'Click to include/exclude this instance'
+        chip.addEventListener('click', () => {
+            state.instances[idx].on = !state.instances[idx].on
+            compositeInstances()
+            renderInstances()
+            renderOverlay()
+            refreshButtons()
+        })
+        els.instances.appendChild(chip)
+    })
+}
+
+async function runTextNow(query) {
+    if (!state.hasImage || !query.trim()) return
+    if (state.running) { state.runQueued = false }
+    const seq = ++state.runSeq
+    state.running = true
+    setStatus(clientState.text?.status === 'ready'
+        ? 'Searching…'
+        : 'Searching… (first run downloads the text model, ~155 MB one-time)')
+    try {
+        const res = await segmentText(els.view, query)
+        if (seq !== state.runSeq) return
+
+        state.query = query
+        state.clicks = []
+        state.box = null
+        state.lasso = null
+        state.instances = res.instances.map((i) => ({ ...i, on: true }))
+
+        if (!res.usable) {
+            state.mask = null
+            state.maskRaw = null
+            state.maskSummary = null
+            // Finding nothing is a real answer, not an error.
+            setStatus(`Nothing matched “${query}” — ${res.reason}`)
+        } else {
+            compositeInstances()
+            state.maskSummary = res.summary
+            state.score = res.instances[0]?.score || 0
+            const n = res.instances.length
+            setStatus(`Found ${n} ${n === 1 ? 'match' : 'matches'} for “${query}” — ${res.lane} · ${(res.summary.coverage * 100).toFixed(1)}% of frame${res.detectCached ? ' · cached' : ''}`)
+        }
+        renderInstances()
+        renderOverlay()
+        refreshButtons()
+    } catch (err) {
+        if (seq !== state.runSeq) return
+        console.error('[seglab] text search failed:', err)
+        setStatus(`Text search failed: ${err?.message}`)
+    } finally {
+        state.running = false
+    }
+}
+
+els.textbar.addEventListener('submit', (e) => {
+    e.preventDefault()
+    runTextNow(els.textq.value)
+})
+
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
 /** Colorize the white-on-black mask; returns {fill, ring} canvases. */
@@ -548,6 +665,39 @@ const waitForRun = async () => {
 
 window.__seglab = {
     loadDemo: () => { showImage(buildDemoScene()) },
+    /** Load an image from a data/blob URL — how bench.mjs feeds in DSLR files. */
+    loadURL: async (url) => {
+        const blob = await (await fetch(url)).blob()
+        const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' })
+        showImage(bmp)
+        const dims = { width: bmp.width, height: bmp.height, canonW: els.view.width, canonH: els.view.height }
+        bmp.close()
+        return dims
+    },
+    /**
+     * Synthetic scene at an arbitrary (DSLR) resolution with analytically
+     * known object masks — the reproducible half of the accuracy benchmark.
+     */
+    loadSynthetic: ({ w = 6000, h = 4000, objects = [] } = {}) => {
+        const c = document.createElement('canvas')
+        c.width = w
+        c.height = h
+        const ctx = c.getContext('2d')
+        const grad = ctx.createLinearGradient(0, 0, 0, h)
+        grad.addColorStop(0, '#8fa4bd')
+        grad.addColorStop(1, '#3b4654')
+        ctx.fillStyle = grad
+        ctx.fillRect(0, 0, w, h)
+        for (const o of objects) {
+            ctx.fillStyle = o.color
+            ctx.beginPath()
+            if (o.kind === 'circle') ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2)
+            else ctx.rect(o.x - o.r, o.y - o.r, o.r * 2, o.r * 2)
+            ctx.fill()
+        }
+        showImage(c)
+        return { width: w, height: h, canonW: els.view.width, canonH: els.view.height }
+    },
     reset: () => clearPrompts(),
     state: () => ({
         ready: clientState.ready,
@@ -558,6 +708,12 @@ window.__seglab = {
         maskSummary: state.maskSummary,
         score: state.score,
         clicks: state.clicks.length,
+        query: state.query,
+        instances: state.instances.map((i) => ({
+            phrase: i.phrase, score: i.score, box: i.box, area: i.area,
+            bbox: [i.x0, i.y0, i.x0 + i.w - 1, i.y0 + i.h - 1],
+        })),
+        text: clientState.text,
     }),
     maskStats: () => {
         if (!state.mask) return null
@@ -568,6 +724,14 @@ window.__seglab = {
         }
         return { components: countMaskComponents(data, width, height), softPixels: soft }
     },
+    /** Drive the text lane headlessly. Resolves once the search has settled. */
+    textSearch: async (query) => {
+        setMode('text')
+        await runTextNow(query)
+        await waitForRun()
+        return window.__seglab.state()
+    },
+    warmText: () => warmUpText(),
     clickAt: async (x, y, negative = false) => {
         state.clicks.push([x, y, negative ? 0 : 1])
         scheduleRun()

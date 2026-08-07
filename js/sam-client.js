@@ -31,6 +31,7 @@ export const clientState = {
     mode: null,     // 'worker' | 'inline' once decided
     lane: null,     // 'slimsam' | 'sam3' — which model served the last result
     ready: false,
+    text: null,     // text-detector state once warmed
     lastRun: null,  // { encodeMs, decodeMs, postMs, encoded, score, ms, lane }
 }
 
@@ -133,9 +134,11 @@ const call = async (op, payload, transfer, timeoutMs, label) => {
     }
     const engine = await getInlineEngine()
     if (op === 'warm') return withTimeout(engine.warm(payload || {}), timeoutMs, label)
-    if (op === 'segment') {
+    if (op === 'warmText') return withTimeout(engine.warmTextLane(), timeoutMs, label)
+    if (op === 'segment' || op === 'segmentText') {
+        const run = op === 'segment' ? engine.segment : engine.segmentText
         try {
-            return await withTimeout(engine.segment(payload), timeoutMs, label)
+            return await withTimeout(run(payload), timeoutMs, label)
         } finally {
             // The worker shell closes transferred bitmaps; inline, that's ours.
             try { payload?.source?.close?.() } catch { /* already closed */ }
@@ -162,6 +165,93 @@ export const warmUp = ({ flagship = true } = {}) => {
         })
     warmPromise.catch(() => { warmPromise = null })
     return warmPromise
+}
+
+/** Download + compile the open-vocabulary text detector (idempotent). */
+let textWarmPromise = null
+export const warmUpText = () => {
+    textWarmPromise ??= call('warmText', null, null, LOAD_TIMEOUT_MS, 'text model load')
+        .then((s) => { clientState.text = s; emit({ type: 'state' }); return s })
+    textWarmPromise.catch(() => { textWarmPromise = null })
+    return textWarmPromise
+}
+
+/**
+ * Select every object matching a free-form phrase. Returns MASKS — a union
+ * ImageData for the overlay plus one compact plane per instance, never boxes.
+ *
+ * An empty `instances` with a `reason` is a legitimate answer: the phrase
+ * describes something that is not in this photo.
+ *
+ * @param {HTMLCanvasElement} canvas  the canonical ≤1024 frame
+ * @param {string} query  free-form, e.g. "all the zebras" or "the red bicycle"
+ */
+export const segmentText = async (canvas, query, { maxInstances = 24 } = {}) => {
+    const startedAt = Date.now()
+    if (!canvas?.width || !canvas?.height) throw new Error('Selection source has no usable dimensions')
+    if (!query || !query.trim()) throw new Error('Type something to search for')
+
+    const imageKey = contentKey(canvas)
+    const buildPayload = async () => {
+        const source = await createImageBitmap(canvas)
+        return { payload: { imageKey, source, query, maxInstances }, transfer: [source] }
+    }
+
+    let result
+    try {
+        const { payload, transfer } = await buildPayload()
+        result = await call('segmentText', payload, transfer, INFER_TIMEOUT_MS, 'Text search')
+    } catch (err) {
+        if (!workerBroken) throw err
+        console.warn('[seglab] retrying text search inline after worker failure')
+        const { payload, transfer } = await buildPayload()
+        result = await call('segmentText', payload, transfer, INFER_TIMEOUT_MS, 'Text search (inline retry)')
+    }
+
+    clientState.device = result.device || clientState.device
+    clientState.lane = result.lane || clientState.lane
+    clientState.ready = true
+    clientState.lastRun = {
+        encodeMs: result.encodeMs,
+        detectMs: result.detectMs,
+        decodeMs: result.decodeMs,
+        postMs: result.postMs,
+        encoded: result.encoded,
+        lane: result.lane,
+        instances: result.instances.length,
+        ms: Date.now() - startedAt,
+    }
+
+    const imageData = result.rgba
+        ? new ImageData(
+            result.rgba instanceof Uint8ClampedArray ? result.rgba : new Uint8ClampedArray(result.rgba),
+            result.width,
+            result.height,
+        )
+        : null
+    const summary = imageData ? summarizeMaskRGBA(imageData.data, result.width, result.height) : null
+
+    emit({ type: 'state' })
+    return {
+        imageData,
+        summary,
+        width: result.width,
+        height: result.height,
+        query: result.query,
+        concepts: result.concepts || [],
+        instances: result.instances,
+        usable: result.instances.length > 0,
+        reason: result.reason,
+        device: result.device,
+        lane: result.lane,
+        encoded: result.encoded,
+        detectCached: result.detectCached,
+        encodeMs: result.encodeMs,
+        detectMs: result.detectMs,
+        decodeMs: result.decodeMs,
+        postMs: result.postMs,
+        ms: Date.now() - startedAt,
+    }
 }
 
 /**

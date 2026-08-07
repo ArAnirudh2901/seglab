@@ -77,6 +77,36 @@
     .signtoggle.pos { color: var(--pos); border-color: var(--pos); }
     .signtoggle.neg { color: var(--neg); border-color: var(--neg); }
 
+    #textbar { display: none; gap: 6px; align-items: center; flex: 1; min-width: 220px; max-width: 460px; }
+    #textbar.visible { display: flex; }
+    #textq {
+        flex: 1;
+        min-width: 0;
+        appearance: none;
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--text);
+        border-radius: var(--radius);
+        padding: 7px 12px;
+        font: inherit;
+    }
+    #textq:focus { outline: none; border-color: var(--accent); }
+    #textq::placeholder { color: var(--dim); }
+    /* Per-instance chips for a multi-object text result. */
+    #instances { display: none; gap: 6px; flex-wrap: wrap; align-items: center; }
+    #instances.visible { display: flex; }
+    .inst {
+        font-size: 11.5px;
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--dim);
+        border-radius: 999px;
+        padding: 2px 9px;
+        cursor: pointer;
+        user-select: none;
+    }
+    .inst.on { color: var(--accent); border-color: rgba(53, 224, 194, 0.45); background: var(--accent-dim); }
+
     main {
         flex: 1;
         display: flex;
@@ -182,8 +212,12 @@
         <button id="mode-click" class="active" title="Click to select — left/tap = include, right/Alt = exclude">Click</button>
         <button id="mode-box" title="Drag a box around the object">Box</button>
         <button id="mode-lasso" title="Draw a rough lasso — it snaps to the object">Lasso</button>
-        <button id="mode-text" disabled title="Describe the object in text — next step">Text</button>
+        <button id="mode-text" title="Describe what to select — e.g. &quot;all the zebras&quot;">Text</button>
     </div>
+    <form id="textbar" autocomplete="off">
+        <input id="textq" type="search" placeholder="Describe it — “all the zebras”, “the red bicycle”" aria-label="Describe what to select">
+        <button id="textgo" type="submit" class="small">Find</button>
+    </form>
     <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
     <div class="spacer"></div>
     <button id="undo" class="small" disabled title="Undo last prompt (Z)">Undo</button>
@@ -211,6 +245,7 @@
 
 <footer>
     <span id="status">Idle — import a photo to begin</span>
+    <span id="instances"></span>
     <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt-click = exclude</span>
     <span id="chip-mode" class="chip">engine: —</span>
     <span id="chip-device" class="chip">device: —</span>

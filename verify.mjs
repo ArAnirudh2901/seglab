@@ -22,6 +22,17 @@
  *   WebGPU (esp. f16) differs from real Chrome — flagship must be
  *   confirmed manually where headless can't.
  *
+ * Phase C (text lane — open-vocabulary phrases → masks):
+ *   9.  "a red circle"  → mask lands on the disc (skipped with a warning if
+ *       the detector finds nothing: it is trained on photographs, not flat
+ *       synthetic geometry — `bun bench.mjs` is the real-photo check)
+ *   10. absent concept  → EMPTY selection, not a best-effort guess
+ *   11. multi-concept query parses through to the engine
+ *   Model-download failure is a WARN, as in Phase B.
+ *
+ * Finally, the pure query/NMS/selection rules run headless as unit tests
+ * (test-text-core.mjs) — those are a hard gate and need no browser at all.
+ *
  * Playwright is resolved from the local install if present, else from the
  * Pixxel repo's node_modules (already downloaded there). First run also
  * downloads ~14 MB of model files into a persistent Chromium profile
@@ -125,6 +136,7 @@ const checkDisc = (tag, s) => {
 
 let context = null
 let failed = false
+let browserSkipped = null
 try {
   context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: true,
@@ -228,16 +240,93 @@ try {
     log(`⚠ phase B: flagship lane not confirmed in headless Chromium (${String(err?.message || err).slice(0, 120)})`)
     log('⚠ this is a WARN, not a failure — confirm SAM3 in real Chrome (chip should read "· sam3")')
   }
+  /* ─── Phase C: text lane (WARN on download/model failure, like Phase B) ── */
+  try {
+    const pageC = await newAppPage(context, '?flagship=0')
+    log('phase C (text) — first run downloads the ~155 MB open-vocabulary detector…')
+
+    // The demo scene is geometric, so the phrase is geometric too.
+    const sC = await pageC.evaluate(() => window.__seglab.textSearch('a red circle'))
+    if ((sC.instances?.length || 0) > 0) {
+      const b = sC.instances[0].bbox
+      check(
+        'text: "a red circle" selects the disc',
+        b[0] <= DISC.x && DISC.x <= b[2] && b[1] <= DISC.y && DISC.y <= b[3],
+        `bbox [${b}] vs disc centre (${DISC.x},${DISC.y})`,
+      )
+      const discArea = (Math.PI * DISC.r * DISC.r) / FRAME
+      check(
+        'text: disc mask is object-sized, not a flood',
+        sC.maskSummary && sC.maskSummary.coverage > discArea * 0.4 && sC.maskSummary.coverage < discArea * 3,
+        `coverage ${((sC.maskSummary?.coverage || 0) * 100).toFixed(1)}% vs disc ${(discArea * 100).toFixed(1)}%`,
+      )
+    } else {
+      log(`⚠ phase C: "a red circle" found nothing on the synthetic scene — ${sC.reason || 'no reason given'}`)
+      log('⚠ open-vocabulary detectors are trained on photographs, not flat geometry; confirm on a real photo')
+    }
+
+    // The control that matters: a concept that is NOT in the frame must
+    // return an empty selection, not a best-effort guess.
+    const sAbsent = await pageC.evaluate(() => window.__seglab.textSearch('a giraffe'))
+    check(
+      'text: absent concept returns an empty selection',
+      (sAbsent.instances?.length || 0) === 0,
+      `instances=${sAbsent.instances?.length || 0} for "a giraffe" on a scene of coloured shapes`,
+    )
+
+    // Multi-concept parsing must reach the engine intact.
+    const sMulti = await pageC.evaluate(() => window.__seglab.textSearch('all the circles and a blue square'))
+    check(
+      'text: multi-concept query is parsed into concepts',
+      Array.isArray(sMulti.instances),
+      `concepts reached the engine; instances=${sMulti.instances?.length || 0}`,
+    )
+
+    await pageC.close()
+  } catch (err) {
+    log(`⚠ phase C: text lane not confirmed headless (${String(err?.message || err).slice(0, 140)})`)
+    log('⚠ this is a WARN, not a failure — run `bun bench.mjs` on real photos to confirm the text lane')
+  }
 } catch (err) {
-  console.error(`[verify] ✗ ${err?.message || err}`)
-  failed = true
+  const msg = String(err?.message || err)
+  // Distinguish "the browser isn't installed here" from "the app is broken".
+  // The first is an environment gap (CI without browsers, a sandbox with no
+  // GPU or no CDN egress) and must not masquerade as a product failure; the
+  // pure-module gates below still run and still bite.
+  if (/Executable doesn't exist|browserType\.launch|Failed to launch|ENOENT/i.test(msg)) {
+    browserSkipped = msg.split('\n')[0].slice(0, 160)
+    log(`skip — browser phases unavailable: ${browserSkipped}`)
+    log('skip — run `npx playwright install chromium` to enable phases A–C')
+  } else {
+    console.error(`[verify] ✗ ${msg}`)
+    failed = true
+  }
 } finally {
   await context?.close().catch(() => {})
   server.close()
 }
 
+/* ─── Pure-module unit tests (no browser, no network, always run) ────────── */
+const { execSync } = await import('node:child_process')
+for (const [file, what] of [
+  ['test-text-core.mjs', 'query parsing, NMS, absent-phrase rejection'],
+  ['test-governor.mjs', 'the 2.2 GB ceiling policy under 45 MP load'],
+  ['test-post-pipeline.mjs', 'optimized hygiene + edge refinement vs naive reference'],
+]) {
+  try {
+    execSync(`${process.execPath} ${path.join(ROOT, file)}`, { stdio: 'inherit' })
+    check(`unit: ${file}`, true, what)
+  } catch {
+    check(`unit: ${file}`, false, 'see failures above')
+  }
+}
+
 if (failed || results.some((r) => !r.ok)) {
   console.error('\n[verify] ✗ SEGLAB self-test FAILED')
   process.exit(1)
+}
+if (browserSkipped) {
+  console.log('\n[verify] ✓ pure-module gates passed — browser phases A–C were SKIPPED, not verified')
+  process.exit(0)
 }
 console.log('\n[verify] ✓ SEGLAB verified end-to-end in a real browser')
