@@ -210,21 +210,52 @@ const labelNearSeed = (labels, w, h, x, y, radius = 8) => {
  */
 export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     const size = w * h
-    const bin = new Uint8Array(size)
+    // One pass over the frame: binarize, total area, and extent.
     let fgArea = 0
-    for (let i = 0; i < size; i += 1) {
-        if (rgba[i * 4] >= 128) { bin[i] = 1; fgArea += 1 }
+    let bx0 = w
+    let by0 = h
+    let bx1 = -1
+    let by1 = -1
+    for (let y = 0; y < h; y += 1) {
+        const row = y * w
+        for (let x = 0; x < w; x += 1) {
+            if (rgba[(row + x) * 4] < 128) continue
+            fgArea += 1
+            if (x < bx0) bx0 = x
+            if (x > bx1) bx1 = x
+            if (y < by0) by0 = y
+            if (y > by1) by1 = y
+        }
     }
     if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0, bbox: null }
 
-    const { labels, areas } = labelComponents(bin, w, h)
-    // Label→keep as a flat lookup table, not a Set: membership is tested once
+    // Everything below runs on the extent plus a one-pixel ring. No component
+    // can exist outside the extent, and the ring is background that is
+    // connected to the frame edge in the full image — so "touches the crop
+    // border" and "touches the frame border" pick out exactly the same
+    // background components, and holes stay holes.
+    const x0 = bx0 > 0 ? bx0 - 1 : 0
+    const y0 = by0 > 0 ? by0 - 1 : 0
+    const x1 = bx1 < w - 1 ? bx1 + 1 : w - 1
+    const y1 = by1 < h - 1 ? by1 + 1 : h - 1
+    const cw = x1 - x0 + 1
+    const ch = y1 - y0 + 1
+    const csize = cw * ch
+    const bin = new Uint8Array(csize)
+    for (let cy = 0; cy < ch; cy += 1) {
+        const s = (y0 + cy) * w + x0
+        const d = cy * cw
+        for (let cx = 0; cx < cw; cx += 1) bin[d + cx] = rgba[(s + cx) * 4] >= 128 ? 1 : 0
+    }
+
+    const { labels, areas } = labelComponents(bin, cw, ch)
+    // Label->keep as a flat lookup table, not a Set: membership is tested once
     // per pixel below, and a Set.has in a million-iteration loop is the
     // single most expensive thing in the hygiene pass.
     const keepLut = new Uint8Array(areas.length + 1)
     let keptCount = 0
     const markKeep = (l) => { if (l && !keepLut[l]) { keepLut[l] = 1; keptCount += 1 } }
-    for (const [sx, sy] of seeds) markKeep(labelNearSeed(labels, w, h, sx, sy))
+    for (const [sx, sy] of seeds) markKeep(labelNearSeed(labels, cw, ch, sx - x0, sy - y0))
     if (keptCount === 0) {
         // No seed hit anything (box/lasso edge cases) — keep the largest.
         let best = 1
@@ -241,11 +272,15 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     }
 
     let dropped = 0
-    for (let i = 0; i < size; i += 1) {
-        if (bin[i] && !keepLut[labels[i]]) {
+    for (let cy = 0; cy < ch; cy += 1) {
+        const s = (y0 + cy) * w + x0
+        const d = cy * cw
+        for (let cx = 0; cx < cw; cx += 1) {
+            const i = d + cx
+            if (!bin[i] || keepLut[labels[i]]) continue
             bin[i] = 0
             dropped += 1
-            const j = i * 4
+            const j = (s + cx) * 4
             rgba[j] = 0
             rgba[j + 1] = 0
             rgba[j + 2] = 0
@@ -253,18 +288,18 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     }
 
     // Hole fill: label the background; components that never touch the
-    // image border are holes — fill the small ones.
-    const inv = new Uint8Array(size)
-    for (let i = 0; i < size; i += 1) inv[i] = bin[i] ? 0 : 1
-    const bg = labelComponents(inv, w, h)
+    // crop border are holes — fill the small ones.
+    const inv = new Uint8Array(csize)
+    for (let i = 0; i < csize; i += 1) inv[i] = bin[i] ? 0 : 1
+    const bg = labelComponents(inv, cw, ch)
     const touchesBorder = new Uint8Array(bg.areas.length + 1)
-    for (let x = 0; x < w; x += 1) {
-        touchesBorder[bg.labels[x]] = 1
-        touchesBorder[bg.labels[(h - 1) * w + x]] = 1
+    for (let cx = 0; cx < cw; cx += 1) {
+        touchesBorder[bg.labels[cx]] = 1
+        touchesBorder[bg.labels[(ch - 1) * cw + cx]] = 1
     }
-    for (let y = 0; y < h; y += 1) {
-        touchesBorder[bg.labels[y * w]] = 1
-        touchesBorder[bg.labels[y * w + w - 1]] = 1
+    for (let cy = 0; cy < ch; cy += 1) {
+        touchesBorder[bg.labels[cy * cw]] = 1
+        touchesBorder[bg.labels[cy * cw + cw - 1]] = 1
     }
     const maxHole = Math.max(64, (fgArea - dropped) * 0.01)
     const fillLut = new Uint8Array(bg.areas.length + 1)
@@ -274,37 +309,41 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     }
     let holesFilled = 0
     if (fillAny) {
-        for (let i = 0; i < size; i += 1) {
-            if (fillLut[bg.labels[i]]) {
+        for (let cy = 0; cy < ch; cy += 1) {
+            const s = (y0 + cy) * w + x0
+            const d = cy * cw
+            for (let cx = 0; cx < cw; cx += 1) {
+                if (!fillLut[bg.labels[d + cx]]) continue
+                bin[d + cx] = 1
                 holesFilled += 1
-                const j = i * 4
+                const j = (s + cx) * 4
                 rgba[j] = 255
                 rgba[j + 1] = 255
                 rgba[j + 2] = 255
             }
         }
     }
-    // Final foreground extent. Hole filling only writes interior pixels, so
-    // scanning `bin` (pre-fill) gives the same box as scanning the result.
-    let minX = w
-    let minY = h
+
+    // Final foreground extent, in frame coordinates.
+    let minX = cw
+    let minY = ch
     let maxX = -1
     let maxY = -1
-    for (let y = 0; y < h; y += 1) {
-        const row = y * w
-        for (let x = 0; x < w; x += 1) {
-            if (!bin[row + x]) continue
-            if (x < minX) minX = x
-            if (x > maxX) maxX = x
-            if (y < minY) minY = y
-            if (y > maxY) maxY = y
+    for (let cy = 0; cy < ch; cy += 1) {
+        const d = cy * cw
+        for (let cx = 0; cx < cw; cx += 1) {
+            if (!bin[d + cx]) continue
+            if (cx < minX) minX = cx
+            if (cx > maxX) maxX = cx
+            if (cy < minY) minY = cy
+            if (cy > maxY) maxY = cy
         }
     }
     return {
         kept: keptCount,
         dropped,
         holesFilled,
-        bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null,
+        bbox: maxX >= 0 ? [x0 + minX, y0 + minY, x0 + maxX, y0 + maxY] : null,
     }
 }
 

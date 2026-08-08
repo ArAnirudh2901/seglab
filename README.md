@@ -24,8 +24,20 @@ First selection downloads ~14 MB of model files once (browser-cached after).
 ## Verify (headless)
 
 ```bash
-bun verify.mjs   # drives the real app in headless Chromium, asserts on known answers
+bun verify.mjs           # real models over the network — the accuracy gate
+node verify-offline.mjs  # same app, ONNX layer stubbed — runs with no egress
 ```
+
+`verify.mjs` needs to reach the CDN and Hugging Face. Where egress is blocked
+it fails on the module import and tells you nothing about the app, so
+`verify-offline.mjs` drives the identical stack (app → worker → engine → GPU
+post) against a flood-fill stand-in decoder and asserts on the demo scene's
+known answers. It covers worker transport, the embedding cache, real pointer
+interaction, the post pipeline on a real WebGPU device, the overlay and the
+export path — everything except the accuracy of the SAM weights themselves.
+
+Both honour `SEGLAB_PLAYWRIGHT`, `SEGLAB_CHROMIUM`, `SEGLAB_SWIFTSHADER` and
+`SEGLAB_NO_SANDBOX` for constrained CI images.
 
 ## Architecture
 
@@ -66,6 +78,10 @@ CPU path at the canonical 1024² frame, by subject size:
 | medium (30%) | 13% | 399 → 29 ms | 41 → 7.5 ms |
 | small (10%) | 2.5% | 241 → 8.6 ms | 44 → 6.0 ms |
 | minute (r=9px) | 0.6% | 220 → 4.2 ms | 41 → 5.6 ms |
+
+Output is byte-identical before and after, verified across 31 scenes covering
+border-touching, multi-component, nested-hole, odd-dimension and full-frame
+masks.
 
 Output is byte-identical before and after, verified across 31 scenes covering
 border-touching, multi-component, nested-hole, odd-dimension and full-frame
