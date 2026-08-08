@@ -79,12 +79,8 @@ CPU path at the canonical 1024² frame, by subject size:
 | small (10%) | 2.5% | 241 → 8.6 ms | 44 → 6.0 ms |
 | minute (r=9px) | 0.6% | 220 → 4.2 ms | 41 → 5.6 ms |
 
-Output is byte-identical before and after, verified across 31 scenes covering
+Output is byte-identical before and after, verified across 45 scenes covering
 border-touching, multi-component, nested-hole, odd-dimension and full-frame
-masks.
-
-Output is byte-identical before and after, verified across 31 scenes covering
-border-touching, multi-component, nested-hole, odd-dimension and full-frame
-masks.
+masks, plus a 24-assertion end-to-end run of the app itself.
 
 Next lanes (same `segment()` contract): SAM3/EfficientSAM3 flagship tier, text prompts.
