@@ -27,8 +27,16 @@ app.js (UI: modes, prompts, overlay, replay)
               ├─ flagship: SAM3-tracker q4f16 (297+5.4 MB, SAM License) — WebGPU, background download, hot-swap + prompt replay
               └─ post pipeline (model-agnostic, every decode):
                    lasso clamp → seeded component cleanup + hole fill (sam-core.js)
-                   → guided-filter edge-band refinement (edge-refine.js)
+                   → guided-filter edge-band refinement, two backends:
+                        ├─ gpu-post.js    WGSL compute shaders on WebGPU — default
+                        └─ edge-refine.js O(N) CPU reference + automatic fallback
 ```
+
+**Why WGSL, not C/C++:** a web page cannot run C/C++ on a GPU — Emscripten
+targets WASM, which is still the CPU. The only code that executes on the GPU
+from a browser is a shader, so the kernels are WGSL (C-family, one thread per
+pixel). The CPU implementation stays as the reference and the fallback for
+devices with no WebGPU, and the two are gated on byte-identical output.
 
 **Why two lanes:** encoders are heavy, decoders are tiny. The draft lane makes the
 tool instantly usable; the flagship encodes once per image (~5.6 s, cached) and
@@ -52,6 +60,7 @@ NO encoder size fixes, and they upgrade every current and future lane.
 | 3 | Mask hygiene: keep clicked components + ≥1%-of-largest, fill pinholes | components = 1 on disc (crumbs gone) |
 | 4 | Edge-band refinement: gray guided filter, ±6 px band, soft output, E toggle | 3131 soft boundary px; post ~110 ms |
 | 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 confirmed headless; encode 5581 ms / decode 630 ms |
+| 6 | Post pipeline on the GPU (WGSL compute) + O(N) CPU fallback + bug sweep | GPU vs CPU byte-identical (maxPixelDiff 0 @1024²); CPU path 427→223 ms |
 
 ---
 

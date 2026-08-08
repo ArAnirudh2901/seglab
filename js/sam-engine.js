@@ -23,8 +23,11 @@
  *
  * Every decoded mask then goes through the shared post pipeline:
  *   lasso clamp → seeded component cleanup + hole fill (sam-core) →
- *   guided-filter edge-band refinement against the photo (edge-refine).
- * The pipeline is model-agnostic: it upgrades both lanes.
+ *   guided-filter edge-band refinement against the photo.
+ * The refinement runs as WebGPU compute shaders when the device has a GPU
+ * (gpu-post.js) and falls back to the O(N) CPU implementation
+ * (edge-refine.js) otherwise. The pipeline is model-agnostic: it upgrades
+ * both lanes, on both backends.
  */
 
 import {
@@ -33,8 +36,10 @@ import {
     cleanupMaskRGBA,
     maskChannelToRGBA,
     pickBestMask,
+    summarizeMaskRGBA,
 } from './sam-core.js'
 import { refineMaskEdges } from './edge-refine.js'
+import { gpuRefineMaskEdges } from './gpu-post.js'
 
 // Pinned CDN build of transformers.js (ESM single file, CORS-enabled) —
 // version-locked so a CDN-side major bump can never break the app.
@@ -78,12 +83,13 @@ const state = {
     forcedWasm: false,       // sticky downgrade after a WebGPU runtime failure
     ready: false,            // draft lane serving
     flagship: 'idle',        // 'idle' | 'loading' | 'ready' | 'failed' | 'unavailable'
+    gpuPost: true,           // WebGPU compute path for the post pipeline
 }
 
 let transformersPromise = null
 const bundles = { draft: null, flagship: null }
 
-/** `${lane}:${imageKey}` → { embeddings, original_sizes, reshaped_input_sizes, gray, w, h } */
+/** `${lane}:${imageKey}` → { embeddings, original_sizes, reshaped_input_sizes, gray, guide, w, h } */
 const embedCache = new Map()
 
 // Event sink — the worker shell points this at postMessage; the inline
@@ -100,6 +106,12 @@ const emitEvent = (event) => {
     }
     try { eventSink(event) } catch { /* sink gone */ }
 }
+
+// A lane pulls several files (model, tokenizer, config). Track which are
+// still in flight so the UI can tell "this file finished" from "the whole
+// download finished" — otherwise the progress bar zeroes out on the first
+// small file and looks stalled for the remaining 290 MB.
+const inflightFiles = new Set()
 
 const activeLaneKey = () => (state.flagship === 'ready' ? 'flagship' : 'draft')
 
@@ -142,17 +154,23 @@ const loadBundle = (laneKey) => {
         if (laneKey === 'flagship' && device !== 'webgpu') {
             throw new Error('flagship lane requires WebGPU')
         }
-        const progress_callback = (info) => emitEvent({
-            type: 'progress',
-            detail: {
-                lane: laneKey,
-                status: info?.status,
-                file: info?.file,
-                progress: info?.progress,
-                loaded: info?.loaded,
-                total: info?.total,
-            },
-        })
+        const progress_callback = (info) => {
+            const key = `${laneKey}:${info?.file}`
+            if (info?.status === 'done') inflightFiles.delete(key)
+            else if (info?.file) inflightFiles.add(key)
+            emitEvent({
+                type: 'progress',
+                detail: {
+                    lane: laneKey,
+                    status: info?.status,
+                    file: info?.file,
+                    progress: info?.progress,
+                    loaded: info?.loaded,
+                    total: info?.total,
+                    allDone: inflightFiles.size === 0,
+                },
+            })
+        }
         const [model, processor] = await withTimeout(
             Promise.all([
                 Cls.from_pretrained(lane.model, { device, progress_callback, ...lane.options })
@@ -161,6 +179,13 @@ const loadBundle = (laneKey) => {
                     // would be an unusable lane, not a fallback.
                     .catch((err) => {
                         if (laneKey === 'flagship') throw err
+                        // The retry runs on transformers.js's default device,
+                        // i.e. WASM. Record that, or every later decision
+                        // (device chip, WebGPU-failure fallback, flagship
+                        // eligibility) is made against a device we are not on.
+                        console.warn('[seglab] draft lane failed on', device, '— retrying on the default device:', err?.message)
+                        state.forcedWasm = true
+                        state.device = 'wasm'
                         return Cls.from_pretrained(lane.model, { progress_callback, ...lane.options })
                     }),
                 transformers.AutoProcessor.from_pretrained(lane.model, { progress_callback }),
@@ -180,7 +205,7 @@ const loadBundle = (laneKey) => {
 
 /** Kick the background flagship download once the draft lane is serving. */
 const maybeStartFlagship = () => {
-    if (state.flagship !== 'idle') return
+    if (state.flagship === 'loading' || state.flagship === 'ready' || state.flagship === 'failed') return
     state.flagship = 'loading';
     (async () => {
         try {
@@ -203,12 +228,16 @@ const maybeStartFlagship = () => {
 /**
  * Warm the draft lane (download + compile), then start the flagship
  * download in the background (pass flagship:false to skip — used by tests
- * and as a data-saver escape hatch).
+ * and as a data-saver escape hatch). `gpu:false` forces the post pipeline
+ * onto the CPU implementation (A/B testing, driver bug escape hatch).
  */
-export const warm = async ({ flagship = true } = {}) => {
+export const warm = async ({ flagship = true, gpu = true } = {}) => {
+    state.gpuPost = gpu !== false
     await loadBundle('draft')
     state.ready = true
     if (flagship) maybeStartFlagship()
+    // 'unavailable' is not terminal: a later warm({flagship:true}) — a user
+    // dropping ?flagship=0 — can still start the background upgrade.
     else if (state.flagship === 'idle') state.flagship = 'unavailable'
     return getEngineState()
 }
@@ -245,8 +274,9 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
     // One draw, one readback: pixels feed BOTH the model input and the
     // grayscale guide used by edge refinement.
     const canvas = makeCanvas(w, h)
-    canvas.getContext('2d').drawImage(source, 0, 0)
-    const pixels = canvas.getContext('2d').getImageData(0, 0, w, h)
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    ctx.drawImage(source, 0, 0)
+    const pixels = ctx.getImageData(0, 0, w, h)
     const image = new RawImage(pixels.data, w, h, 4)
     const gray = new Float32Array(w * h)
     for (let i = 0; i < gray.length; i += 1) {
@@ -265,6 +295,7 @@ const ensureEmbeddings = async (bundle, imageKey, source) => {
         original_sizes: inputs.original_sizes,
         reshaped_input_sizes: inputs.reshaped_input_sizes,
         gray,
+        guide: {}, // CPU edge-refine's per-photo mean(I)/mean(I²) cache
         w,
         h,
     }
@@ -310,6 +341,17 @@ const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
             rgba[i + 2] = 0
         }
     }
+}
+
+/** Guided-filter edge refinement: GPU compute shaders when we can, the O(N)
+ *  CPU implementation when we can't. gpu-post demotes itself permanently on
+ *  any failure, so this never thrashes between backends. */
+const refinePost = async (rgba, w, h, entry, imageKey) => {
+    if (state.gpuPost) {
+        const gpuResult = await gpuRefineMaskEdges(rgba, w, h, entry.gray, { guideKey: imageKey })
+        if (gpuResult) return gpuResult
+    }
+    return refineMaskEdges(rgba, w, h, entry.gray, { guide: entry.guide })
 }
 
 const segmentOnce = async (req) => {
@@ -372,8 +414,12 @@ const segmentOnce = async (req) => {
     }
     const seeds = effectiveClicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
     const hygiene = cleanupMaskRGBA(rgba, mw, mh, seeds)
-    const refined = refineMaskEdges(rgba, mw, mh, entry.gray)
+    const refined = await refinePost(rgba, mw, mh, entry, req.imageKey)
+    // Summarise here, not on the main thread: it is a full-frame pass and the
+    // UI thread is the one resource a selection must never spend.
+    const summary = summarizeMaskRGBA(rgba, mw, mh)
 
+    state.ready = true
     return {
         rgba,
         rawRgba,
@@ -386,7 +432,9 @@ const segmentOnce = async (req) => {
         encodeMs: tEncoded - t0,
         decodeMs: tDecoded - tEncoded,
         postMs: Date.now() - tDecoded,
+        postBackend: refined.backend,
         hygiene,
+        summary,
         bandPixels: refined.bandPixels,
     }
 }

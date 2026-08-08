@@ -14,8 +14,11 @@
 import { countMaskComponents, lassoToPrompts } from './sam-core.js'
 import { clientState, segment, subscribe, warmUp } from './sam-client.js'
 
+const QUERY = new URLSearchParams(location.search)
 // ?flagship=0 keeps the session on the 14 MB draft lane (tests, data saver).
-const FLAGSHIP_ENABLED = new URLSearchParams(location.search).get('flagship') !== '0'
+const FLAGSHIP_ENABLED = QUERY.get('flagship') !== '0'
+// ?gpu=0 forces the post pipeline onto the CPU implementation (A/B, driver bugs).
+const GPU_POST_ENABLED = QUERY.get('gpu') !== '0'
 
 const CANON_MAX = 1024
 const ACCENT = '#35e0c2'
@@ -70,10 +73,11 @@ const refreshChips = () => {
     els.chipDevice.textContent = `device: ${clientState.device || '—'}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
     const run = clientState.lastRun
+    const post = run ? `post ${run.postMs}ms${run.postBackend ? ` ${run.postBackend}` : ''}` : ''
     els.chipTiming.textContent = run
         ? (run.encoded
-            ? `encode ${run.encodeMs}ms · decode ${run.decodeMs}ms · post ${run.postMs}ms`
-            : `decode ${run.decodeMs}ms · post ${run.postMs}ms (cached)`)
+            ? `encode ${run.encodeMs}ms · decode ${run.decodeMs}ms · ${post}`
+            : `decode ${run.decodeMs}ms · ${post} · cached`)
         : '— ms'
 }
 
@@ -90,7 +94,9 @@ subscribe((event) => {
             } else {
                 setStatus(`Downloading model — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~14 MB)`)
             }
-        } else if (d.status === 'done') {
+        } else if (d.status === 'done' && d.allDone !== false) {
+            // Only when every file of the lane has landed — a lane pulls
+            // several, and zeroing on the first one reads as a stall.
             els.loadbar.style.width = '0%'
         }
         return
@@ -126,6 +132,7 @@ const showImage = (bitmapOrCanvas) => {
     viewCtx.drawImage(bitmapOrCanvas, 0, 0, els.view.width, els.view.height)
 
     state.hasImage = true
+    state.showRaw = false // a new photo must not inherit the E-toggle state
     clearPrompts()
     els.dropzone.style.display = 'none'
     els.stage.classList.add('visible')
@@ -133,7 +140,8 @@ const showImage = (bitmapOrCanvas) => {
         ? 'Ready — click any object'
         : 'Preparing the model in the background — you can aim already')
     // Start the one-time model download NOW, while the user is aiming.
-    warmUp({ flagship: FLAGSHIP_ENABLED }).catch((err) => setStatus(`Model load failed: ${err?.message}`))
+    warmUp({ flagship: FLAGSHIP_ENABLED, gpu: GPU_POST_ENABLED })
+        .catch((err) => setStatus(`Model load failed: ${err?.message}`))
 }
 
 const loadFile = async (file) => {
@@ -178,7 +186,12 @@ const buildDemoScene = () => {
 }
 
 els.pick.addEventListener('click', () => els.file.click())
-els.file.addEventListener('change', () => loadFile(els.file.files?.[0]))
+els.file.addEventListener('change', () => {
+    const file = els.file.files?.[0]
+    // Clear the input, or picking the SAME file twice fires no change event.
+    els.file.value = ''
+    loadFile(file)
+})
 els.demo.addEventListener('click', () => showImage(buildDemoScene()))
 els.newimg.addEventListener('click', () => {
     state.hasImage = false
@@ -189,7 +202,11 @@ els.newimg.addEventListener('click', () => {
 })
 
 window.addEventListener('dragover', (e) => { e.preventDefault(); els.dropzone.classList.add('drag') })
-window.addEventListener('dragleave', () => els.dropzone.classList.remove('drag'))
+// relatedTarget is null only when the pointer actually leaves the window;
+// without that check every child element crossed re-triggers the highlight.
+window.addEventListener('dragleave', (e) => {
+    if (!e.relatedTarget) els.dropzone.classList.remove('drag')
+})
 window.addEventListener('drop', (e) => {
     e.preventDefault()
     els.dropzone.classList.remove('drag')
@@ -239,6 +256,7 @@ function clearPrompts() {
     state.score = 0
     state.drag = null
     state.runSeq += 1 // orphan any in-flight result
+    state.runQueued = false // ...and the follow-up it would otherwise trigger
     renderOverlay()
     refreshButtons()
 }
@@ -263,6 +281,12 @@ const undoPrompt = () => {
 els.undo.addEventListener('click', undoPrompt)
 els.reset.addEventListener('click', () => { clearPrompts(); setStatus('Cleared') })
 window.addEventListener('keydown', (e) => {
+    // Never shadow a browser shortcut (⌘R / ⌘Z / Alt-…) and never steal a
+    // keystroke aimed at a field — the text prompt lane lands here next.
+    if (e.ctrlKey || e.metaKey || e.altKey) return
+    const t = e.target
+    if (t instanceof HTMLElement && (t.isContentEditable || /^(input|textarea|select)$/i.test(t.tagName))) return
+    if (!state.hasImage) return
     if (e.key === 'z' || e.key === 'Z') undoPrompt()
     if (e.key === 'r' || e.key === 'R') { clearPrompts(); setStatus('Cleared') }
     if (e.key === 'e' || e.key === 'E') {
@@ -287,7 +311,8 @@ els.overlay.addEventListener('contextmenu', (e) => e.preventDefault())
 els.overlay.addEventListener('pointerdown', (e) => {
     if (!state.hasImage) return
     e.preventDefault()
-    els.overlay.setPointerCapture(e.pointerId)
+    // Capture can throw if the pointer was already released (fast taps).
+    try { els.overlay.setPointerCapture(e.pointerId) } catch { /* not capturable */ }
     const [x, y] = toCanvas(e)
     if (state.mode === 'click') {
         state.drag = { kind: 'tap', start: [x, y], moved: false, negative: e.button === 2 || e.altKey }
@@ -350,6 +375,17 @@ els.overlay.addEventListener('pointerup', (e) => {
     refreshButtons()
 })
 
+// A cancelled pointer (touch turned into a system gesture, pen lifted out of
+// range, capture stolen) never delivers pointerup — without this the drag
+// state sticks and the next tap is interpreted as the tail of the old one.
+const abortDrag = () => {
+    if (!state.drag) return
+    state.drag = null
+    renderOverlay()
+}
+els.overlay.addEventListener('pointercancel', abortDrag)
+els.overlay.addEventListener('lostpointercapture', abortDrag)
+
 /* ─── Segmentation pipeline ──────────────────────────────────────────────── */
 
 let debounceTimer = null
@@ -405,8 +441,19 @@ async function runNow() {
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
-/** Colorize the white-on-black mask; returns {fill, ring} canvases. */
+/**
+ * Colorize the white-on-black mask; returns {fill, ring} canvases.
+ *
+ * Memoized on mask identity. renderOverlay() runs on every pointermove of a
+ * box or lasso drag, and this function is a full-frame getImageData plus a
+ * million-iteration tint loop plus nine composited draws — rebuilding it per
+ * move event is what makes dragging stutter once a mask is on screen. Masks
+ * are fresh ImageData objects per decode, so reference identity is exactly
+ * the right cache key.
+ */
+let layerCache = { mask: null, layers: null }
 const buildMaskLayers = (mask) => {
+    if (layerCache.mask === mask) return layerCache.layers
     const { width, height } = mask
     const raw = new OffscreenCanvas(width, height)
     const rawCtx = raw.getContext('2d')
@@ -435,7 +482,8 @@ const buildMaskLayers = (mask) => {
     }
     ringCtx.globalCompositeOperation = 'destination-out'
     ringCtx.drawImage(alpha, 0, 0)
-    return { fill: alpha, ring }
+    layerCache = { mask, layers: { fill: alpha, ring } }
+    return layerCache.layers
 }
 
 function renderOverlay() {
@@ -514,6 +562,12 @@ function renderOverlay() {
 
 els.cutout.addEventListener('click', async () => {
     if (!state.mask) return
+    if (state.mask.width !== els.view.width || state.mask.height !== els.view.height) {
+        // Can only happen if a decoder returns off-frame dims; exporting
+        // anyway would throw inside ImageData construction.
+        setStatus('Cutout unavailable — mask and photo frames disagree')
+        return
+    }
     const c = document.createElement('canvas')
     c.width = els.view.width
     c.height = els.view.height
@@ -544,6 +598,11 @@ const waitForRun = async () => {
     while (state.running || state.runQueued) {
         await new Promise((res) => setTimeout(res, 40))
     }
+    // The hooks mutate prompt state directly, so bring the visible canvas and
+    // the buttons back in sync — a headless screenshot must show what a real
+    // interaction would have drawn.
+    renderOverlay()
+    refreshButtons()
 }
 
 window.__seglab = {

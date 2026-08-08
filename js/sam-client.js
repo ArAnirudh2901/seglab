@@ -77,6 +77,17 @@ const getWorker = () => {
             if (data.ok) entry.resolve(data.result)
             else entry.reject(new Error(data.error || 'on-device selection failed'))
         }
+        worker.onmessageerror = () => {
+            // A reply that failed structured clone is lost for good — the
+            // request behind it would otherwise hang until its timeout.
+            console.warn('[seglab] worker reply could not be deserialized; switching to inline engine')
+            failAllPending('selection worker sent an unreadable reply')
+            try { worker.terminate() } catch { /* already dead */ }
+            worker = null
+            workerBroken = true
+            clientState.mode = 'inline'
+            emit({ type: 'state' })
+        }
         worker.onerror = (event) => {
             // A worker-level error (script load failure, unhandled throw) is
             // not recoverable per-request: fail everything in flight and go
@@ -150,9 +161,9 @@ let warmPromise = null
 
 /** Download + compile the draft lane, then the flagship in the background
  *  (idempotent). `flagship:false` skips the background upgrade. */
-export const warmUp = ({ flagship = true } = {}) => {
+export const warmUp = ({ flagship = true, gpu = true } = {}) => {
     if (warmPromise) return warmPromise
-    warmPromise = call('warm', { flagship }, null, LOAD_TIMEOUT_MS, 'model load')
+    warmPromise = call('warm', { flagship, gpu }, null, LOAD_TIMEOUT_MS, 'model load')
         .then((engineState) => {
             clientState.device = engineState?.device || clientState.device
             clientState.lane = engineState?.lane || clientState.lane
@@ -230,13 +241,16 @@ export const segment = async (canvas, { clicks = [], box = null, clampPoly = nul
     )
     const imageData = toImageData(result.rgba)
     const rawImageData = toImageData(result.rawRgba)
-    const summary = summarizeMaskRGBA(imageData.data, result.width, result.height)
+    // The engine already summarised off-thread; only recompute if an older
+    // engine build (or an inline path that predates it) omitted it.
+    const summary = result.summary || summarizeMaskRGBA(imageData.data, result.width, result.height)
     const verdict = validateClickMask(summary)
 
     clientState.lastRun = {
         encodeMs: result.encodeMs,
         decodeMs: result.decodeMs,
         postMs: result.postMs,
+        postBackend: result.postBackend,
         encoded: result.encoded,
         score: result.score,
         lane: result.lane,

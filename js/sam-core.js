@@ -141,10 +141,15 @@ export const validateClickMask = ({ coverage, bbox }) => {
  *  flood fill (no recursion — 1024² masks would blow the call stack).
  *  Returns { labels: Int32Array (0 = background, 1..n), areas: number[] }
  *  where areas[k] is the pixel count of component k+1. */
+let scratchStack = null
 const labelComponents = (bin, w, h) => {
     const labels = new Int32Array(w * h)
     const areas = []
-    const stack = new Int32Array(w * h)
+    // The flood-fill stack is the same size as the image and is dead the
+    // moment this function returns — reuse it instead of churning 4 MB per
+    // call (labeling runs twice per decode: foreground, then background).
+    if (!scratchStack || scratchStack.length < bin.length) scratchStack = new Int32Array(bin.length)
+    const stack = scratchStack
     let next = 0
     for (let start = 0; start < bin.length; start += 1) {
         if (!bin[start] || labels[start]) continue
@@ -211,27 +216,31 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
 
     const { labels, areas } = labelComponents(bin, w, h)
-    const keep = new Set()
-    for (const [sx, sy] of seeds) {
-        const l = labelNearSeed(labels, w, h, sx, sy)
-        if (l) keep.add(l)
-    }
-    let largestKept = 0
-    if (keep.size === 0) {
+    // Label→keep as a flat lookup table, not a Set: membership is tested once
+    // per pixel below, and a Set.has in a million-iteration loop is the
+    // single most expensive thing in the hygiene pass.
+    const keepLut = new Uint8Array(areas.length + 1)
+    let keptCount = 0
+    const markKeep = (l) => { if (l && !keepLut[l]) { keepLut[l] = 1; keptCount += 1 } }
+    for (const [sx, sy] of seeds) markKeep(labelNearSeed(labels, w, h, sx, sy))
+    if (keptCount === 0) {
         // No seed hit anything (box/lasso edge cases) — keep the largest.
         let best = 1
         for (let k = 1; k < areas.length; k += 1) if (areas[k] > areas[best - 1]) best = k + 1
-        keep.add(best)
+        markKeep(best)
     }
-    for (const l of keep) largestKept = Math.max(largestKept, areas[l - 1])
+    let largestKept = 0
+    for (let k = 0; k < areas.length; k += 1) {
+        if (keepLut[k + 1] && areas[k] > largestKept) largestKept = areas[k]
+    }
     const minUnseeded = Math.max(48, largestKept * 0.01)
     for (let k = 0; k < areas.length; k += 1) {
-        if (!keep.has(k + 1) && areas[k] >= minUnseeded) keep.add(k + 1)
+        if (!keepLut[k + 1] && areas[k] >= minUnseeded) markKeep(k + 1)
     }
 
     let dropped = 0
     for (let i = 0; i < size; i += 1) {
-        if (bin[i] && !keep.has(labels[i])) {
+        if (bin[i] && !keepLut[labels[i]]) {
             bin[i] = 0
             dropped += 1
             const j = i * 4
@@ -246,24 +255,25 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     const inv = new Uint8Array(size)
     for (let i = 0; i < size; i += 1) inv[i] = bin[i] ? 0 : 1
     const bg = labelComponents(inv, w, h)
-    const touchesBorder = new Set()
+    const touchesBorder = new Uint8Array(bg.areas.length + 1)
     for (let x = 0; x < w; x += 1) {
-        if (bg.labels[x]) touchesBorder.add(bg.labels[x])
-        if (bg.labels[(h - 1) * w + x]) touchesBorder.add(bg.labels[(h - 1) * w + x])
+        touchesBorder[bg.labels[x]] = 1
+        touchesBorder[bg.labels[(h - 1) * w + x]] = 1
     }
     for (let y = 0; y < h; y += 1) {
-        if (bg.labels[y * w]) touchesBorder.add(bg.labels[y * w])
-        if (bg.labels[y * w + w - 1]) touchesBorder.add(bg.labels[y * w + w - 1])
+        touchesBorder[bg.labels[y * w]] = 1
+        touchesBorder[bg.labels[y * w + w - 1]] = 1
     }
     const maxHole = Math.max(64, (fgArea - dropped) * 0.01)
-    const fillLabel = new Set()
+    const fillLut = new Uint8Array(bg.areas.length + 1)
+    let fillAny = false
     for (let k = 0; k < bg.areas.length; k += 1) {
-        if (!touchesBorder.has(k + 1) && bg.areas[k] <= maxHole) fillLabel.add(k + 1)
+        if (!touchesBorder[k + 1] && bg.areas[k] <= maxHole) { fillLut[k + 1] = 1; fillAny = true }
     }
     let holesFilled = 0
-    if (fillLabel.size) {
+    if (fillAny) {
         for (let i = 0; i < size; i += 1) {
-            if (fillLabel.has(bg.labels[i])) {
+            if (fillLut[bg.labels[i]]) {
                 holesFilled += 1
                 const j = i * 4
                 rgba[j] = 255
@@ -272,7 +282,7 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
             }
         }
     }
-    return { kept: keep.size, dropped, holesFilled }
+    return { kept: keptCount, dropped, holesFilled }
 }
 
 /** Component count of a mask (verify/debug hook). */

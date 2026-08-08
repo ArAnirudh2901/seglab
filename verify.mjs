@@ -33,33 +33,38 @@
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
-const ROOT = path.resolve(import.meta.dir)
+// import.meta.dir is Bun-only; this form works under both Bun and Node.
+const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const PROFILE_DIR = path.join(ROOT, '.cache', 'profile')
 const TIMEOUT_MS = Number(process.env.HARNESS_TIMEOUT_MS || 8 * 60 * 1000)
 
 const log = (msg) => console.log(`[verify] ${msg}`)
 const results = []
+// Phase B (flagship) is documented as WARN-only: headless Chromium's WebGPU,
+// especially f16, is not real Chrome. warnOnly makes that true of the checks
+// themselves — previously a phase-B miss silently failed the whole gate.
+let warnOnly = false
 const check = (label, ok, detail) => {
-  results.push({ label, ok })
-  console.log(`[verify] ${ok ? 'ok' : '✗'} ${label} — ${detail}`)
+  results.push({ label, ok: ok || warnOnly })
+  console.log(`[verify] ${ok ? 'ok' : (warnOnly ? '⚠' : '✗')} ${label} — ${detail}`)
 }
 
-/* ─── Playwright (local, else Pixxel's install) ─────────────────────────── */
-// Prefer the Pixxel repo's install: its browser build is known-downloaded
-// (a bare 'playwright' can resolve to a different version whose browser
-// binary was never fetched).
+/* ─── Playwright ────────────────────────────────────────────────────────── */
+// Set SEGLAB_PLAYWRIGHT to a specific install when the local one resolves to
+// a version whose browser binary was never downloaded.
 let chromium
-try {
-  ({ chromium } = await import('/Users/andhetharuntej/Pixxel/node_modules/playwright/index.mjs'))
-} catch {
+for (const spec of [process.env.SEGLAB_PLAYWRIGHT, 'playwright'].filter(Boolean)) {
   try {
-    ({ chromium } = await import('playwright'))
-  } catch {
-    log('skip — playwright not found in ~/Pixxel or locally')
-    process.exit(0)
-  }
+    ({ chromium } = await import(spec))
+    break
+  } catch { /* try the next candidate */ }
+}
+if (!chromium) {
+  log('skip — playwright not found (npm i -D playwright, or set SEGLAB_PLAYWRIGHT=/path/to/playwright)')
+  process.exit(0)
 }
 
 /* ─── Static server ─────────────────────────────────────────────────────── */
@@ -194,11 +199,13 @@ try {
   )
 
   const stA = await page.evaluate(() => window.__seglab.state())
-  log(`phase A done: engine=${stA.mode} device=${stA.device} lane=${stA.lane}`)
+  log(`phase A done: engine=${stA.mode} device=${stA.device} lane=${stA.lane} `
+    + `post=${stA.lastRun?.postBackend || '?'} (${stA.lastRun?.postMs}ms)`)
   await page.close()
 
   /* ─── Phase B: flagship upgrade (WARN on failure, headless WebGPU ≠
          real Chrome) ──────────────────────────────────────────────────── */
+  warnOnly = true
   try {
     const pageB = await newAppPage(context, '')
     log('phase B (flagship) — waiting for the background SAM3 upgrade (first run downloads ~300 MB)…')
