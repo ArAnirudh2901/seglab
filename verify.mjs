@@ -133,7 +133,16 @@ let failed = false
 try {
   context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: true,
-    args: ['--enable-unsafe-webgpu', '--enable-gpu'],
+    // CI images often ship a browser that does not match the pinned
+    // playwright build; SEGLAB_CHROMIUM points at the one that is present.
+    ...(process.env.SEGLAB_CHROMIUM ? { executablePath: process.env.SEGLAB_CHROMIUM } : {}),
+    args: [
+      '--enable-unsafe-webgpu', '--enable-gpu',
+      // Software WebGPU so headless boxes without a real GPU still exercise
+      // the compute path instead of silently testing only the CPU fallback.
+      ...(process.env.SEGLAB_SWIFTSHADER ? ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] : []),
+      ...(process.env.SEGLAB_NO_SANDBOX ? ['--no-sandbox'] : []),
+    ],
   })
 
   /* ─── Phase A: draft lane, deterministic ────────────────────────────── */

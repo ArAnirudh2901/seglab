@@ -49,4 +49,26 @@ what a C++/Dawn build of this pipeline would hand the driver anyway.
 Both backends are verified to produce byte-identical masks. `?gpu=0` forces the
 CPU path; the timing chip reports which one served the last decode.
 
+### Post-pipeline cost
+
+The band that edge refinement can change is a few percent of a frame, and mask
+components cannot exist outside the mask's own bounding box. Both stages
+therefore run on that box plus a margin rather than the whole frame — see
+CROP MARGIN in `edge-refine.js` for why the shell is provably sufficient. The
+saving scales with how much of the frame the subject occupies, so it is
+largest exactly where the old code was most wasteful: small objects.
+
+CPU path at the canonical 1024² frame, by subject size:
+
+| subject | frame covered | refinement | hygiene |
+|---|---|---|---|
+| huge (60% of width) | 43% | 271 → 88 ms | 57 → 18 ms |
+| medium (30%) | 13% | 399 → 29 ms | 41 → 7.5 ms |
+| small (10%) | 2.5% | 241 → 8.6 ms | 44 → 6.0 ms |
+| minute (r=9px) | 0.6% | 220 → 4.2 ms | 41 → 5.6 ms |
+
+Output is byte-identical before and after, verified across 31 scenes covering
+border-touching, multi-component, nested-hole, odd-dimension and full-frame
+masks.
+
 Next lanes (same `segment()` contract): SAM3/EfficientSAM3 flagship tier, text prompts.

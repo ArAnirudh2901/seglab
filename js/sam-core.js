@@ -204,7 +204,9 @@ const labelNearSeed = (labels, w, h, x, y, radius = 8) => {
  *
  * @param {Uint8ClampedArray} rgba  white-on-black mask, modified in place
  * @param {Array<[number, number]>} seeds  positive prompt points
- * @returns {{ kept: number, dropped: number, holesFilled: number }}
+ * @returns {{ kept: number, dropped: number, holesFilled: number, bbox: number[]|null }}
+ *   `bbox` is the final foreground extent — the edge refinement uses it to
+ *   confine its work to a shell around the boundary instead of the frame.
  */
 export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     const size = w * h
@@ -213,7 +215,7 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     for (let i = 0; i < size; i += 1) {
         if (rgba[i * 4] >= 128) { bin[i] = 1; fgArea += 1 }
     }
-    if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
+    if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0, bbox: null }
 
     const { labels, areas } = labelComponents(bin, w, h)
     // Label→keep as a flat lookup table, not a Set: membership is tested once
@@ -282,7 +284,28 @@ export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
             }
         }
     }
-    return { kept: keptCount, dropped, holesFilled }
+    // Final foreground extent. Hole filling only writes interior pixels, so
+    // scanning `bin` (pre-fill) gives the same box as scanning the result.
+    let minX = w
+    let minY = h
+    let maxX = -1
+    let maxY = -1
+    for (let y = 0; y < h; y += 1) {
+        const row = y * w
+        for (let x = 0; x < w; x += 1) {
+            if (!bin[row + x]) continue
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+        }
+    }
+    return {
+        kept: keptCount,
+        dropped,
+        holesFilled,
+        bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null,
+    }
 }
 
 /** Component count of a mask (verify/debug hook). */

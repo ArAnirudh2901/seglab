@@ -346,12 +346,12 @@ const clampRGBAToPolygon = (rgba, w, h, poly, margin) => {
 /** Guided-filter edge refinement: GPU compute shaders when we can, the O(N)
  *  CPU implementation when we can't. gpu-post demotes itself permanently on
  *  any failure, so this never thrashes between backends. */
-const refinePost = async (rgba, w, h, entry, imageKey) => {
+const refinePost = async (rgba, w, h, entry, imageKey, bbox) => {
     if (state.gpuPost) {
-        const gpuResult = await gpuRefineMaskEdges(rgba, w, h, entry.gray, { guideKey: imageKey })
+        const gpuResult = await gpuRefineMaskEdges(rgba, w, h, entry.gray, { guideKey: imageKey, bbox })
         if (gpuResult) return gpuResult
     }
-    return refineMaskEdges(rgba, w, h, entry.gray, { guide: entry.guide })
+    return refineMaskEdges(rgba, w, h, entry.gray, { guide: entry.guide, bbox })
 }
 
 const segmentOnce = async (req) => {
@@ -414,7 +414,9 @@ const segmentOnce = async (req) => {
     }
     const seeds = effectiveClicks.filter((c) => c[2]).map((c) => [c[0], c[1]])
     const hygiene = cleanupMaskRGBA(rgba, mw, mh, seeds)
-    const refined = await refinePost(rgba, mw, mh, entry, req.imageKey)
+    // hygiene already walked the mask, so its bbox is free — the refinement
+    // uses it to work on a shell around the boundary instead of the frame.
+    const refined = await refinePost(rgba, mw, mh, entry, req.imageKey, hygiene.bbox)
     // Summarise here, not on the main thread: it is a full-frame pass and the
     // UI thread is the one resource a selection must never spend.
     const summary = summarizeMaskRGBA(rgba, mw, mh)

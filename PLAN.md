@@ -61,6 +61,7 @@ NO encoder size fixes, and they upgrade every current and future lane.
 | 4 | Edge-band refinement: gray guided filter, ±6 px band, soft output, E toggle | 3131 soft boundary px; post ~110 ms |
 | 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 confirmed headless; encode 5581 ms / decode 630 ms |
 | 6 | Post pipeline on the GPU (WGSL compute) + O(N) CPU fallback + bug sweep | GPU vs CPU byte-identical (maxPixelDiff 0 @1024²); CPU path 427→223 ms |
+| 7 | Boundary-shell cropping of both post stages; GPU proven live via timestamp queries | byte-identical on 31 scenes; CPU post 3–52× faster by subject size; GPU dispatch-limit bug found at 2048² and fixed |
 
 ---
 
