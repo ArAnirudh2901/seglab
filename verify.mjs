@@ -708,8 +708,10 @@ try {
     autoTiered.draftCacheMax === 1 && autoTiered.maxResidentHeavy === 1
       && autoTiered.exportMaxMP === 12 && autoTiered.hdExportDecode === true
       && autoTiered.autoEscalate === false && autoTiered.samWebGPU === true
-      && autoTiered.memBudgetMB <= 2000,
-    JSON.stringify({ cache: autoTiered.draftCacheMax, exportMP: autoTiered.exportMaxMP, hd: autoTiered.hdExportDecode, esc: autoTiered.autoEscalate }),
+      // The CEILING, not the working set — the lane rests at ~1980 MB, so a
+      // budget under that declared a healthy app to be in permanent pressure.
+      && autoTiered.memBudgetMB === 2200,
+    JSON.stringify({ cache: autoTiered.draftCacheMax, exportMP: autoTiered.exportMaxMP, hd: autoTiered.hdExportDecode, esc: autoTiered.autoEscalate, budget: autoTiered.memBudgetMB }),
   )
   check(
     'policy: the detector is evicted before an encode and idles out',
@@ -788,57 +790,52 @@ try {
     JSON.stringify({ single: liteDefault.memBudgetMB }),
   )
 
-  /* ── Memory governor: the real safety net (measured bytes + drift, not JS heap) ── */
+  /* ── Memory governor: judges THIS APP's footprint, never the machine's RAM ── */
   check(
-    // The measured signal SEES a runaway WASM heap (the 3 GB failure) that the
-    // old JS-heap watchdog was blind to; deep headroom under budget is the only
-    // thing that emits a climb signal. Drift is the unified-memory swap signal
-    // (GPU bytes are invisible to the measure API) and MUST catch onset early:
-    // it sheds at a few hundred ms, not after the multi-second freeze the old
-    // 2.5/5 s thresholds waited through — while ignoring normal foreground jitter.
-    'governor: WASM-scale bytes shed to L3; proven headroom climbs; drift catches swap ONSET',
-    decidePressure({ bytesMB: 3000, budgetMB: 1800 }).level === 3
-      && decidePressure({ bytesMB: 500, budgetMB: 1800 }).headroom === true
-      && decidePressure({ bytesMB: 1600, budgetMB: 1800 }).level === 1
-      && decidePressure({ bytesMB: 0, driftMs: 6000 }).level === 3   // unambiguous multi-second OS freeze → free the arena
-      && decidePressure({ bytesMB: 0, driftMs: 2000 }).level === 2   // a lone ~2 s spike can be GC/compile jank → defer work, keep the session
-      && decidePressure({ bytesMB: 0, driftMs: 1000 }).level === 2   // sustained stall caught early
-      && decidePressure({ bytesMB: 0, driftMs: 500 }).level === 1    // onset caught (was silent under 2.5 s)
-      && decidePressure({ bytesMB: 0, driftMs: 300 }).level === 0    // normal foreground jitter ignored
-      && decidePressure({ bytesMB: 1200, budgetMB: 1800 }).headroom === false, // under budget but not deep → no climb
+    // A runaway WASM heap (the 3 GB failure) still sheds to L3. Drift measures
+    // the HOST, so it can no longer shed at any magnitude — a machine swapping
+    // under everything else the user has open must not pause our WebGPU work.
+    // It survives only as a climb veto.
+    'governor: app footprint sheds; drift alone never does; deep headroom climbs',
+    decidePressure({ bytesMB: 3000, budgetMB: 2200 }).level === 3
+      && decidePressure({ bytesMB: 500, budgetMB: 2200 }).headroom === true
+      && decidePressure({ bytesMB: 2150, budgetMB: 2200 }).level === 1
+      && decidePressure({ bytesMB: 0, driftMs: 6000 }).level === 0   // the OS is swapping, not us
+      && decidePressure({ bytesMB: 0, driftMs: 500 }).level === 0
+      && decidePressure({ bytesMB: 500, budgetMB: 2200, driftMs: 6000 }).headroom === false // …but do not climb into it
+      && decidePressure({ bytesMB: 1200, budgetMB: 2200 }).headroom === false, // under budget but not deep → no climb
     JSON.stringify({
-      wasm: decidePressure({ bytesMB: 3000, budgetMB: 1800 }).level,
-      headroom: decidePressure({ bytesMB: 500, budgetMB: 1800 }).headroom,
+      wasm: decidePressure({ bytesMB: 3000, budgetMB: 2200 }).level,
+      headroom: decidePressure({ bytesMB: 500, budgetMB: 2200 }).headroom,
       driftDeep: decidePressure({ bytesMB: 0, driftMs: 6000 }).level,
-      driftOnset: decidePressure({ bytesMB: 0, driftMs: 500 }).level,
-      driftJitter: decidePressure({ bytesMB: 0, driftMs: 300 }).level,
+      driftVetoesClimb: decidePressure({ bytesMB: 500, budgetMB: 2200, driftMs: 6000 }).headroom,
     }),
   )
 
-  // The engine that reaps hardest is the one with no byte API at all: both
-  // `measureUserAgentSpecificMemory` and `performance.memory` are Chromium-only,
-  // so on WebKit the ladder above had drift as its ONLY input — and drift is an
-  // OS-swap signal, while WebKit kills per WebContent process with the machine
-  // nowhere near swap. The allocation ledger is what makes the shed rungs
-  // reachable there. It must never manufacture a climb signal: headroom is a
-  // proof, and an estimate proves nothing.
+  // The ledger is the ONLY signal that sees the whole app.
+  // `measureUserAgentSpecificMemory` covers one agent cluster, and the SAM lane's
+  // SharedWorker is a different one — measured 75 MB while the app held ~2 GB. So
+  // a byte reading is a FLOOR: it may raise the estimate, never silence it. It
+  // used to do exactly that (the caller skipped the ledger whenever bytes > 0),
+  // which left Chrome with no footprint signal at all.
+  //
+  // And the bands sit above normal operation: with an encoder live the ledger
+  // rests at ~1980 MB, which the old 0.85 warn band called pressure forever.
   check(
-    'governor: the allocation ledger sheds where no byte API exists, but never proves headroom',
-    decidePressure({ bytesMB: 0, estimateMB: 2300, budgetMB: 1900 }).level === 3
-      && decidePressure({ bytesMB: 0, estimateMB: 1950, budgetMB: 1900 }).level === 2
-      && decidePressure({ bytesMB: 0, estimateMB: 1700, budgetMB: 1900 }).level === 1
-      && decidePressure({ bytesMB: 0, estimateMB: 900, budgetMB: 1900 }).level === 0
-      && decidePressure({ bytesMB: 0, estimateMB: 400, budgetMB: 1900 }).headroom === false
-      // A real reading always outranks the ledger, and the caller enforces that
-      // by not computing one; passing both must still prefer the measurement.
-      && decidePressure({ bytesMB: 500, estimateMB: 2300, budgetMB: 1900 }).level === 0
+    'governor: the ledger is a floor a partial byte reading cannot silence; rest is calm',
+    decidePressure({ bytesMB: 0, estimateMB: 2600, budgetMB: 2200 }).level === 3
+      && decidePressure({ bytesMB: 0, estimateMB: 2300, budgetMB: 2200 }).level === 2
+      && decidePressure({ bytesMB: 0, estimateMB: 2150, budgetMB: 2200 }).level === 1
+      && decidePressure({ bytesMB: 0, estimateMB: 1980, budgetMB: 2200 }).level === 0 // the lane at rest
+      && decidePressure({ bytesMB: 0, estimateMB: 400, budgetMB: 2200 }).headroom === true
+      // The 75 MB page reading must not hide a 2.3 GB app.
+      && decidePressure({ bytesMB: 75, estimateMB: 2300, budgetMB: 2200 }).level === 2
       // The heap floor stays reachable when there is no ledger either.
       && decidePressure({ bytesMB: 0, estimateMB: 0, heapMB: 700 }).level === 3,
     JSON.stringify({
-      shedL3: decidePressure({ bytesMB: 0, estimateMB: 2300, budgetMB: 1900 }).level,
-      shedL1: decidePressure({ bytesMB: 0, estimateMB: 1700, budgetMB: 1900 }).level,
-      noClimb: decidePressure({ bytesMB: 0, estimateMB: 400, budgetMB: 1900 }).headroom,
-      measuredWins: decidePressure({ bytesMB: 500, estimateMB: 2300, budgetMB: 1900 }).level,
+      shedL3: decidePressure({ bytesMB: 0, estimateMB: 2600, budgetMB: 2200 }).level,
+      atRest: decidePressure({ bytesMB: 0, estimateMB: 1980, budgetMB: 2200 }).level,
+      partialBytes: decidePressure({ bytesMB: 75, estimateMB: 2300, budgetMB: 2200 }).level,
     }),
   )
 

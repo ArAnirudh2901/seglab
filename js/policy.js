@@ -23,7 +23,7 @@
 const CONFIG = {
         profile: 'standard8',
         samIdleMs: 300_000,
-        memBudgetMB: 1900,
+        memBudgetMB: 2200,   // ceiling, not a working set: the lane rests at ~1980
         proxyMax: 1024,          // floor on the LONG edge; see proxyShortMax
         // The encoder consumes a 1024x1024 SQUARE (sam21-lane drawImage), so the
         // detail it can use is capped PER AXIS. Sizing only by the long edge

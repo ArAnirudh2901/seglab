@@ -6,19 +6,23 @@
  * while a WASM SlimSAM heap ballooned to ~3 GB (measured). This governor watches
  * the signals that actually move:
  *
- *  - `measureUserAgentSpecificMemory()` (crossOriginIsolated only): real bytes
- *    for the whole same-origin agent cluster — main thread + workers + WASM.
- *    This SEES a runaway WASM heap. (GPU-process memory is separate and not
- *    counted, which is why timer-drift is the paired signal.)
- *  - timer drift: a 1 s tick landing seconds late means the OS is swapping /
- *    starving this device — the one device-relative signal, works everywhere.
- *  - `performance.memory` JS heap: coarse tertiary (only when no measured bytes).
+ * It judges THIS APP's footprint against the app's ceiling — never the machine's
+ * RAM. Work runs on WebGPU; a host that is swapping because of everything else
+ * the user has open is not a reason to degrade seglab.
  *
- * Bidirectional but asymmetric: it sheds (down) the instant any signal shows
- * pressure; it emits a climb signal (up) only when measured bytes stay well
- * under the tier budget AND there is no drift for a sustained cooldown. Down
- * always wins. A device without the measured signal never climbs (no positive
- * proof) — it simply stays safe at its detected tier.
+ *  - the caller's ledger: what the app knows it allocated (worker arena, device
+ *    pool, encoder session, its own canvases). Available everywhere.
+ *  - `measureUserAgentSpecificMemory()` (crossOriginIsolated only): real bytes,
+ *    but ONLY for this agent cluster. The SAM lane's SharedWorker is a different
+ *    one, so the ORT arena — the multi-GB resident — is not in it: measured
+ *    75 MB while the app held ~2 GB. It is a floor, never a ceiling, and a small
+ *    reading must not be allowed to silence the ledger.
+ *  - `performance.memory` JS heap: coarse last resort, no ledger and no bytes.
+ *  - timer drift: device-relative, so it can no longer shed. It only vetoes a
+ *    CLIMB — don't get greedier on a machine that is already struggling.
+ *
+ * Asymmetric: sheds the instant the footprint crosses a band, climbs only after
+ * a sustained run well under the ceiling.
  */
 
 const MB = 1024 * 1024
@@ -28,52 +32,28 @@ const MB = 1024 * 1024
  * `bytesMB` is the measured agent-cluster figure (0 = unavailable this cycle).
  * Exported so verify can exercise the ladder without a browser.
  */
-export const decidePressure = ({ bytesMB = 0, budgetMB = 1800, driftMs = 0, heapMB = 0, estimateMB = 0 } = {}) => {
+export const decidePressure = ({ bytesMB = 0, budgetMB = 2200, driftMs = 0, heapMB = 0, estimateMB = 0 } = {}) => {
+    // Whichever signal saw MORE. `bytesMB` misses the SharedWorker cluster
+    // entirely, so it can only ever raise the floor, never lower it.
+    const footprintMB = Math.max(bytesMB, estimateMB)
     let level = 0
-    // Measured footprint vs the tier's soft ceiling — catches the app itself
-    // over-allocating (runaway WASM heap, oversized export, stacked images).
-    if (bytesMB > 0) {
-        if (bytesMB > budgetMB * 1.2) level = 3
-        else if (bytesMB > budgetMB) level = 2
-        else if (bytesMB > budgetMB * 0.85) level = 1
-    } else if (estimateMB > 0) {
-        // WebKit has NEITHER byte API — `measureUserAgentSpecificMemory` and
-        // `performance.memory` are both Chromium-only — so on the engine that
-        // reaps a tab hardest this ladder had exactly one input left, drift, and
-        // drift is the wrong instrument for it: WebKit kills per WebContent
-        // PROCESS against its own footprint limit, which is reached with the
-        // machine nowhere near swap. Every shed rung below (relievePressure L1–L3,
-        // measured 2112 → 78 MB) was therefore unreachable there.
-        //
-        // The app cannot observe that ceiling, but it does KNOW what it
-        // allocated — see the caller's ledger. Same thresholds, because it is the
-        // same unit against the same budget; never a headroom proof, because an
-        // estimate cannot prove anything.
-        if (estimateMB > budgetMB * 1.2) level = 3
-        else if (estimateMB > budgetMB) level = 2
-        else if (estimateMB > budgetMB * 0.85) level = 1
+    if (footprintMB > 0) {
+        // Bands sit ABOVE normal operation. With an encoder live the ledger rests
+        // at ~1980 MB, so the old 0.85 warn band (1615 of an 1800 budget) put a
+        // healthy app in permanent pressure — which is exactly what it did on
+        // WebKit, where the ledger is the only input.
+        if (footprintMB > budgetMB * 1.15) level = 3
+        else if (footprintMB > budgetMB) level = 2
+        else if (footprintMB > budgetMB * 0.95) level = 1
     } else if (heapMB > 0) {
-        // No measured bytes (non-COI / rate-limited): coarse JS-heap floor.
+        // No ledger and no bytes: coarse JS-heap floor.
         if (heapMB > 650) level = 3
         else if (heapMB > 450) level = 2
         else if (heapMB > 300) level = 1
     }
-    // Timer drift is the device-relative swap signal — and on a unified-memory
-    // host it is the ONLY early warning we get: the GPU/unified bytes that
-    // actually push the machine into swap are invisible to the measure API
-    // above, so a green byte reading routinely coincides with a swapping OS.
-    // Tuned to fire at swap ONSET (a foreground 1 s tick landing a few hundred
-    // ms late) instead of after the multi-second freeze the old 2.5/5 s
-    // thresholds waited through — by then the machine was already frozen.
-    // L3 (which now releases the ORT session arena — an expensive rebuild) is
-    // reserved for an unambiguous multi-second OS freeze; a lone 2 s spike can
-    // be GC/compile jank and only defers work at L2.
-    if (driftMs > 4000) level = Math.max(level, 3)
-    else if (driftMs > 900) level = Math.max(level, 2)
-    else if (driftMs > 450) level = Math.max(level, 1)
-    // Headroom is only ever PROVEN by a real byte reading well under budget with
-    // no drift — never inferred from the absence of a signal.
-    const headroom = level === 0 && bytesMB > 0 && bytesMB < budgetMB * 0.5 && driftMs < 500
+    // Drift measures the MACHINE, not this app — another process swapping the
+    // host is not a reason to pause our WebGPU work. It only blocks a climb.
+    const headroom = level === 0 && footprintMB > 0 && footprintMB < budgetMB * 0.5 && driftMs < 500
     return { level, headroom }
 }
 
@@ -128,10 +108,6 @@ export const createMemoryGovernor = ({
         if (isActive && !isActive()) { drift = 0; lastTick = now; lastFiredLevel = 0; return }
         if (lastTick) drift = Math.max(0, now - lastTick - 1000)
         lastTick = now
-        // Act on drift HERE, on the fast 1 s loop. The slow decision cycle can
-        // itself be starved by the swap we're trying to catch, so the swap
-        // signal must not wait for it; the byte path stays on that cycle.
-        if (drift > 450) firePressure(decidePressure({ driftMs: drift }).level)
     }
 
     // Fire-and-forget: never blocks the decision loop.
@@ -157,9 +133,9 @@ export const createMemoryGovernor = ({
         const fresh = measuredMB > 0 && (Date.now() - measuredAt) < staleAfterMs
         const bytesMB = fresh ? measuredMB : 0
         const heapMB = performance.memory ? Math.round(performance.memory.usedJSHeapSize / MB) : 0
-        // Only worth computing where nothing measured is available; a real
-        // reading always outranks the ledger.
-        const estimateMB = bytesMB > 0 ? 0 : Math.round(getEstimateMB?.() || 0)
+        // ALWAYS: a byte reading that cannot see the lane's worker must not
+        // suppress the one signal that can.
+        const estimateMB = Math.round(getEstimateMB?.() || 0)
         const { level, headroom } = decidePressure({ bytesMB, budgetMB, driftMs: drift, heapMB, estimateMB })
         onSample?.({ bytesMB, estimateMB, heapMB, driftMs: Math.round(drift), budgetMB, level, headroom, measuring, pressureLevel: budget.pressureLevel || 0 })
         if (level > 0) {
