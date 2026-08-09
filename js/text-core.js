@@ -24,6 +24,30 @@ const COLOR_WORDS = new Map([
 ])
 const COLOR_FILLERS = new Set(['color', 'colour', 'colored', 'coloured'])
 
+/**
+ * Words that start a post-modifier, i.e. everything after them describes the
+ * SETTING rather than the subject. The head noun is whatever sits in front.
+ *
+ * The normalizer below otherwise takes the LAST word as the head, which is right
+ * for "orange tulip" and badly wrong for "the dog sitting among the flowers" —
+ * it heads on "flowers", and the detector, which scores a phrase as a bag of
+ * words, then happily boxes flowers for a photo with no dog in it. Measured on
+ * the canonical NEF: that phrase returned 5 boxes and "snow covering the
+ * flowers" returned 6, all of them flowers.
+ *
+ * "of" is deliberately NOT here: "a cluster of blue florets" would head on
+ * "cluster" and lose the subject entirely.
+ */
+const POST_MODIFIER = new Set([
+    'in', 'on', 'at', 'among', 'amongst', 'behind', 'near', 'nearby', 'under',
+    'underneath', 'over', 'above', 'below', 'beneath', 'beside', 'between',
+    'against', 'inside', 'outside', 'atop', 'around', 'across', 'along',
+    'that', 'which', 'who',
+    'sitting', 'standing', 'lying', 'covering', 'covered', 'holding', 'held',
+    'wearing', 'worn', 'resting', 'hanging', 'growing', 'floating', 'leaning',
+    'walking', 'running', 'playing', 'parked', 'placed', 'surrounded',
+])
+
 // -ves and mutated plurals that strip-the-s mangles ("leaves" → "leave").
 const IRREGULAR_PLURALS = new Map([
     ['leaves', 'leaf'], ['wolves', 'wolf'], ['shelves', 'shelf'], ['halves', 'half'],
@@ -55,9 +79,18 @@ export const normalizePhrase = (raw) => {
         : core
     const labels = [`a photo of a ${core}`]
     if (color && objectCore && objectCore !== core) labels.push(`a photo of a ${objectCore}`)
+    // The subject, with any "… sitting among the flowers" setting cut off. Null
+    // when the phrase has no post-modifier, so callers can tell "no subject to
+    // check separately" from "the subject IS the whole phrase".
+    const cut = (objectCore || core).split(' ')
+    const at = cut.findIndex((w, i) => i > 0 && POST_MODIFIER.has(w))
+    const headWords = at > 0 ? cut.slice(0, at) : null
+    if (headWords) headWords[headWords.length - 1] = depluralize(headWords[headWords.length - 1])
+    const headCore = headWords?.length ? headWords.join(' ') : null
     return {
         core,
         objectCore: objectCore || core,
+        headCore: headCore && headCore !== (objectCore || core) ? headCore : null,
         color,
         labels,
         multi: COUNT_INTENT.test(clean) || words[words.length - 1] !== head,
@@ -168,6 +201,44 @@ export const collapseToObject = (dets, { gap = 1.5 } = {}) => {
 export const letterboxPlan = (w, h, side = DETECTOR_INPUT) => {
     const k = side / Math.max(w, h)
     return { side, k, dw: Math.max(1, Math.round(w * k)), dh: Math.max(1, Math.round(h * k)) }
+}
+
+/** How far the full-frame pass shrinks the photo to reach the detector's square.
+ *  A 45 MP DSLR frame at 640 is ~13x, so anything under ~200 px in the original
+ *  lands below 16 px and is effectively invisible to the detector. */
+export const shrinkFactor = (w, h, side = YOLOE_INPUT) => Math.max(w, h) / side
+
+/**
+ * Overlapping detector tiles, in ORIGINAL pixel coordinates.
+ *
+ * The detector input is a fixed square, so a big photo is squeezed into it and
+ * small subjects fall below the resolution floor — the reason a dense field of
+ * muscari scored 0.09 while a tulip in the same frame scored 0.60. Each tile is
+ * letterboxed into its own square, multiplying linear resolution by `grid`.
+ *
+ * Tiles overlap by `overlap` of a step so a subject on a seam is whole in at
+ * least one tile; the caller de-duplicates with NMS after mapping back.
+ * Returns [{ ox, oy, ow, oh, plan }] where plan is the cell's own letterbox.
+ */
+export const tilePlans = (w, h, side = YOLOE_INPUT, { grid = 2, overlap = 0.15 } = {}) => {
+    const out = []
+    const stepX = w / grid
+    const stepY = h / grid
+    const padX = stepX * overlap
+    const padY = stepY * overlap
+    for (let gy = 0; gy < grid; gy += 1) {
+        for (let gx = 0; gx < grid; gx += 1) {
+            const x0 = Math.max(0, gx * stepX - padX)
+            const y0 = Math.max(0, gy * stepY - padY)
+            const x1 = Math.min(w, (gx + 1) * stepX + padX)
+            const y1 = Math.min(h, (gy + 1) * stepY + padY)
+            const ow = x1 - x0
+            const oh = y1 - y0
+            if (ow < 1 || oh < 1) continue
+            out.push({ ox: x0, oy: y0, ow, oh, plan: letterboxPlan(ow, oh, side) })
+        }
+    }
+    return out
 }
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v)
@@ -308,6 +379,50 @@ const containment = (outer, inner) => {
     const iy = Math.max(0, Math.min(outer[3], inner[3]) - Math.max(outer[1], inner[1]))
     const area = (inner[2] - inner[0]) * (inner[3] - inner[1])
     return area > 0 ? (ix * iy) / area : 0
+}
+
+/** Which edges of `box` sit on an interior edge of the tile `cell` it came from
+ *  — i.e. the subject was cut by the tile, not by its own silhouette. An edge
+ *  that coincides with the IMAGE border is not clipping: nothing continues past
+ *  it. `tol` is in original px; letterbox rounding lands boxes a pixel or two
+ *  inside the cell, so an exact compare would miss every real clip. */
+export const clippedEdges = (box, cell, bounds, tol = 4) => {
+    const out = []
+    const at = (v, edge) => Math.abs(v - edge) <= tol
+    if (at(box[0], cell.ox) && cell.ox > tol) out.push('x0')
+    if (at(box[1], cell.oy) && cell.oy > tol) out.push('y0')
+    if (at(box[2], cell.ox + cell.ow) && cell.ox + cell.ow < bounds.w - tol) out.push('x1')
+    if (at(box[3], cell.oy + cell.oh) && cell.oy + cell.oh < bounds.h - tol) out.push('y1')
+    return out
+}
+
+/**
+ * Drop tile fragments that duplicate a whole-object detection.
+ *
+ * A tiled pass sees each subject once per tile it falls in, and every one of
+ * those views is cut off at the tile border — the box stops where the tile
+ * stops, not where the object does. Such a box is truncated EVIDENCE, not a
+ * detection, yet nothing distinguished it before: it carried a full score and
+ * competed on equal terms.
+ *
+ * Measured, both from the real detector:
+ *   · a streetcar spanning the seam — the full-frame pass boxed all of it (0.547)
+ *     and a tile fragment cut at two edges scored HIGHER (0.604), so plain NMS
+ *     deleted the complete box and kept the truncated one.
+ *   · a tulip — the top-scoring detection in the whole frame (0.702) was the
+ *     bottom half of the flower, cut exactly at the tile edge.
+ *
+ * Score cannot arbitrate this: a tight crop of half an object genuinely looks
+ * more like the phrase than the whole object does. Provenance can. So a clipped
+ * box that is mostly inside an unclipped one is the same object seen worse, and
+ * loses regardless of score. A clipped box with no unclipped rival survives
+ * untouched — that is the small-object case tiling exists for.
+ */
+export const dropClippedDuplicates = (dets, { cover = 0.7 } = {}) => {
+    const whole = dets.filter((d) => !d.clipped?.length)
+    if (!whole.length) return dets
+    return dets.filter((d) => !d.clipped?.length
+        || !whole.some((w) => w !== d && containment(w.box, d.box) >= cover))
 }
 
 /** Drop group boxes. Shown several instances, a detector also emits a box

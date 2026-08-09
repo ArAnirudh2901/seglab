@@ -53,23 +53,10 @@ export const readPhosmithResources = () => normalizePhosmithResources(
     typeof globalThis === 'undefined' ? null : globalThis.__PHOSMITH_DEVICE_RESOURCES__,
 )
 
-const lowerProfile = (profile) => ({ ultra: 'pro', pro: 'standard', standard: 'standard', lite: 'lite' }[profile] || 'standard')
 
 // Trusted-host tier ladder (usable editor budget the host vouches for, not
 // installed RAM). Unverified budgets never enter it.
-const TIER_MIN_GB = { standard: 8, pro: 12, ultra: 24 }
 
-const profileForMemory = (memoryGB, trusted, mode) => {
-    // Browser memory reports are unverifiable, so they never pick a tier —
-    // an untrusted budget always resolves to the conservative baseline.
-    if (!trusted) return 'lite'
-    let profile = 'standard'
-    if (memoryGB > 0 && memoryGB < TIER_MIN_GB.standard) profile = 'lite'
-    else if (memoryGB >= TIER_MIN_GB.ultra) profile = 'ultra'
-    else if (memoryGB >= TIER_MIN_GB.pro) profile = 'pro'
-    if (mode === 'conservative') profile = lowerProfile(profile)
-    return profile
-}
 
 const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit }) => {
     if (!webgpu || fallback) return 'none'
@@ -82,29 +69,19 @@ const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit })
  * The highest tier an UNVERIFIED browser may auto-run, chosen from signals that
  * cannot be spoofed *upward*:
  *   - `logicalProcessors` (hardwareConcurrency): not capped, a device-class proxy.
- *   - `gpuTier`: a usable, non-fallback WebGPU adapter — REQUIRED, because a
- *     GPU-less device runs SlimSAM on WASM, whose ORT heap holds ~3 GB (measured),
- *     so it must stay bounded at lite. 'accelerated' (f16 + healthy limits) is
- *     the strongest signal.
+ *   - `gpuTier`: a usable, non-fallback WebGPU adapter — REQUIRED. It used to be
+ *     required because the WASM alternative held a ~3 GB ORT heap (measured);
+ *     now it is required because there is no alternative at all — the mask lane
+ *     refuses an adapter without shader-f16. 'accelerated' is the strongest signal.
  *   - `deviceMemory`: used only DOWNWARD — a genuine sub-8 reading demotes; a
  *     reading of 8 (the privacy cap) never raises.
  *   - `mobile`: phones/tablets stay lite (small RAM, thermal throttling).
  * Capped at `standard8` — pro/ultra are Phosmith-verified-only or manual override.
  * A trusted host returns null (classifyCapability already has a real figure).
  */
-const autoTierFor = ({ trusted, cores, memoryGB, gpuTier, mobile }) => {
-    if (trusted) return null
-    if (mobile) return 'lite'
-    if (gpuTier === 'none') return 'lite'            // WASM-only → ~3 GB risk, stay bounded
-    if (memoryGB > 0 && memoryGB < 8) return 'lite'  // a real sub-8 reading is trusted down
-    if (!cores || cores < 6) return 'lite'           // no / low multi-core signal
-    // Usable GPU (SlimSAM runs at ~0.5 GB on WebGPU, not ~3 GB on WASM) + real
-    // multi-core. Accelerated adapter or a strong core count earns standard8.
-    return (gpuTier === 'accelerated' || cores >= 8) ? 'standard8' : 'lite'
-}
 
 const proxyFor = (profile, gpuTier, textureLimit) => {
-    // SlimSAM resizes every input to a 1024 long edge, so 1024 is the baseline
+    // The encoder resizes every input to a 1024 long edge, so 1024 is the baseline
     // that feeds the model its exact native frame (and a crisp preview) at no
     // extra model cost. Bigger values improve only interaction/preview
     // precision, so GPU strength earns a bounded increase above that.
@@ -128,14 +105,13 @@ export const classifyCapability = (input = {}) => {
     const memoryGB = host?.memoryGB || browserMemoryGB
     const memorySource = host?.memoryGB ? 'phosmith' : (browserMemoryGB ? 'browser' : 'unknown')
     const resourceMode = host?.mode || 'balanced'
-    const profile = profileForMemory(memoryGB, memorySource === 'phosmith', resourceMode)
     const gpuTier = gpuTierFor(input)
     const vramGB = host?.vramGB || 0
     const cores = Number(input.logicalProcessors) || 0
     const mobile = !!input.mobile
-    // The tier an unverified device may auto-run (capped at standard8, GPU- and
-    // core-gated). Applied by resolveBudget as the locked-budget default.
-    const autoTier = autoTierFor({ trusted: memorySource === 'phosmith', cores, memoryGB, gpuTier, mobile })
+    // One configuration (§11): there is no tier to estimate. `profile` is a
+    // stable label for telemetry and for proxyFor's size table, not a choice.
+    const profile = 'standard8'
 
     return {
         webgpu: !!input.webgpu,
@@ -158,13 +134,9 @@ export const classifyCapability = (input = {}) => {
         storageBufferLimit: Number(input.storageBufferLimit) || 0,
         gpuPreference: 'high-performance',
         profile,
-        // The tier an unverified device auto-runs (null once Phosmith supplies a
-        // real figure). Applied by resolveBudget; the manual toggle can exceed it.
-        autoTier,
-        estimatedProfile: autoTier, // back-compat alias for the profile-toggle UI
         proxyMax: proxyFor(profile, gpuTier, Number(input.textureLimit) || 0),
-        // Segmentation is SlimSAM-only. Kept as a stable diagnostic field for
-        // existing host integrations; it is deliberately never eligible.
+        // Kept as a stable diagnostic field for existing host integrations; it
+        // is deliberately never eligible.
         flagshipEligible: false,
     }
 }
@@ -211,6 +183,30 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
         }
     } catch { /* WebGPU is optional; the engine has a WASM lane. */ }
     return classifyCapability(raw)
+}
+
+/**
+ * Text lane availability. The open-vocab lane peaks ~1.6 GB (Chrome, survives);
+ * WebKit reaps its web process at ~1.0 GB, taking the tab with it, so on WebKit
+ * the lane cannot complete — the mask lane is unaffected and still runs there.
+ *
+ * The constraint is a per-process ceiling, which exposes no feature to detect,
+ * so this tests the *engine*. `navigator.vendor` is the narrowest instrument
+ * available: WebKit alone reports "Apple Computer, Inc." — Chrome reports
+ * "Google Inc." and Firefox reports "" on every platform, including macOS, so
+ * this never catches them. It does correctly catch iOS Chrome/Firefox, which
+ * are WebKit underneath and share the ceiling. `?text=1` overrides it (the
+ * ceiling may move); `?text=0` disables the lane anywhere.
+ */
+export const probeTextLane = (
+    search = typeof location !== 'undefined' ? location.search : '',
+    vendor = typeof navigator === 'undefined' ? '' : navigator.vendor,
+) => {
+    const q = new URLSearchParams(search).get('text')
+    if (q === '0') return { ok: false, reason: 'disabled' }
+    if (q === '1') return { ok: true, reason: 'forced' }
+    if (String(vendor || '') === 'Apple Computer, Inc.') return { ok: false, reason: 'webkit-memory-ceiling' }
+    return { ok: true, reason: 'ok' }
 }
 
 export const RESOURCE_PROFILES = PROFILES

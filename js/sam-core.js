@@ -1,5 +1,5 @@
 /**
- * sam-core (pure — no DOM, no transformers.js)
+ * sam-core (pure — no DOM, no model runtime)
  * ----------------------------------------------
  * Prompt/mask math for the on-device segmentation engine: mapping click/box
  * coordinates into the model's reshaped input space, building prompt tensor
@@ -22,7 +22,7 @@ export const scalePointToReshaped = (x, y, srcW, srcH, reshaped) => [
 /**
  * Build the point-prompt payload from `[x, y, label]` clicks (label 1 =
  * include, 0 = exclude). Returns plain arrays + dims; the engine wraps them
- * in Tensors (this module stays transformers-free).
+ * in Tensors (this module stays runtime-free).
  *
  * @param {Array<[number, number, 0|1]>} clicks  source-space clicks
  * @param {number} srcW

@@ -35,9 +35,23 @@ export const interactionPlan = (w, h, budget = {}) => {
     const directSafe = (w * h) <= (budget.directMaxMP || 2) * 1e6
         && longSide <= (budget.directMaxSide || 2048)
     const disabled = budget.proxyMode === 'disabled'
-    const cap = disabled && directSafe
+    let cap = disabled && directSafe
         ? longSide
         : (disabled ? (budget.safeProxyMax || 768) : (budget.proxyMax || 768))
+    // Per-axis sizing: the encoder resizes the proxy to a 1024x1024 SQUARE, so
+    // a long-edge cap leaves the short edge — and with it a whole axis of real
+    // detail — below what the model can consume. Raise the long edge until the
+    // SHORT one reaches the encoder edge, bounded by a hard long-edge stop and
+    // a total-pixel guard so a panorama cannot turn this into a huge buffer.
+    // Auto mode only: an explicit ?proxy= is the user's number, not ours.
+    const shortTarget = Math.min(budget.proxyShortMax || 0, cap)
+    if (!disabled && budget.proxyMode !== 'manual' && shortTarget > 0) {
+        const aspect = longSide / Math.max(1, Math.min(w, h))
+        const pixelCap = budget.proxyPixelMax || 0
+        let want = Math.floor(shortTarget * aspect) // floor: never overshoot the encoder edge
+        if (pixelCap > 0) want = Math.min(want, Math.round(Math.sqrt(pixelCap * aspect)))
+        cap = Math.max(cap, Math.min(want, budget.proxyLongMax || 2048))
+    }
     const { scale, proxyActive } = getBoundedProxySize(w, h, cap)
     return {
         scale,

@@ -92,21 +92,23 @@ const decodeCropAlpha = async (proxyMask, prompts, rect, tf, {
     }
     const upFactor = cropW / proxySubrect.sw
 
-    const proxyBuf = new Uint8ClampedArray(proxyMask.data) // clone for transfer
+    // No proxy-mask clone and no transfer list: the compose runs on this thread
+    // against the lane's continuous field, so there is nothing to post across a
+    // worker boundary. The clone was a full copy of the proxy mask per export,
+    // allocated only to be transferred to a worker that no longer exists.
     const res = await hdExport({
         revision,
         // Working-res and native-res pixels for the same rect must never
         // share a crop embedding.
         cropKey: doDecode ? cropKeyFor(rect) + (bounded ? ':w' : '') : null,
         source: cropBitmap,
-        proxyMask: { data: proxyBuf.buffer, width: proxyMask.width, height: proxyMask.height },
         proxySubrect,
         prompts: cropPrompts,
         doDecode,
         upFactor,
         compose,
         emitBlob,
-    }, [cropBitmap, proxyBuf.buffer])
+    })
     if (res.stale) return null
     return {
         rect, proxySubrect, upFactor, bounded,
@@ -157,6 +159,33 @@ const compositeProxyMask = async (proxyMask, tf, { exportMaxSide = 0, exportMaxM
     }
 }
 
+// IoU between an escalated crop alpha and the proxy mask it is meant to sharpen,
+// walked on the proxy grid (the coarser of the two). R channel is the coverage
+// ramp in both buffers. The whole mask is inside the rect by construction —
+// cropRectFromBBox pads the mask's own bbox.
+const cropVsProxyIoU = (proxyMask, crop) => {
+    const { sx, sy, sw, sh } = crop.proxySubrect
+    const kx = crop.width / sw
+    const ky = crop.height / sh
+    const x0 = Math.max(0, Math.floor(sx))
+    const y0 = Math.max(0, Math.floor(sy))
+    const x1 = Math.min(proxyMask.width, Math.ceil(sx + sw))
+    const y1 = Math.min(proxyMask.height, Math.ceil(sy + sh))
+    let inter = 0
+    let union = 0
+    for (let py = y0; py < y1; py += 1) {
+        const cy = Math.min(crop.height - 1, Math.max(0, Math.floor((py - sy) * ky)))
+        for (let px = x0; px < x1; px += 1) {
+            const cx = Math.min(crop.width - 1, Math.max(0, Math.floor((px - sx) * kx)))
+            const a = proxyMask.data[(py * proxyMask.width + px) * 4] >= 128
+            const b = crop.alpha[(cy * crop.width + cx) * 4] >= 128
+            if (a && b) inter += 1
+            if (a || b) union += 1
+        }
+    }
+    return union ? inter / union : 0
+}
+
 /**
  * M3 interactive escalation: one native-res crop re-decode for a small
  * selection. On success caches the native patch (HD export reuses it) and
@@ -173,8 +202,19 @@ export const escalateCrop = async (proxyMask, prompts, { budget, revision } = {}
     const rect = cropRectFromBBox(summary.bbox, tf)
     const crop = await decodeCropAlpha(proxyMask, prompts, rect, tf, { budget, revision, forceDecode: true })
     if (!crop || !crop.decoded) return null
+    // The re-decode is a SECOND opinion from a model that has never seen the
+    // rest of the frame, so it can land on a different object (measured: a
+    // lamppost proxy mask of 497 px came back as 82 px — the crop model locked
+    // onto the pole instead of the fixture). Escalation is only allowed to
+    // sharpen the selection the user already approved; when the two disagree
+    // this much it is a different selection, and the proxy stands.
+    const iou = cropVsProxyIoU(proxyMask, crop)
+    if (iou < (budget?.escalateMinIoU ?? 0.5)) {
+        console.warn(`[seglab][hd] escalation IoU-rejected (${iou.toFixed(3)}); keeping the proxy mask`)
+        return null
+    }
     setHdPatch({ revision, rect, alpha: crop.alpha, width: crop.width, height: crop.height, decoded: true, bounded: crop.bounded })
-    return crop
+    return { ...crop, iou }
 }
 
 /** Full-res tight cutout for the proxy mask selected by prompts (both in

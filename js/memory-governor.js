@@ -28,7 +28,7 @@ const MB = 1024 * 1024
  * `bytesMB` is the measured agent-cluster figure (0 = unavailable this cycle).
  * Exported so verify can exercise the ladder without a browser.
  */
-export const decidePressure = ({ bytesMB = 0, budgetMB = 1800, driftMs = 0, heapMB = 0 } = {}) => {
+export const decidePressure = ({ bytesMB = 0, budgetMB = 1800, driftMs = 0, heapMB = 0, estimateMB = 0 } = {}) => {
     let level = 0
     // Measured footprint vs the tier's soft ceiling — catches the app itself
     // over-allocating (runaway WASM heap, oversized export, stacked images).
@@ -36,6 +36,22 @@ export const decidePressure = ({ bytesMB = 0, budgetMB = 1800, driftMs = 0, heap
         if (bytesMB > budgetMB * 1.2) level = 3
         else if (bytesMB > budgetMB) level = 2
         else if (bytesMB > budgetMB * 0.85) level = 1
+    } else if (estimateMB > 0) {
+        // WebKit has NEITHER byte API — `measureUserAgentSpecificMemory` and
+        // `performance.memory` are both Chromium-only — so on the engine that
+        // reaps a tab hardest this ladder had exactly one input left, drift, and
+        // drift is the wrong instrument for it: WebKit kills per WebContent
+        // PROCESS against its own footprint limit, which is reached with the
+        // machine nowhere near swap. Every shed rung below (relievePressure L1–L3,
+        // measured 2112 → 78 MB) was therefore unreachable there.
+        //
+        // The app cannot observe that ceiling, but it does KNOW what it
+        // allocated — see the caller's ledger. Same thresholds, because it is the
+        // same unit against the same budget; never a headroom proof, because an
+        // estimate cannot prove anything.
+        if (estimateMB > budgetMB * 1.2) level = 3
+        else if (estimateMB > budgetMB) level = 2
+        else if (estimateMB > budgetMB * 0.85) level = 1
     } else if (heapMB > 0) {
         // No measured bytes (non-COI / rate-limited): coarse JS-heap floor.
         if (heapMB > 650) level = 3
@@ -76,7 +92,7 @@ export const decidePressure = ({ bytesMB = 0, budgetMB = 1800, driftMs = 0, heap
  * cache alongside timer-drift (the responsive swap signal) and JS heap.
  */
 export const createMemoryGovernor = ({
-    getBudget, onPressure, onHeadroom, isActive, onSample,
+    getBudget, onPressure, onHeadroom, isActive, onSample, getEstimateMB,
     intervalMs = 2500, headroomCycles = 4, measureCooldownMs = 15000, staleAfterMs = 60000,
 } = {}) => {
     const canMeasure = typeof performance !== 'undefined'
@@ -141,8 +157,11 @@ export const createMemoryGovernor = ({
         const fresh = measuredMB > 0 && (Date.now() - measuredAt) < staleAfterMs
         const bytesMB = fresh ? measuredMB : 0
         const heapMB = performance.memory ? Math.round(performance.memory.usedJSHeapSize / MB) : 0
-        const { level, headroom } = decidePressure({ bytesMB, budgetMB, driftMs: drift, heapMB })
-        onSample?.({ bytesMB, heapMB, driftMs: Math.round(drift), budgetMB, level, headroom, measuring, pressureLevel: budget.pressureLevel || 0 })
+        // Only worth computing where nothing measured is available; a real
+        // reading always outranks the ledger.
+        const estimateMB = bytesMB > 0 ? 0 : Math.round(getEstimateMB?.() || 0)
+        const { level, headroom } = decidePressure({ bytesMB, budgetMB, driftMs: drift, heapMB, estimateMB })
+        onSample?.({ bytesMB, estimateMB, heapMB, driftMs: Math.round(drift), budgetMB, level, headroom, measuring, pressureLevel: budget.pressureLevel || 0 })
         if (level > 0) {
             cleanStreak = 0
             firePressure(level)
