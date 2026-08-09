@@ -8,6 +8,12 @@
 # Usage: mem-peak.sh sample <user-data-dir-fragment>   # run this in background
 #        mem-peak.sh stop [label]                      # kill it and report
 #
+# A previous run's Chrome still tearing down matches the SAME --user-data-dir and
+# is summed into this run's baseline — up to ~700 MB of phantom memory, which is
+# what made the text lane read 2.9-3.6 GB when it actually peaks at ~2.0. Before
+# relaunching on a profile, spin until
+# `pgrep -fc "user-data-dir=[^ ]*<frag>"` returns 0.
+#
 # `sample` runs in the FOREGROUND on purpose. A backgrounded loop dies with the
 # shell that started it — a 30 s scenario then yields three samples, which reads
 # as a low peak rather than as a broken sampler. macOS has no `setsid` to detach
