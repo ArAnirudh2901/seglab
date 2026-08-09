@@ -2646,10 +2646,10 @@ window.__seglab = {
     },
     // Raw detector scores before ranking — separates "phrase unknown" from
     // "object below the 640² resolution floor".
-    testDetectRaw: async (phrase, threshold = 0.001, slots = null) => {
+    testDetectRaw: async (phrase, threshold = 0.001, slots = null, grid = undefined) => {
         try {
             const { detectRaw } = await import('./text-ui.js')
-            return await detectRaw(phrase, { threshold, slots })
+            return await detectRaw(phrase, { threshold, slots, ...(grid ? { grid } : {}) })
         } catch (err) { return { error: String(err?.message || err) } }
     },
     // Phrase → 512-d MobileCLIP2 vector, for asserting the open-vocab path

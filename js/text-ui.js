@@ -30,6 +30,21 @@ const toCandidate = (d, kx, ky) => ({
 const TILE_MIN_SHRINK = 2.5
 const TILE_GRID = 2
 
+/** Second, finer grid, tried only when the first pass finds nothing. Measured on
+ *  streetlight.jpg (2034², shrink 3.2), best score over all cells:
+ *
+ *    phrase           full   2x2    3x3
+ *    street light     0.111  0.256  0.478
+ *    streetlight      0.066  0.147  0.255
+ *    person           0.826  0.826  0.826
+ *    snowman (absent) 0.005  0.022  0.044
+ *
+ *  Small subjects sit under the 640² resolution floor at 2x2 and clear it at 3x3;
+ *  absent objects stay quiet at every depth, so escalating cannot invent a match.
+ *  Gated on shrink >= the grid: past that a tile holds no detail the last pass
+ *  did not already have, only upscale. */
+const ESCALATE_GRID = 3
+
 /** Draw one source rect into a gray-padded side² RGB frame. `rect` is in the
  *  DECODED source's pixels; `plan` is the cell's own letterbox. */
 const frameFromSource = (source, plan, rect) => {
@@ -76,6 +91,19 @@ const buildFrames = async (cells, tf) => {
     }
 }
 
+/** One detector sweep at `grid` → detections merged into ORIGINAL pixels.
+ *  Null when the decode failed; `stale` when a newer request superseded this one. */
+const runPass = async (tf, phrases, fallbackLabel, grid, opts) => {
+    const cells = cellsFor(tf, YOLOE_INPUT, grid)
+    const frames = await buildFrames(cells, tf)
+    if (!frames) return null
+    const { results, slotNames, backend, stale } = await detectText(frames, phrases, opts)
+    if (stale) return { stale: true, mapped: [], backend }
+    if (!results?.length) return { stale: false, mapped: [], backend }
+    const bounds = { w: tf.originalW, h: tf.originalH }
+    return { stale: false, backend, mapped: mergeCells(results, cells, frames, slotNames, fallbackLabel, bounds) }
+}
+
 /** Prefer candidates that visibly contain a colour named in the prompt. A
  * broad false-positive box may include a few red pixels; it should not beat a
  * tight red-flower box. If the image has no strong colour evidence, leave the
@@ -98,7 +126,7 @@ const focusRequestedColor = (dets, color) => {
 }
 
 /** Full frame, plus tiles when the photo is far larger than the detector square. */
-const cellsFor = (tf, side) => {
+const cellsFor = (tf, side, grid = TILE_GRID) => {
     const full = {
         ox: 0, oy: 0, ow: tf.originalW, oh: tf.originalH,
         plan: letterboxPlan(tf.originalW, tf.originalH, side),
@@ -106,8 +134,11 @@ const cellsFor = (tf, side) => {
     if (shrinkFactor(tf.originalW, tf.originalH, side) < TILE_MIN_SHRINK) return [full]
     // Keep the full frame: it is the only pass that can see a subject larger
     // than one tile, and it is what big-object phrases already matched on.
-    return [full, ...tilePlans(tf.originalW, tf.originalH, side, { grid: TILE_GRID })]
+    return [full, ...tilePlans(tf.originalW, tf.originalH, side, { grid })]
 }
+
+/** True when a finer grid still has original detail left to give. */
+const canEscalate = (tf, side) => shrinkFactor(tf.originalW, tf.originalH, side) >= ESCALATE_GRID
 
 /** Per-cell detections → one list in ORIGINAL pixels, de-duplicated.
  *  `rawBox` and `frame` stay the CELL's, so colour sampling reads the pixels the
@@ -194,11 +225,11 @@ const subjectSlots = (norm) => {
  *  detector's 640² resolution floor" (real scores, just under threshold).
  *  `slots` overrides the slot list, which is how the slot budget above was
  *  measured rather than guessed. */
-export const detectRaw = async (phrase, { threshold = 0.001, slots = null } = {}) => {
+export const detectRaw = async (phrase, { threshold = 0.001, slots = null, grid = TILE_GRID } = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
-    const cells = cellsFor(tf, YOLOE_INPUT)
+    const cells = cellsFor(tf, YOLOE_INPUT, grid)
     const frames = await buildFrames(cells, tf)
     if (!frames) return null
     const phrases = slots?.length ? slots.slice(0, MAX_SLOTS) : slotPhrases(norm)
@@ -208,6 +239,7 @@ export const detectRaw = async (phrase, { threshold = 0.001, slots = null } = {}
     return {
         phrases,
         cells: cells.length,
+        grid,
         n: scores.length,
         uniqueBoxes: new Set(flat.map((d) => d.box.map((v) => v.toFixed(4)).join(','))).size,
         afterMerge: mergeCells(results || [], cells, frames, slotNames, norm.objectCore, { w: tf.originalW, h: tf.originalH }).length,
@@ -278,9 +310,6 @@ export const detectCandidates = async (phrase, { rankThreshold = 0.08, idleMs = 
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
-    const cells = cellsFor(tf, YOLOE_INPUT)
-    const frames = await buildFrames(cells, tf)
-    if (!frames) return null
     const phrases = slotPhrases(norm)
     // 0.05, not the 0.25 a closed-vocabulary detector wants. Measured on the
     // canonical NEF: an absent object ("a rusty bicycle") scores NOTHING even at
@@ -288,11 +317,17 @@ export const detectCandidates = async (phrase, { rankThreshold = 0.08, idleMs = 
     // input's resolution) tops out at 0.091. The head is calibrated enough that
     // a low floor costs no false positives, and `relative` below is the real
     // guard — it drops anything far under the best match in THIS image.
-    const { results, slotNames, backend, stale } = await detectText(frames, phrases, {
-        threshold: 0.05, idleMs, evict,
-    })
-    if (stale || !results?.length) return null
-    const mapped = mergeCells(results, cells, frames, slotNames, norm.objectCore, { w: tf.originalW, h: tf.originalH })
+    const pass = (grid) => runPass(tf, phrases, norm.objectCore, grid, { threshold: 0.05, idleMs, evict })
+    let first = await pass(TILE_GRID)
+    if (!first || first.stale) return null
+    // Nothing cleared the bar — retry finer before answering "not here". A tiny
+    // subject scores under the floor at 2x2 and well over it at 3x3 (ESCALATE_GRID).
+    if (!first.mapped.some((d) => d.score >= rankThreshold) && canEscalate(tf, YOLOE_INPUT)) {
+        const deeper = await pass(ESCALATE_GRID)
+        if (deeper?.stale) return null
+        if (deeper?.mapped.length) first = deeper
+    }
+    const { mapped, backend } = first
     if (mapped.length === 0) return null
     // The detector scores a phrase as a bag of words, so a phrase whose SETTING
     // is in the photo matches even when its subject is absent: "the dog sitting

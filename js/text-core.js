@@ -60,9 +60,9 @@ const IRREGULAR_PLURALS = new Map([
 const depluralize = (w) => IRREGULAR_PLURALS.get(w)
     || (w.length > 3 && w.endsWith('s') && !NEVER_PLURAL.test(w) ? w.slice(0, -1) : w)
 
-/** Raw phrase → detector label(s) + selection intent.
- * "all red zebras" sends both the exact phrase and the object-only fallback.
- * The latter finds boxes more reliably; a colour check ranks its results. */
+/** Raw phrase → detector cores + selection intent. Bare nouns only: YOLOE's text
+ *  tower was trained on class names, and a "a photo of a …" wrapper only dilutes
+ *  them. `objectCore` drops any colour word; a colour check ranks its results. */
 export const normalizePhrase = (raw) => {
     const clean = String(raw || '').trim().toLowerCase().replace(/\s+/g, ' ')
     if (!clean) return null
@@ -77,8 +77,6 @@ export const normalizePhrase = (raw) => {
     const objectCore = color
         ? words.filter((word) => !COLOR_WORDS.has(word) && !COLOR_FILLERS.has(word)).join(' ')
         : core
-    const labels = [`a photo of a ${core}`]
-    if (color && objectCore && objectCore !== core) labels.push(`a photo of a ${objectCore}`)
     // The subject, with any "… sitting among the flowers" setting cut off. Null
     // when the phrase has no post-modifier, so callers can tell "no subject to
     // check separately" from "the subject IS the whole phrase".
@@ -92,17 +90,10 @@ export const normalizePhrase = (raw) => {
         objectCore: objectCore || core,
         headCore: headCore && headCore !== (objectCore || core) ? headCore : null,
         color,
-        labels,
         multi: COUNT_INTENT.test(clean) || words[words.length - 1] !== head,
         display: clean,
     }
 }
-
-/** CLIP-style templates help OWLv2 rank but hurt Grounding DINO: its grounded
- *  head scores boxes per token, so "a photo of" lets scene-sized boxes match.
- *  Strip back to the bare noun phrase for the grounding lane. */
-export const bareLabel = (label) => String(label).toLowerCase().trim()
-    .replace(/^a photo of (a|an|the) /, '').replace(/\.+$/, '')
 
 /** True when a baked-vocab `label` satisfies the phrase's object `core`
  *  (normalizePhrase.objectCore). Single-word core: whole-word match incl. plural

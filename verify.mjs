@@ -51,7 +51,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import {
-  bareLabel, classifyPixelColor, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
+  classifyPixelColor, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
 } from './js/text-core.js'
 import {
   buildFacets, expandQuery, labelMatchesQuery, regionOf, suggest,
@@ -276,8 +276,8 @@ try {
   await run.enter('T')
   const np = normalizePhrase('all red cars')
   check(
-    'text-core: phrase → template + multi intent',
-    np && np.multi === true && np.color === 'red' && np.labels[0] === 'a photo of a red car' && np.labels[1] === 'a photo of a car',
+    'text-core: phrase → bare cores + multi intent',
+    np && np.multi === true && np.color === 'red' && np.core === 'red car' && np.objectCore === 'car',
     `${JSON.stringify(np)}`,
   )
   const colorFrame = { data: new Uint8ClampedArray(12), width: 4, height: 1, contentWidth: 4, contentHeight: 1 }
@@ -293,9 +293,9 @@ try {
   const irregular = normalizePhrase('leaves')
   check(
     'text-core: irregular plurals depluralize to the real noun ("leaves" → leaf)',
-    irregular.labels[0] === 'a photo of a leaf' && irregular.multi === true
+    irregular.core === 'leaf' && irregular.multi === true
       && normalizePhrase('all people').core === 'person',
-    `${irregular.labels[0]} multi=${irregular.multi}`,
+    `${irregular.core} multi=${irregular.multi}`,
   )
   // The detector scores a phrase as a bag of words, so a phrase whose SETTING is
   // present matches even with its subject absent — measured on the canonical NEF,
@@ -322,11 +322,6 @@ try {
       'plain phrases unchanged',
     )
   }
-  check(
-    'text-core: grounding lane strips the CLIP template to the bare phrase',
-    bareLabel('a photo of a leaf') === 'leaf' && bareLabel('a photo of a red car.') === 'red car',
-    `"${bareLabel('a photo of a leaf')}" / "${bareLabel('a photo of a red car.')}"`,
-  )
   // A cluster-sized box around two real instances is a group guess, not a
   // match; a box containing only one other stays (could be the real object).
   const grouped = rankDetections([
