@@ -440,6 +440,11 @@ export const releaseAll = () => {
     releaseEncoder()
     releaseDecoder()
     releaseEmbedding()
+    // Dropping the LAST session takes ORT's GPUDevice with it and ORT will not
+    // build another by itself, so arm the recovery seam for the next encode.
+    // Without this the governor's top rung left the lane dead until the worker
+    // exited: every later click failed "no WebGPU device after encode".
+    if (state.device) state.lost = true
 }
 
 /** Destroy the GPUDevice. TERMINAL for this JS context: ORT-Web caches its
@@ -452,6 +457,7 @@ export const destroyDevice = () => {
     dropPreproc()
     const dev = state.device
     state.device = null
+    state.lost = true // ensureDevice re-arms ORT on next use
     try { dev?.destroy?.() } catch { /* already gone */ }
 }
 

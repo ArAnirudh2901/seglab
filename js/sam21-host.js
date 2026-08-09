@@ -196,7 +196,35 @@ const pump = () => {
             }, active.transfer?.(result) || []),
             (err) => send(active.port, { id: active.id, ok: false, error: String(err?.message || err) }),
         )
-        .finally(() => { active = null; pushStatus(); pump(); reviewIdleExit() })
+        .finally(() => {
+            active = null
+            // Before pump(): nothing is in flight right here, which is the only
+            // moment freeing a session is safe. Waiting for the queue to drain
+            // too would let a busy tab starve the relief entirely.
+            runDeferredShed()
+            pushStatus()
+            pump()
+            reviewIdleExit()
+        })
+}
+
+// Ops that FREE something must never run while a job holds it. encode/decode go
+// through the queue; every other op is answered immediately (a ping has to reply
+// during an encode or it proves nothing), and the destructive ones rode along —
+// so the governor's pressure shed released ORT sessions out from under a running
+// inference. The trap surfaced as "Selection failed: call_indirect to a signature
+// that does not match" in Safari, "null function" in Chrome: the freed module's
+// table, called by a decode that was already in it.
+//
+// Deferred, not queued: relief has to be the NEXT thing that happens, and memory
+// a running job is using cannot be handed back before it finishes anyway.
+const DESTRUCTIVE = new Set(['releaseAll', 'releaseEncoder', 'releaseDecoder', 'destroyDevice', 'shutdown'])
+let deferredShed = null
+
+const runDeferredShed = () => {
+    const shed = deferredShed
+    deferredShed = null
+    if (shed) try { shed() } catch (err) { console.warn('[seglab][sam21] deferred shed failed:', err?.message) }
 }
 
 const submit = (port, id, label, run, { priority = 'normal', transfer = null } = {}) => {
@@ -342,6 +370,17 @@ const handle = async (port, msg) => {
     }
     const fn = OPS[op]
     if (!fn) { send(port, { id, ok: false, error: `unknown op: ${op}` }); return }
+    if (active && DESTRUCTIVE.has(op)) {
+        // Answer now with what the caller can still see; the free itself lands
+        // the moment the running job lets go.
+        // Chain rather than replace: the governor climbs its ladder with
+        // separate calls (releaseEncoder, then releaseAll), and dropping the
+        // earlier one would silently skip a rung.
+        const prev = deferredShed
+        deferredShed = () => { prev?.(); fn(port, payload) }
+        send(port, { id, ok: true, result: { ...status(), deferred: op } })
+        return
+    }
     try {
         const result = await fn(port, payload)
         // The embedding readback is 8 MB — transfer it rather than letting
