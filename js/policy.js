@@ -49,7 +49,6 @@ const CONFIG = {
         flagshipCacheMax: 0,
         maxResidentHeavy: 1,
         flagship: false,
-        detectorWebGPU: true,
         detectorEvictOnEncode: true,
         detectorIdleMs: 120_000,
         samWebGPU: true,
@@ -198,12 +197,14 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.maxResidentHeavy = 1
         next.draftCacheMax = Math.min(next.draftCacheMax || 1, 1)
         next.flagshipCacheMax = 0
-        next.detectorWebGPU = false
-        // NB: pressure does NOT move the mask lane off the GPU, and can't —
-        // there is no wasm EP left to move it to. The rule outlived the code
-        // that could break it: measured, the old WASM lane pinned ~3 GB against
-        // the GPU's ~0.5 GB, so demoting under memory pressure made swap WORSE.
-        // The lane is now WebGPU or nothing (sam21-lane checkDevice).
+        // NB: pressure does NOT move ANY lane off the GPU. The mask lane can't —
+        // there is no wasm EP left to move it to (sam21-lane checkDevice). The
+        // detector won't: `detectorWebGPU` used to be set false here and was
+        // never read, and wiring it would be the wrong fix. Measured, the old
+        // WASM lane pinned ~3 GB against the GPU's ~0.5 GB, and a wasm arena is
+        // freed only by terminating the worker; the WebGPU detector peaks at
+        // 293 MB and gives 178 MB of it back on dispose. Demoting under pressure
+        // makes swap WORSE, which is the one thing pressure is trying to avoid.
         next.eagerEncode = false
     }
     if (nextLevel >= 2) {
