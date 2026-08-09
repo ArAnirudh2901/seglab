@@ -390,6 +390,18 @@ export const decodeMask = (clicks, { key = null, onWait = null } = {}) =>
 export const setVisible = (visible) => call('visibility', { visible })
 export const releaseAll = () => call('releaseAll')
 /** Swap encoder/decoder file or session options. Drops resident state first. */
-/** Escape hatch for bench/governor ops (buildEncoder, destroyDevice, …). */
-export const op = (name, payload = {}) => call(name, payload)
+/** Escape hatch for bench/governor ops (buildEncoder, destroyDevice, …).
+ *  `shutdown` retires the generation HERE, before the call: the host's own
+ *  `closing` notice can lose the race with a page that closes right after asking
+ *  (verify does exactly that), and then the next page in the same origin adopts
+ *  the corpse by name. localStorage is written synchronously, so it cannot. */
+export const op = (name, payload = {}) => {
+    if (name !== 'shutdown') return call(name, payload)
+    // Order matters: call() connects and posts synchronously, so the message
+    // reaches the CURRENT generation; retiring first would spawn a fresh host
+    // and shut THAT one down, leaving the live one running.
+    const done = call(name, payload)
+    retireGen(state.gen)
+    return done.finally(() => { state.port = null })
+}
 export const refreshStatus = () => call('state').then((r) => { state.status = r; notify(); return r })

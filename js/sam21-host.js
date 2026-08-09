@@ -125,9 +125,18 @@ setDeviceLostHandler((info) => {
 //     is hidden. The embedding survives; only the sessions go.
 const anyVisible = () => [...clients.values()].some((c) => c.visible)
 
+// releaseAll() runs the instant shutdown starts, but `self.close()` only lands a
+// macrotask later — and a SharedWorker keeps taking messages until it does. Work
+// arriving in that window ran against freed sessions and trapped in wasm
+// ("Error: null function"), which surfaced to the user as a bare "selection
+// failed". Nothing runs once this is set.
+let closing = false
+
 /** Exit the worker. Only way to give ORT's WebGPU pool back; clients reconnect
  *  transparently and rebuild on next use. */
 const shutdown = () => {
+    if (closing) return
+    closing = true
     releaseAll()
     // Report which generation is dying. Clients retire exactly that one, so
     // several tabs seeing this converge on a single fresh name rather than each
@@ -271,6 +280,13 @@ const OPS = {
 const handle = async (port, msg) => {
     const { id, op, payload } = msg || {}
     if (!op) return
+    // Sessions are already gone. Send the caller to a fresh generation instead
+    // of running against them.
+    if (closing) {
+        try { port.postMessage({ type: 'closing', gen: GEN }) } catch { /* port gone */ }
+        if (id != null) try { port.postMessage({ id, ok: false, error: 'sam21: host restarting' }) } catch { /* port gone */ }
+        return
+    }
     if (op === 'encode') {
         submit(port, id, 'encode', async () => {
             clients.get(port).imageKey = payload.key

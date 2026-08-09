@@ -2058,12 +2058,25 @@ try {
     // detector's cold load, which a fixed wait cannot cover.
     const deadline = performance.now() + 30000
     let s = window.__seglab.state()
+    // The early exit must mean "the app SAID it found nothing", which it says in
+    // the status line. It used to key on `candidates === 0` — but a single match
+    // auto-selects and clears the list, so that is true on the success path too,
+    // and any phrase whose mask took longer than the 3 s grace (the first one
+    // always does: cold detector session) was scored as a miss. Measured: "bus"
+    // reported 0.0% while the very same click reached 30.2% at 965 ms.
+    const saidNoMatch = () => (document.getElementById('status')?.textContent || '').startsWith('No matches')
     while (performance.now() < deadline && !(s?.maskSummary?.coverage > 0)) {
       await new Promise((r) => setTimeout(r, 250))
       s = window.__seglab.state()
-      if (d?.candidates === 0 && !s?.running && performance.now() > deadline - 27000) break
+      if (saidNoMatch() && !s?.running) break
     }
-    return { cov: s?.maskSummary?.coverage || 0, score: s?.score || 0 }
+    // Backend and raw top score: a wasm-EP fallback scores this graph very
+    // differently from WebGPU, and without them a miss looks like a lane bug.
+    const raw = await window.__seglab.testDetectRaw(t, 0.001)
+    return {
+      cov: s?.maskSummary?.coverage || 0, score: s?.score || 0,
+      cands: d?.candidates ?? -1, backend: raw?.backend || '?', top: raw?.top?.[0] ?? -1,
+    }
   }, q)
   const tBus = await phrase('bus')
   const tOpen = await phrase('vehicle')
@@ -2071,7 +2084,8 @@ try {
   check(
     'text search: a real phrase detects and selects the object',
     tBus.cov > 0.05 && tBus.score > 0.5,
-    `"bus" → ${(tBus.cov * 100).toFixed(1)}% of frame, score ${tBus.score.toFixed(2)}`,
+    `"bus" → ${(tBus.cov * 100).toFixed(1)}% of frame, score ${tBus.score.toFixed(2)},`
+    + ` candidates=${tBus.cands} detector=${tBus.backend} raw=${tBus.top}`,
   )
   check(
     // The open-vocab lane's whole point: a word the baked vocab does not carry
@@ -2471,6 +2485,7 @@ try {
       'offline: fresh import + click + text + export all pass with the network cut',
       !!oClick?.maskSummary && !!oText?.maskSummary && oEx && oEx.coverage > 0,
       `click=${!!oClick.maskSummary} encoded=${oClick.lastRun?.encoded} export=${oEx?.w}×${oEx?.h}`
+      + ` text=${((oText?.maskSummary?.coverage || 0) * 100).toFixed(1)}% textRun=${JSON.stringify(oText?.lastRun || null)}`
       + (oDiag ? ` diag=${JSON.stringify(oDiag)}` : ''),
     )
     check('offline: zero successful network fetches during inference', succeeded === 0, `${attempted} attempted, ${succeeded} succeeded`)
