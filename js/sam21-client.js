@@ -57,6 +57,7 @@ const workerName = () => `seglab.sam21.${readGen()}`
 const TIMEOUT_MS = {
     encode: 10 * 60 * 1000,     // model download on a cold cache can be minutes
     warm: 10 * 60 * 1000,
+    buildEncoder: 10 * 60 * 1000,   // 78 MB fetch + shader compile
     adoptEmbedding: 60 * 1000,
     exportEmbedding: 60 * 1000,
     decode: 120 * 1000,
@@ -329,6 +330,17 @@ export const hello = async (label = null) => {
 /** Build the decoder ahead of the first click. Cheap (9.9 MB). */
 export const warm = () => call('warm')
 
+/** Build the ENCODER session ahead of any image: the ~1 GB half, and the shader
+ *  compile that otherwise lands on the first click. Held until the first encode
+ *  — the lane arms its idle release only after one runs. */
+export const buildEncoder = () => call('buildEncoder')
+
+/** Report tab-side heavy work so the host holds its idle weight prefetch.
+ *  Never connects a host just to say this. */
+export const noteBusy = (busy) => (state.port
+    ? call('busy', { busy }).catch(() => null)
+    : Promise.resolve(null))
+
 /**
  * Encode `bitmap` (transferred — the caller must not touch it afterwards) into
  * the shared embedding, keyed by `key`. A second tab opening the same image
@@ -389,6 +401,9 @@ export const decodeMask = (clicks, { key = null, onWait = null } = {}) =>
  *  exported so tests can drive dormancy without backgrounding a real tab. */
 export const setVisible = (visible) => call('visibility', { visible })
 export const releaseAll = () => call('releaseAll')
+/** Drop embeddings only (all, or one `key`), keeping both sessions and the
+ *  GPU device. The image-swap path — see sam-client releaseEmbeddings. */
+export const releaseEmbedding = (key = null) => call('releaseEmbedding', { key })
 /** Swap encoder/decoder file or session options. Drops resident state first. */
 /** Escape hatch for bench/governor ops (buildEncoder, destroyDevice, …).
  *  `shutdown` retires the generation HERE, before the call: the host's own

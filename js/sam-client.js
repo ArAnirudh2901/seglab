@@ -17,7 +17,7 @@
  */
 
 import { summarizeMaskRGBA, validateClickMask } from './sam-core.js'
-import { enqueueHeavy, cancelHeavyBefore, STALE } from './heavy-job-queue.js'
+import { enqueueHeavy, cancelHeavyBefore, onHeavyActivity, STALE } from './heavy-job-queue.js'
 import { sam21Candidates, sam21Cycle, sam21HdCompose, sam21Segment } from './sam21-adapter.js'
 import { LANE } from './sam21-lane.js'
 import { noteModel } from './model-registry.js'
@@ -68,15 +68,24 @@ const onWorkerEvent = (event) => {
  */
 export const cancelBefore = (revision) => cancelHeavyBefore(revision)
 
+// Detector runs, RAW decodes and exports never touch the SAM host, so the host
+// cannot see them. Forward the tab's busy edge; it holds its weight prefetch.
+onHeavyActivity((busy) => {
+    import('./sam21-client.js').then((c) => c.noteBusy(busy)).catch(() => null)
+})
+
 let warmPromise = null
 
 /** Build the decoder once an interaction proxy is visible. The encoder is the
  *  expensive half and stays unbuilt until there is an actual image to encode.
  *  There is intentionally no model-upgrade branch: a second segmentation model
  *  would violate the bounded interaction-memory contract. */
-export const warmUp = () => {
+export const warmUp = ({ speculative = false } = {}) => {
     if (warmPromise) return warmPromise
-    trace('warm-start', { model: LANE })
+    trace('warm-start', { model: LANE, speculative })
+    // A speculative (boot) warm yields to user work: lowest rank, and an
+    // `isCurrent` so clearHeavyQueue can cancel it while still queued rather
+    // than making an import decode wait behind a warm nobody asked for.
     warmPromise = enqueueHeavy('model-warm', async () => {
         const c = await import('./sam21-client.js')
         await c.hello('seglab')
@@ -87,10 +96,61 @@ export const warmUp = () => {
         noteModel('sam21', { device: 'webgpu', scale: 'small', release: 'darktable-5.6.0' })
         emit({ type: 'state' })
         return clientState
+    }, speculative ? { priority: 'idle', isCurrent: () => true } : {})
+    // STALE means cancelled before it ran. Drop the memo or every later warmUp
+    // hands back a resolved promise that never built anything.
+    warmPromise = warmPromise.then((r) => {
+        if (r === STALE) warmPromise = null
+        return r === STALE ? clientState : r
     })
     warmPromise.catch(() => { warmPromise = null })
     return warmPromise
 }
+
+let encoderPromise = null
+let encoderBuilt = false
+
+/** True once the encoder SESSION exists, so an encode costs only its forward
+ *  pass. The eager path skips its settle gate on this — the gate guards session
+ *  create, and that is already paid. */
+export const encoderReady = () => encoderBuilt
+
+/**
+ * Build the encoder session ahead of any image. The ~1 GB half and the shader
+ * compile that otherwise land on the first click. Speculative callers yield to
+ * user work; the lane holds the session until the first encode arms its idle
+ * release, so it is still standing when a photo arrives.
+ */
+let trackingLane = false
+export const warmEncoder = ({ speculative = false } = {}) => {
+    if (encoderPromise) return encoderPromise
+    trace('encoder-warm-start', { speculative })
+    encoderPromise = enqueueHeavy('encoder-warm', async () => {
+        const c = await import('./sam21-client.js')
+        await c.hello('seglab')
+        // The lane drops the session on its own — post-encode idle release,
+        // governor shed, host exit — and only its broadcasts see that. Track
+        // them or encoderReady() goes on claiming a session that is gone.
+        if (!trackingLane) {
+            trackingLane = true
+            c.subscribe((s) => { if (s?.lane) encoderBuilt = Boolean(s.lane.encoder) })
+        }
+        const r = await c.buildEncoder()
+        encoderBuilt = Boolean(r?.encoder ?? true)
+        emit({ type: 'state' })
+        return r
+    }, speculative ? { priority: 'idle', isCurrent: () => true } : {})
+    encoderPromise = encoderPromise.then((r) => {
+        if (r === STALE) encoderPromise = null
+        return r
+    })
+    encoderPromise.catch(() => { encoderPromise = null })
+    return encoderPromise
+}
+
+/** The governor and the lane's idle ladder both drop the session behind our
+ *  back; re-arm so a later boot-style warm can rebuild it. */
+export const forgetEncoder = () => { encoderBuilt = false; encoderPromise = null }
 
 /**
  * Content key for the embedding cache: dims + FNV-1a over a 16×16
@@ -456,6 +516,14 @@ export const detectText = async (frames, phrases, { threshold = 0.25, revision =
 /** Drop every embedding for the outgoing document (model weights stay). */
 export const releaseDocument = () =>
     import('./sam21-client.js').then((c) => c.releaseAll()).catch(() => null)
+
+/** Same intent as releaseDocument, but keeps the sessions and the GPU device.
+ *  For an image SWAP, where an encode of the new document follows immediately:
+ *  releaseAll drops the last session, which destroys the device (lane
+ *  releaseAll), so the next click paid a device rebuild + a ~1 GB session build
+ *  + the shader compile — measured 457 ms against a 215 ms steady state. */
+export const releaseEmbeddings = () =>
+    import('./sam21-client.js').then((c) => c.releaseEmbedding()).catch(() => null)
 
 /** Lane residency snapshot (verify/debug): { cachedImages, lane, … }. */
 export const engineState = () =>

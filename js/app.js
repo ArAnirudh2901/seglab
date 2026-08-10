@@ -13,7 +13,8 @@
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
 import {
-    cancelBefore, clientState, cycleCandidate, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure,
+    cancelBefore, clientState, cycleCandidate, encodeImage, encoderReady, engineState, forgetEncoder,
+    releaseDocument, releaseEmbeddings, segment, subscribe, warmEncoder, warmUp, relievePressure,
 } from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import { createMemoryGovernor } from './memory-governor.js'
@@ -27,6 +28,7 @@ import { detectCandidates } from './text-ui.js'
 import { suggest, buildFacets } from './search-taxonomy.js'
 import { modelRegistry, noteModel, isModelNoted, laneOfModel } from './model-registry.js'
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
+import { prefetchTextLane } from './model-prefetch.js'
 import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-client.js'
 
 // The user's own persisted profile choice — a deliberate decision, so it is
@@ -56,13 +58,12 @@ const bootProbe = probeCapability().then((cap) => {
     return capability
 })
 
-// No model loads before the user supplies an image. The warm request is
-// enqueued AFTER the import decode releases its bitmaps (heavy-job queue
-// serializes them regardless).
+// The mask lane warms at PAGE LOAD (see Boot), not at import. warmUp memoises,
+// so the import path calling it again is free.
 let warmStarted = false
-const ensureWarm = () => {
+const ensureWarm = (opts) => {
     warmStarted = true
-    return warmUp()
+    return warmUp(opts)
 }
 
 const ACCENT = '#35e0c2'
@@ -346,6 +347,16 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
         && preprocessEpoch === state.preprocessEpoch
         && revision === state.revision
     state.eagerEncode = (async () => {
+        // Session already standing (boot): the settle gate below guards session
+        // CREATE, which is paid, so waiting on it only delays the first click.
+        if (encoderReady() && !(BUDGET.pressureLevel || 0)) {
+            if (!current() || document.hidden) return null
+            const r = await encodeImage(els.view, { revision })
+            if (!current() || r?.stale) return null
+            state.encodePending = false
+            if (!state.running) setStatus(`${readyStatus} · prepared locally`)
+            return r
+        }
         await waitForIdle()
         if (!current() || document.hidden) return null
         // Do not stack the proxy encoder immediately behind the model's own
@@ -353,20 +364,28 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
         // the first selection instead of forcing an unsafe memory peak. The
         // baseline profile waits longer for the same reason.
         const lite = BUDGET.profile === 'lite'
-        const calm = await waitForCalm(lite ? { frames: 16, maxWaitMs: 10000 } : { frames: 12, maxWaitMs: 6000 })
-        if (!current()) return null
-        // The governor may have shed between scheduling and now: a speculative
-        // encode on a host already under memory pressure is exactly the peak the
-        // ratchet is trying to avoid, so defer to the (user-initiated) first click.
-        if ((BUDGET.pressureLevel || 0) > 0) {
-            state.encodePending = true
-            return null
+        const window = lite ? { frames: 16, maxWaitMs: 10000 } : { frames: 12, maxWaitMs: 6000 }
+        // The device rarely settles on the FIRST window after a big import,
+        // which is exactly when the encode matters most. Abandoning there left
+        // the whole encoder build + forward pass on the first click. Retry on a
+        // later window instead; a click or a new image bumps revision/epoch and
+        // `current()` drops this on the spot.
+        let calm = false
+        for (let attempt = 0; attempt < 3 && !calm; attempt += 1) {
+            // The governor may have shed since scheduling: a speculative encode
+            // under memory pressure is the peak the ratchet exists to avoid.
+            if ((BUDGET.pressureLevel || 0) > 0) {
+                state.encodePending = true
+                return null
+            }
+            calm = await waitForCalm(window)
+            if (!current()) return null
+            if (!calm) {
+                state.encodePending = true
+                console.warn('[seglab] idle encode deferred — device has not settled', { attempt: attempt + 1 })
+            }
         }
-        if (!calm) {
-            state.encodePending = true
-            console.warn('[seglab] idle encode deferred — device did not settle after model warm')
-            return null
-        }
+        if (!calm) return null
         // The `gpuOnly` guard that used to sit here protected against paying the
         // WASM lane's multi-GB arena for a prewarm nobody asked for. There is no
         // WASM lane now — the encode is WebGPU or it does not happen — so the
@@ -402,7 +421,21 @@ const showImage = async (source, {
     // any new decode starts. Model weights stay; the queue serializes the
     // decode against any still-running kernel.
     clearHeavyQueue()
-    if (warmStarted) releaseDocument()
+    // Gated on a PRIOR document, not warmStarted: boot warm sets warmStarted
+    // before the first import, and releaseAll would drop the fresh decoder.
+    //
+    // Embeddings ONLY on a swap. releaseAll drops the last session, which takes
+    // the GPU device with it, and a swap is followed immediately by an encode
+    // that has to rebuild device + session + pipeline set — the ~976 MB is
+    // handed straight back and the next click pays for it. Restore-on-reload
+    // makes this the common path, not the rare one: the restored photo sets
+    // hasImage before the user's first import, so the boot-built encoder was
+    // being torn down on essentially every import. Under real pressure the
+    // memory is worth more than the click, so shed properly there.
+    if (state.hasImage) {
+        if (BUDGET.pressureLevel || 0) { releaseDocument(); forgetEncoder() }
+        else releaseEmbeddings()
+    }
 
     // A RAW container's embedded JPEG preview (not the 33 MB sensor payload)
     // becomes the only image decoded during interaction.
@@ -487,7 +520,10 @@ const showImage = async (source, {
     // never sees an encode op before its warm op.
     hidePrep(epoch)
     const startEngine = async () => {
-        if (BUDGET.memoryLocked) await new Promise((resolve) => setTimeout(resolve, 1200))
+        // The 1200 ms memoryLocked stagger that sat here guarded session-create
+        // against the import flush. Boot warm builds the decoder long before an
+        // import, so it delayed only the encode; the encoder's own build is
+        // still gated by the calm window below.
         try { await ensureWarm() } catch (err) {
             console.warn('[seglab] model warm failed (first selection will retry):', err?.message)
         }
@@ -597,7 +633,7 @@ els.file.addEventListener('change', () => {
 els.newimg.addEventListener('click', () => {
     beginImageRequest() // invalidate a queued file/idle encode before cleanup
     clearHeavyQueue()
-    if (warmStarted) releaseDocument()
+    if (state.hasImage) { releaseDocument(); forgetEncoder() }   // releaseAll drops the session too
     state.hasImage = false
     hidePrep()
     clearPrompts()
@@ -634,6 +670,10 @@ const shedMemory = (level, { announce = true } = {}) => {
         }
         refreshChips()
     }
+    // L1 already sheds the encoder session. Forget it here or encoderReady()
+    // keeps claiming a session that is gone, and the eager path would skip the
+    // settle gate for a build it now has to pay under pressure.
+    if (level >= 1) forgetEncoder()
     return relievePressure(level).catch(() => [])
 }
 
@@ -785,6 +825,9 @@ const setMode = (mode) => {
     if (mode === 'text') {
         els.textinput.focus()
         void hintTextSearch()
+        // Intent signal: pull the detector's weights while the phrase is typed,
+        // rather than at boot (a session that never searches must not pay).
+        prefetchTextLane()
     }
 }
 els.modes.click.addEventListener('click', () => setMode('click'))
@@ -2716,8 +2759,52 @@ if ('serviceWorker' in navigator) {
 setMode('click')
 refreshChips()
 
-// Deliberately NO model warm here: nothing downloads or compiles until the
-// user has supplied an image and its bounded proxy is on screen.
-bootProbe.catch(() => {})
+// Warm at page load, not at import: waiting for an image put the whole cold
+// cost — ORT, model pointer, decoder build, 78 MB weight fetch — in front of
+// the first click. Only the cheap half warms; the encoder SESSION is the ~1 GB
+// half and still waits for an image, which ENCODER_IDLE_MS would drop anyway.
+// Every step stays on the heavy-job queue — nothing here runs concurrently.
+const bootWarm = async () => {
+    const cap = await bootProbe
+    if (!cap?.webgpu || !cap.f16 || cap.fallback) return   // §4: no lane on this device
+    // First visit: until the SW controls the page, weights land only in the HTTP
+    // cache and get pulled again on eviction. Bounded — HTTP cache still works.
+    if ('serviceWorker' in navigator && !navigator.serviceWorker.controller) {
+        await new Promise((resolve) => {
+            const done = () => {
+                clearTimeout(timer)
+                navigator.serviceWorker.removeEventListener('controllerchange', done)
+                resolve()
+            }
+            const timer = setTimeout(done, 3000)
+            navigator.serviceWorker.addEventListener('controllerchange', done)
+        })
+    }
+    // Nobody waits on a background tab; no reason to take a GPU device from the
+    // foreground one to warm it.
+    if (document.hidden) {
+        await new Promise((resolve) => {
+            const on = () => {
+                if (document.hidden) return
+                document.removeEventListener('visibilitychange', on)
+                resolve()
+            }
+            document.addEventListener('visibilitychange', on)
+        })
+    }
+    try {
+        await ensureWarm({ speculative: true })
+        // Then the encoder SESSION. This is the ~1 GB resident and the ~1.3 s
+        // shader compile that otherwise land on the first click; the lane arms
+        // its idle release only after an encode RUNS, so a session built here
+        // stands until a photo arrives. Cost is stated in DESIGN §4: an idle
+        // page holds the encoder. The governor still sheds it under pressure
+        // and the host's 120 s idle exit still reclaims an abandoned tab.
+        await warmEncoder({ speculative: true })
+    } catch (err) {
+        console.warn('[seglab] boot warm failed (first import retries):', err?.message)
+    }
+}
+bootWarm()
 
 console.log('[seglab] ready')

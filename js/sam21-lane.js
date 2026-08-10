@@ -320,6 +320,7 @@ export const buildEncoder = () => {
         // URL-sourced, not ArrayBuffer: constructing from a buffer holds the
         // bytes + the parsed graph + the GPU copy at once (~2–2.5× weights).
         const s = await ort.InferenceSession.create(await modelURL(ENCODER_FILE), sessionOpts('gpu-buffer'))
+        markWeightsCached()   // session build populated the cache; no prefetch owed
         captureDevice()
         state.encoder = s
         return s
@@ -339,6 +340,36 @@ export const buildDecoder = () => {
     })()
     state.decoderPromise.catch(() => { state.decoderPromise = null })
     return state.decoderPromise
+}
+
+/**
+ * Encoder weights into the model cache, no session: the 78 MB fetch is the slow
+ * half of a cold first encode, and costs no GPU memory here. Body drained and
+ * discarded — the caches keep the bytes. Abortable; the host runs it only while
+ * idle, and an aborted attempt restarts from scratch next window.
+ */
+let prefetchPromise = null
+let prefetched = false
+export const weightsPrefetched = () => prefetched
+export const markWeightsCached = () => { prefetched = true }
+export const prefetchWeights = (signal) => {
+    if (prefetched) return Promise.resolve(true)
+    prefetchPromise ??= (async () => {
+        const r = await fetch(await modelURL(ENCODER_FILE), { signal })
+        if (!r.ok) throw new Error(`sam21: encoder prefetch failed (${r.status})`)
+        const reader = r.body?.getReader()
+        if (!reader) { await r.arrayBuffer(); return true }
+        let bytes = 0
+        for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            bytes += value.byteLength
+        }
+        console.log('[sam21] encoder weights cached', `${(bytes / 1e6).toFixed(1)} MB`)
+        return true
+    })()
+    prefetchPromise.then(() => { prefetched = true }, () => { prefetchPromise = null })
+    return prefetchPromise
 }
 
 export const releaseEncoder = () => {

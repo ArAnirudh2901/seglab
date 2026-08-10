@@ -28,6 +28,7 @@ const TIMEOUT_MS = {
     'decode-proxy': 60_000,
     'cv-refine': 60_000,
     'model-warm': 240_000,     // first run compiles shaders after an 81 MB fetch
+    'encoder-warm': 600_000,   // 78 MB fetch + shader compile, on a cold cache
     'encode-prewarm': 240_000,
     segment: 240_000,
     'export-refine': 300_000,
@@ -76,8 +77,21 @@ const settle = (job, outcome, deliver) => {
     }
 }
 
+// Observers of "heavy work is running in this tab". The SAM host schedules its
+// own idle-time weight prefetch and cannot see this queue — a detector run and
+// a background download would otherwise overlap.
+const activityHooks = new Set()
+let lastBusy = false
+export const onHeavyActivity = (fn) => { activityHooks.add(fn); return () => activityHooks.delete(fn) }
+const noteActivity = () => {
+    const busy = Boolean(state.active) || state.queue.length > 0
+    if (busy === lastBusy) return
+    lastBusy = busy
+    for (const fn of activityHooks) { try { fn(busy) } catch { /* observer bug */ } }
+}
+
 const pump = () => {
-    if (state.active || state.queue.length === 0) return
+    if (state.active || state.queue.length === 0) { noteActivity(); return }
     const job = state.queue.shift()
     if (isStale(job)) {
         logJob({ label: job.label, outcome: 'stale', waitMs: Date.now() - job.queuedAt, runMs: 0 })
@@ -86,6 +100,7 @@ const pump = () => {
         return
     }
     state.active = job
+    noteActivity()
     job.startedAt = Date.now()
     job.timer = setTimeout(
         () => settle(job, 'timeout', () => job.reject(
@@ -108,10 +123,12 @@ const pump = () => {
  */
 export const enqueueHeavy = (label, task, {
     priority = 'normal', signal = null, revision = null, isCurrent = null, timeoutMs = null,
+    onPreempt = null,
 } = {}) => new Promise((resolve, reject) => {
     const job = {
         label,
         task,
+        onPreempt,
         rank: PRIORITY[priority] ?? PRIORITY.normal,
         seq: ++state.seq,
         signal,
@@ -128,6 +145,11 @@ export const enqueueHeavy = (label, task, {
     let i = state.queue.length
     while (i > 0 && (state.queue[i - 1].rank > job.rank)) i -= 1
     state.queue.splice(i, 0, job)
+    // No preemption in this queue, so a background job yields on its own: real
+    // work must never wait out a speculative download that already holds the slot.
+    if (state.active && job.rank < state.active.rank) {
+        try { state.active.onPreempt?.() } catch { /* yielding is best-effort */ }
+    }
     pump()
 })
 

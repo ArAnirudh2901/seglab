@@ -1588,13 +1588,27 @@ try {
      Pinned to lite so this strictest-floor contract is tested deterministically
      even on a capable CI machine that would otherwise autoTier to standard8. */
   const page = await newAppPage(context, '?flagship=0', null, { pin: 'lite' })
-  const bootState = await page.evaluate(() => window.__seglab.state())
   const bootBudget = await page.evaluate(() => window.__seglab.resourceBudget())
+  // Boot now builds BOTH sessions with no image on screen, so the first click
+  // pays neither the download nor the shader compile. The encoder is the ~1 GB
+  // resident; holding it from boot is the deliberate trade for an instant first
+  // click, and the governor + host idle exit remain its bounds.
+  const bootState = await page.evaluate(async () => {
+    const t0 = Date.now()
+    const lane = async () => (await window.__seglab.engineState().catch(() => null))?.lane || {}
+    while (!(await lane()).encoder && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    const s = window.__seglab.state()
+    const l = await lane()
+    return { ready: s.ready, mode: s.mode, hasImage: s.hasImage, encoder: l.encoder, decoder: l.decoder }
+  })
   check(
-    'boot: no model loads before an image; the single config is bounded',
-    bootState.ready === false && bootState.mode === null
+    'boot: both sessions stand with no image; the single config is bounded',
+    bootState.ready === true && bootState.mode !== null && bootState.hasImage === false
+      && bootState.decoder === true && bootState.encoder === true
       && bootBudget.profile === 'standard8' && bootBudget.memoryLocked === true && bootBudget.proxyMax === 1024,
-    JSON.stringify({ ready: bootState.ready, profile: bootBudget.profile, proxyMax: bootBudget.proxyMax }),
+    JSON.stringify({ ...bootState, profile: bootBudget.profile, proxyMax: bootBudget.proxyMax }),
   )
   const swSmoke = await page.evaluate(async () => {
     const registration = await navigator.serviceWorker?.getRegistration()

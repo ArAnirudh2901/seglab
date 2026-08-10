@@ -22,7 +22,8 @@
 import {
     adoptEmbedding, buildDecoder, buildEncoder, checkDevice, decode, destroyDevice,
     embedStats, encode, exportEmbedding, recycleEncoderDevice, setDeviceLostHandler,
-    laneConfig, laneState, releaseAll, releaseDecoder, releaseEncoder, setEmbedCap, touchEmbedding, warmDecoder,
+    laneConfig, laneState, prefetchWeights, releaseAll, releaseDecoder, releaseEmbedding, releaseEncoder, setEmbedCap, touchEmbedding, warmDecoder,
+    weightsPrefetched,
 } from './sam21-lane.js'
 
 const PRIORITY = { interactive: 0, import: 1, normal: 2, idle: 3 }
@@ -184,7 +185,8 @@ const reviewDormancy = () => {
 const pump = () => {
     if (active || queue.length === 0) return
     active = queue.shift()
-    if (!clients.has(active.port)) { active = null; pump(); return } // tab closed
+    // Null port = internal job (weight prefetch): no reply, no client to lose.
+    if (active.port && !clients.has(active.port)) { active = null; pump(); return } // tab closed
     pushStatus()
     const started = performance.now()
     Promise.resolve()
@@ -204,6 +206,7 @@ const pump = () => {
             runDeferredShed()
             pushStatus()
             pump()
+            armPrefetch()   // idle-only weight pull; no-op unless pump left the host free
             reviewIdleExit()
         })
 }
@@ -218,7 +221,7 @@ const pump = () => {
 //
 // Deferred, not queued: relief has to be the NEXT thing that happens, and memory
 // a running job is using cannot be handed back before it finishes anyway.
-const DESTRUCTIVE = new Set(['releaseAll', 'releaseEncoder', 'releaseDecoder', 'destroyDevice', 'shutdown'])
+const DESTRUCTIVE = new Set(['releaseAll', 'releaseEncoder', 'releaseDecoder', 'releaseEmbedding', 'destroyDevice', 'shutdown'])
 let deferredShed = null
 
 const runDeferredShed = () => {
@@ -227,7 +230,55 @@ const runDeferredShed = () => {
     if (shed) try { shed() } catch (err) { console.warn('[seglab][sam21] deferred shed failed:', err?.message) }
 }
 
+/* ─── Encoder weight prefetch ─────────────────────────────────────────────
+ * Moves the first encode's 78 MB download off the first click. Rides the same
+ * single-job queue as everything else (I3): starts only from an idle host,
+ * aborts on any real submit. The queue has no preemption, so a background
+ * download must never hold the slot in front of a click.
+ */
+const PREFETCH_IDLE_MS = 2000
+const PREFETCH_TRIES = 3
+let prefetchAbort = null
+let prefetchTimer = null
+let prefetchFails = 0
+
+// Tab-side heavy work (detector, RAW decode, export) never reaches this host,
+// so tabs report it — see sam-client's activity hook.
+const anyBusy = () => [...clients.values()].some((c) => c.busy)
+
+const abortPrefetch = () => {
+    clearTimeout(prefetchTimer)
+    if (!prefetchAbort) return
+    prefetchAbort.abort()
+    prefetchAbort = null
+    const i = queue.findIndex((j) => j.label === 'prefetch')
+    if (i >= 0) queue.splice(i, 1)
+}
+
+// Re-armed only by a job finishing (pump's finally) — no polling timer.
+const armPrefetch = () => {
+    if (weightsPrefetched() || closing || prefetchAbort || prefetchFails >= PREFETCH_TRIES) return
+    clearTimeout(prefetchTimer)
+    prefetchTimer = setTimeout(() => {
+        if (active || queue.length || closing || weightsPrefetched() || anyBusy()) return
+        prefetchAbort = new AbortController()
+        const { signal } = prefetchAbort
+        submit(null, null, 'prefetch', () => prefetchWeights(signal)
+            .catch((err) => {
+                if (!signal.aborted) {
+                    prefetchFails += 1
+                    console.warn('[sam21] encoder prefetch failed:', err?.message)
+                }
+                return null
+            })
+            .finally(() => { prefetchAbort = null }),
+        { priority: 'idle' })
+    }, PREFETCH_IDLE_MS)
+}
+
 const submit = (port, id, label, run, { priority = 'normal', transfer = null } = {}) => {
+    // Real work cancels a running prefetch instead of queueing behind it.
+    if (label !== 'prefetch') abortPrefetch()
     const job = {
         id, port, label, run, transfer, client: clients.get(port),
         rank: PRIORITY[priority] ?? PRIORITY.normal, seq: (seq += 1),
@@ -300,9 +351,33 @@ const OPS = {
         return { adopted: ok }
     },
     exportEmbedding: (port, p) => exportEmbedding(p.key),
-    buildEncoder: async () => { await buildEncoder(); return laneState() },
+    // Tab-side heavy work the host cannot observe; gates the weight prefetch.
+    busy: (port, p) => {
+        const c = clients.get(port)
+        if (c) c.busy = !!p?.busy
+        if (anyBusy()) abortPrefetch()
+        else armPrefetch()
+        return { busy: anyBusy() }
+    },
+    // NB: buildEncoder is NOT here — a session build allocates ~1 GB and
+    // compiles the pipeline set, so it takes a queue slot like any other heavy
+    // op. See the submit() branch in handle().
     releaseEncoder: () => { releaseEncoder(); return laneState() },
     releaseDecoder: () => { releaseDecoder(); return laneState() },
+    // Document swap: drop the outgoing embedding's GPU buffers and NOTHING else.
+    // releaseAll here would take the device with it (see lane releaseAll), and a
+    // swap is immediately followed by an encode that has to rebuild all of it.
+    //
+    // Defaults to THIS tab's image, never all of them: one lane is shared across
+    // tabs, so an unscoped drop evicts a sibling tab's resident embedding and
+    // costs it a full re-encode on its next click.
+    releaseEmbedding: (port, p) => {
+        const c = clients.get(port)
+        const key = p?.key ?? c?.imageKey ?? null
+        if (key) releaseEmbedding(key)
+        if (c) c.imageKey = null
+        return laneState()
+    },
 }
 
 const handle = async (port, msg) => {
@@ -368,6 +443,12 @@ const handle = async (port, msg) => {
         submit(port, id, 'warm', async () => { await buildDecoder(); return laneState() })
         return
     }
+    if (op === 'buildEncoder') {
+        // Lowest rank: a speculative pre-build must never delay a real encode
+        // or click that arrives while it is still queued.
+        submit(port, id, 'buildEncoder', async () => { await buildEncoder(); return laneState() }, { priority: 'idle' })
+        return
+    }
     const fn = OPS[op]
     if (!fn) { send(port, { id, ok: false, error: `unknown op: ${op}` }); return }
     if (active && DESTRUCTIVE.has(op)) {
@@ -393,7 +474,7 @@ const handle = async (port, msg) => {
 }
 
 const attach = (port) => {
-    clients.set(port, { id: `t${clients.size + 1}-${Date.now() % 100000}`, visible: true, imageKey: null, label: null })
+    clients.set(port, { id: `t${clients.size + 1}-${Date.now() % 100000}`, visible: true, busy: false, imageKey: null, label: null })
     port.onmessage = (e) => {
         if (e.data?.op === 'bye') { detach(port); return }
         handle(port, e.data)
