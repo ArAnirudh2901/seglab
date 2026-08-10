@@ -178,7 +178,75 @@ Cost is 5 inferences per search instead of 1 — all on one session, in one work
 message, because a worker respawn per tile would dwarf the saving. Measured
 1.6–3.3 s per search, and only on images large enough to need it.
 
-## 7. Cache generation
+## 7. The detector proxy, and its cap
+
+The lane has its own proxy, separate from the interaction frame: `buildFrames`
+re-decodes the ORIGINAL so each tile reaches the detector square at real
+resolution. That decode used to be sized from tile geometry alone — no budget,
+no ceiling, no response to pressure. The one lane that scales with image size
+was the one lane nothing capped.
+
+`detectorPlan` (`js/proxy-plan.js`, beside every other sizing decision) now owns
+it, with **one knob**: `detectorMaxCells`, the number of 640² inferences a search
+may run. Cells are what cost memory, so the grid comes from that budget and the
+source resolution is DERIVED from the grid it bought — two independent numbers
+could disagree and starve an axis. `detectorMaxSide`/`detectorMaxMP` are
+guardrails behind it, not the working limit.
+
+The derived size lands exactly on the geometry it is sizing for, so on a capable
+device the cap never binds:
+
+| grid | cells | derived source | measured `need` |
+|---|---|---|---|
+| 1 (full frame only) | 1 | 640 | 640 |
+| 2 | 5 | 1114 | 1113 |
+| 3 | 10 | 1670 | 1669 |
+
+Corner tiles carry padding on one side only, so they are the smallest cell and
+they set the number: `side × grid / (1 + overlap)`. Below it a tile is *upscaled*
+into its square, which is the resolution floor tiling exists to lift (§6).
+
+Demotion uses signals that cannot be spoofed upward. `memoryGB` 0 means the
+browser would not even guess — WebKit and Gecko ship no `navigator.deviceMemory`,
+and that is the same engine where the governor has no byte API to read
+(`webkit-has-no-byte-api-governor-is-blind`), so nothing downstream can catch
+this lane climbing either.
+
+| device | cells | grid |
+|---|---|---|
+| Chrome desktop, ≥8 GB reported | 10 | 3 |
+| Safari / Firefox (no `deviceMemory`), mobile, ≤4 GB, `gpuTier: basic` | 5 | 2 |
+| ≤2 GB, or no WebGPU (WASM detector, arena only grows) | 1 | full frame |
+| pressure 1–2 / pressure 3 | 5 / 1 | 2 / full frame |
+
+Measured on a 7680×4320 PNG (33 MP), real Chrome, production path:
+
+| stage | before | after (10 cells) | after (5 cells) |
+|---|---|---|---|
+| import | 1342 MB | 1330 MB | 1341 MB |
+| `"car"` peak | 1951 MB | 1939 MB | 1956 MB |
+| absent phrase (escalates) | 2902 ms | 2878 ms | **1233 ms** |
+
+Two things that measurement contradicted, both worth keeping written down:
+
+- **Cells do not drive PEAK memory in the production path.** They drive work.
+  With the worker held across the idle window the session is built once and
+  ORT's pool saturates, so the 3×3 pass reuses the 2×2 pass's buffers. Cell
+  count only showed up as memory under `detectorDispose: 'now'` (+872 MB for
+  grid 3 over grid 2), where every pass rebuilds. The peak is the first search's
+  fixed cost — model parse, session build, CLIP encoder — not the proxy.
+- **`detectorDispose: 'now'` is the wrong companion to a demoted rung.** It does
+  drop the settled floor (1894 → 1407 MB), and terminating the worker is the only
+  true free of the ORT arena. But it makes every later search rebuild the YOLOE
+  session, which raised the peak (1956 → 2069, then 2284 MB) and took 2.9 s →
+  6.2 s. The failure being defended against is an OOM kill, and a kill is decided
+  by the peak.
+
+`detectCandidates` holds the detect worker across the two passes of one search
+(`keepAlive` → `disposeDetector`). Under `dispose: 'now'` an escalated search
+otherwise paid a full session build between its own halves.
+
+## 8. Cache generation
 
 `/models/` is served `immutable, max-age=31536000` *and* held by the service
 worker, so **a model file cannot be updated in place**. Changing

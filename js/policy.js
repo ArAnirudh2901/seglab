@@ -51,6 +51,16 @@ const CONFIG = {
         flagship: false,
         detectorEvictOnEncode: true,
         detectorIdleMs: 120_000,
+        // Text lane ceiling (proxy-plan detectorPlan). Cells are 640² detector
+        // inferences in one pass; 10 = full frame + 3x3, the depth §6 of
+        // DESIGN-TEXT-LANE measured small subjects need. The source decode is
+        // derived from the grid these buy (~1670 px at 3x3), so detectorMaxSide
+        // is a guardrail rather than the working limit — it binds only if the
+        // grid is ever raised. maxMP bounds a square/panorama, where a long-edge
+        // cap alone says nothing about the raster.
+        detectorMaxCells: 10,
+        detectorMaxSide: 2048,
+        detectorMaxMP: 3,
         samWebGPU: true,
         autoEscalate: false,     // interaction-time native re-decode → manual tiers only
         hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
@@ -119,6 +129,32 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         // bounded, so the upload burst is small; segment() still falls back to
         // WASM on any runtime failure, and ?force=wasm / memory pressure override.
         budget.samWebGPU = cap.gpuTier !== 'none'
+        budget.mobile = !!cap.mobile
+        // Text-lane depth, from signals that cannot be spoofed upward (the same
+        // rule capability.js uses: deviceMemory counts DOWNWARD only — a genuine
+        // sub-8 reading demotes, an 8 is the privacy cap and never promotes).
+        // Tiling is what makes small subjects findable, so this is the last
+        // thing to go, not the first: a weak device keeps the 2x2 pass and gives
+        // up only the 3x3 escalation.
+        // memoryGB 0 = the browser would not even guess (WebKit and Gecko ship no
+        // navigator.deviceMemory). That is the same engine where the governor has
+        // no byte API to read, so nothing downstream can catch this lane climbing
+        // either — the shallower pass is the only bound left. Chrome reports a
+        // figure and keeps the full depth.
+        const unmeasurable = cap.memorySource !== 'phosmith' && !cap.memoryGB
+        const weak = cap.mobile || cap.gpuTier === 'basic' || (cap.memoryGB > 0 && cap.memoryGB <= 4)
+        if (weak || unmeasurable) budget.detectorMaxCells = Math.min(budget.detectorMaxCells, 5)
+        // Do NOT also switch this rung to detectorDispose 'now'. It looks like
+        // the obvious companion — terminating the worker is the only true free
+        // of its ORT arena — and measured on this image it does drop the settled
+        // floor 1894 -> 1407 MB. But it makes every later search rebuild the
+        // YOLOE session, which raised the PEAK (1956 -> 2069, then 2284 MB) and
+        // took 2.9 s -> 6.2 s. The failure being defended against is an OOM
+        // kill, and a kill is decided by the peak, not the floor.
+        // No usable WebGPU adapter means the detector falls back to WASM, whose
+        // ORT arena only ever grows and is freed only by terminating the worker.
+        // Every extra cell there is permanent for the life of that worker.
+        if (cap.gpuTier === 'none' || (cap.memoryGB > 0 && cap.memoryGB <= 2)) budget.detectorMaxCells = 1
     }
     budget.memoryLocked = locked
     budget.profileSource = 'single' // kept for telemetry; there is nothing to pick
@@ -206,6 +242,10 @@ export const applyMemoryPressure = (budget, level = 1) => {
         // 293 MB and gives 178 MB of it back on dispose. Demoting under pressure
         // makes swap WORSE, which is the one thing pressure is trying to avoid.
         next.eagerEncode = false
+        // Give up the 3x3 escalation before anything the user can see. It is
+        // the deepest pass (10 inferences vs 5) and it only ever runs after the
+        // 2x2 pass already found nothing.
+        next.detectorMaxCells = Math.min(next.detectorMaxCells || 10, 5)
     }
     if (nextLevel >= 2) {
         next.cropMaxSide = Math.min(next.cropMaxSide || 1280, 1280)
@@ -226,6 +266,11 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.proxyMax = Math.min(next.proxyMax || 768, 768)
         next.proxyShortMax = 0 // give up the per-axis boost before anything visible
         next.displayMax = Math.min(next.displayMax || 1280, 1280)
+        // Full frame only: one 640² inference, and the re-decode that feeds it
+        // shrinks with it (detectorPlan derives the source from the grid).
+        next.detectorMaxCells = 1
+        next.detectorMaxSide = Math.min(next.detectorMaxSide || 768, 768)
+        next.detectorMaxMP = Math.min(next.detectorMaxMP || 1, 1)
         if (next.safeProxyMax) next.safeProxyMax = Math.min(next.safeProxyMax, 768)
     }
     return next

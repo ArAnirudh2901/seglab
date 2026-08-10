@@ -1784,7 +1784,7 @@ async function runDetect(phrase) {
     try {
         // One open-vocabulary lane: the phrase conditions the detector directly,
         // so there is no vocabulary to miss and nothing to fall back to.
-        const res = await detectCandidates(phrase, { idleMs, evict })
+        const res = await detectCandidates(phrase, { idleMs, evict, budget: BUDGET })
         if (revision !== state.revision) return // superseded by newer input
         state.textBackend = res?.backend || null
         refreshChips()
@@ -2691,7 +2691,7 @@ window.__seglab = {
     // raw candidate count + backend for scripted validation.
     testDetect: async (phrase) => {
         try {
-            const res = await detectCandidates(phrase, { idleMs: 0, evict: false })
+            const res = await detectCandidates(phrase, { idleMs: 0, evict: false, budget: BUDGET })
             return res
                 ? { n: res.candidates.length, backend: res.backend, labels: res.candidates.map((c) => c.label).slice(0, 6) }
                 : { n: 0, backend: null }
@@ -2702,7 +2702,7 @@ window.__seglab = {
     testDetectStages: async (phrase) => {
         try {
             const { detectStages } = await import('./text-ui.js')
-            return await detectStages(phrase)
+            return await detectStages(phrase, { budget: BUDGET })
         } catch (err) { return { error: String(err?.message || err) } }
     },
     // Raw detector scores before ranking — separates "phrase unknown" from
@@ -2710,7 +2710,7 @@ window.__seglab = {
     testDetectRaw: async (phrase, threshold = 0.001, slots = null, grid = undefined) => {
         try {
             const { detectRaw } = await import('./text-ui.js')
-            return await detectRaw(phrase, { threshold, slots, ...(grid ? { grid } : {}) })
+            return await detectRaw(phrase, { threshold, slots, budget: BUDGET, ...(grid ? { grid } : {}) })
         } catch (err) { return { error: String(err?.message || err) } }
     },
     // Phrase → 512-d MobileCLIP2 vector, for asserting the open-vocab path

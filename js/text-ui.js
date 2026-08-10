@@ -5,11 +5,12 @@
  * state or DOM here; app.js owns the input, overlay, and selection glue.
  */
 import {
-    clippedEdges, clusterObjects, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, dropClippedDuplicates, letterboxPlan, nms, normalizePhrase, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
+    clippedEdges, clusterObjects, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, dropClippedDuplicates, letterboxPlan, nms, normalizePhrase, rankDetections, scaleBox, shrinkFactor, TILE_OVERLAP, tilePlans, unletterboxBox, YOLOE_INPUT,
 } from './text-core.js'
 import { expandQuery } from './search-taxonomy.js'
 import { getTransform, getBoundedOriginal } from './asset-store.js'
-import { detectText } from './sam-client.js'
+import { detectText, disposeDetector } from './sam-client.js'
+import { detectorPlan } from './proxy-plan.js'
 import { MAX_SLOTS } from './yoloe-detect.js'
 
 /** A ranked detection → an app-facing candidate, tagged with the dominant
@@ -75,10 +76,17 @@ const frameFromSource = (source, plan, rect) => {
 
 /** Frames for every cell in `cells` (each { ox, oy, ow, oh, plan } in ORIGINAL
  *  pixels). ONE bounded decode serves them all — sized so the smallest cell
- *  still fills the detector square, never the full-res original. */
-const buildFrames = async (cells, tf) => {
+ *  still fills the detector square, never the full-res original, and never
+ *  above the budget's ceiling (`plan`, from detectorPlan). The cap is derived
+ *  from the same grid these cells came from, so in the normal case it does not
+ *  bind; it is what stops an unbounded source from reaching the decoder when
+ *  the geometry, the device or the pressure level says otherwise. */
+const buildFrames = async (cells, tf, plan) => {
     const need = Math.ceil(Math.max(...cells.map((c) => c.plan.side * (Math.max(tf.originalW, tf.originalH) / Math.max(c.ow, c.oh)))))
-    const { source, owned } = await getBoundedOriginal({ maxSide: need })
+    const { source, owned } = await getBoundedOriginal({
+        maxSide: Math.min(need, plan.maxSide),
+        maxMP: plan.maxMP,
+    })
     if (!source) return null
     try {
         const kx = source.width / tf.originalW
@@ -93,9 +101,10 @@ const buildFrames = async (cells, tf) => {
 
 /** One detector sweep at `grid` → detections merged into ORIGINAL pixels.
  *  Null when the decode failed; `stale` when a newer request superseded this one. */
-const runPass = async (tf, phrases, fallbackLabel, grid, opts) => {
-    const cells = cellsFor(tf, YOLOE_INPUT, grid)
-    const frames = await buildFrames(cells, tf)
+const runPass = async (tf, phrases, fallbackLabel, grid, budget, opts) => {
+    const plan = planFor(tf, budget, grid)
+    const cells = cellsFor(tf, YOLOE_INPUT, plan)
+    const frames = await buildFrames(cells, tf, plan)
     if (!frames) return null
     const { results, slotNames, backend, stale } = await detectText(frames, phrases, opts)
     if (stale) return { stale: true, mapped: [], backend }
@@ -125,20 +134,29 @@ const focusRequestedColor = (dets, color) => {
         }))
 }
 
-/** Full frame, plus tiles when the photo is far larger than the detector square. */
-const cellsFor = (tf, side, grid = TILE_GRID) => {
+/** The budget's ceiling for this image at the requested grid. */
+const planFor = (tf, budget, grid) => detectorPlan(tf.originalW, tf.originalH, budget || {}, {
+    side: YOLOE_INPUT, overlap: TILE_OVERLAP, grid,
+})
+
+/** Full frame, plus tiles when the photo is far larger than the detector square
+ *  AND the budget affords them (`plan.grid`, which may be below the request). */
+const cellsFor = (tf, side, plan) => {
     const full = {
         ox: 0, oy: 0, ow: tf.originalW, oh: tf.originalH,
         plan: letterboxPlan(tf.originalW, tf.originalH, side),
     }
-    if (shrinkFactor(tf.originalW, tf.originalH, side) < TILE_MIN_SHRINK) return [full]
+    if (plan.grid < 2 || shrinkFactor(tf.originalW, tf.originalH, side) < TILE_MIN_SHRINK) return [full]
     // Keep the full frame: it is the only pass that can see a subject larger
     // than one tile, and it is what big-object phrases already matched on.
-    return [full, ...tilePlans(tf.originalW, tf.originalH, side, { grid })]
+    return [full, ...tilePlans(tf.originalW, tf.originalH, side, { grid: plan.grid, overlap: TILE_OVERLAP })]
 }
 
-/** True when a finer grid still has original detail left to give. */
-const canEscalate = (tf, side) => shrinkFactor(tf.originalW, tf.originalH, side) >= ESCALATE_GRID
+/** True when a finer grid still has original detail left to give AND the budget
+ *  can pay for it — escalating to a grid the plan will clamp back down just
+ *  re-runs the pass that already found nothing. */
+const canEscalate = (tf, side, budget) => shrinkFactor(tf.originalW, tf.originalH, side) >= ESCALATE_GRID
+    && planFor(tf, budget, ESCALATE_GRID).grid >= ESCALATE_GRID
 
 /** Per-cell detections → one list in ORIGINAL pixels, de-duplicated.
  *  `rawBox` and `frame` stay the CELL's, so colour sampling reads the pixels the
@@ -225,12 +243,15 @@ const subjectSlots = (norm) => {
  *  detector's 640² resolution floor" (real scores, just under threshold).
  *  `slots` overrides the slot list, which is how the slot budget above was
  *  measured rather than guessed. */
-export const detectRaw = async (phrase, { threshold = 0.001, slots = null, grid = TILE_GRID } = {}) => {
+export const detectRaw = async (phrase, {
+    threshold = 0.001, slots = null, grid = TILE_GRID, budget = {},
+} = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
-    const cells = cellsFor(tf, YOLOE_INPUT, grid)
-    const frames = await buildFrames(cells, tf)
+    const plan = planFor(tf, budget, grid)
+    const cells = cellsFor(tf, YOLOE_INPUT, plan)
+    const frames = await buildFrames(cells, tf, plan)
     if (!frames) return null
     const phrases = slots?.length ? slots.slice(0, MAX_SLOTS) : slotPhrases(norm)
     const { results, slotNames, backend } = await detectText(frames, phrases, { threshold, idleMs: 0 })
@@ -239,7 +260,8 @@ export const detectRaw = async (phrase, { threshold = 0.001, slots = null, grid 
     return {
         phrases,
         cells: cells.length,
-        grid,
+        grid: plan.grid, // what the budget actually ran, not what was asked for
+        sourceMax: plan.maxSide,
         n: scores.length,
         uniqueBoxes: new Set(flat.map((d) => d.box.map((v) => v.toFixed(4)).join(','))).size,
         afterMerge: mergeCells(results || [], cells, frames, slotNames, norm.objectCore, { w: tf.originalW, h: tf.originalH }).length,
@@ -251,12 +273,13 @@ export const detectRaw = async (phrase, { threshold = 0.001, slots = null, grid 
 /** Every intermediate stage of one detection, in ORIGINAL pixels — diagnostics
  *  only. detectRaw answers "did the detector see it"; this answers "which
  *  ranking stage dropped or truncated the box it saw". */
-export const detectStages = async (phrase, { rankThreshold = 0.08 } = {}) => {
+export const detectStages = async (phrase, { rankThreshold = 0.08, budget = {} } = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
-    const cells = cellsFor(tf, YOLOE_INPUT)
-    const frames = await buildFrames(cells, tf)
+    const plan = planFor(tf, budget, TILE_GRID)
+    const cells = cellsFor(tf, YOLOE_INPUT, plan)
+    const frames = await buildFrames(cells, tf, plan)
     if (!frames) return null
     const phrases = slotPhrases(norm)
     const { results, slotNames } = await detectText(frames, phrases, { threshold: 0.05, idleMs: 0 })
@@ -306,7 +329,9 @@ export const detectStages = async (phrase, { rankThreshold = 0.08 } = {}) => {
  * No label filter and no fallback lane: the detector only ever scores the
  * phrases it was given, so a returned box already IS a match.
  */
-export const detectCandidates = async (phrase, { rankThreshold = 0.08, idleMs = 0, evict = false } = {}) => {
+export const detectCandidates = async (phrase, {
+    rankThreshold = 0.08, idleMs = 0, evict = false, budget = {},
+} = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
@@ -317,15 +342,28 @@ export const detectCandidates = async (phrase, { rankThreshold = 0.08, idleMs = 
     // input's resolution) tops out at 0.091. The head is calibrated enough that
     // a low floor costs no false positives, and `relative` below is the real
     // guard — it drops anything far under the best match in THIS image.
-    const pass = (grid) => runPass(tf, phrases, norm.objectCore, grid, { threshold: 0.05, idleMs, evict })
-    let first = await pass(TILE_GRID)
-    if (!first || first.stale) return null
-    // Nothing cleared the bar — retry finer before answering "not here". A tiny
-    // subject scores under the floor at 2x2 and well over it at 3x3 (ESCALATE_GRID).
-    if (!first.mapped.some((d) => d.score >= rankThreshold) && canEscalate(tf, YOLOE_INPUT)) {
-        const deeper = await pass(ESCALATE_GRID)
-        if (deeper?.stale) return null
-        if (deeper?.mapped.length) first = deeper
+    // An escalation is a SECOND detector pass. Under `detectorDispose: 'now'`
+    // (idleMs 0) the worker is torn down after each one, so the two passes of a
+    // single search would each pay a fresh YOLOE session build. Hold the worker
+    // across the pair and dispose once, at the end.
+    const mayEscalate = canEscalate(tf, YOLOE_INPUT, budget)
+    const hold = mayEscalate && idleMs === 0
+    const pass = (grid, keepAlive = false) => runPass(tf, phrases, norm.objectCore, grid, budget, {
+        threshold: 0.05, idleMs, evict, keepAlive,
+    })
+    let first
+    try {
+        first = await pass(TILE_GRID, hold)
+        if (!first || first.stale) return null
+        // Nothing cleared the bar — retry finer before answering "not here". A tiny
+        // subject scores under the floor at 2x2 and well over it at 3x3 (ESCALATE_GRID).
+        if (!first.mapped.some((d) => d.score >= rankThreshold) && mayEscalate) {
+            const deeper = await pass(ESCALATE_GRID)
+            if (deeper?.stale) return null
+            if (deeper?.mapped.length) first = deeper
+        }
+    } finally {
+        if (hold) disposeDetector() // no-op once the escalated pass disposed it
     }
     const { mapped, backend } = first
     if (mapped.length === 0) return null

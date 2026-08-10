@@ -217,7 +217,12 @@ export const shrinkFactor = (w, h, side = YOLOE_INPUT) => Math.max(w, h) / side
  * least one tile; the caller de-duplicates with NMS after mapping back.
  * Returns [{ ox, oy, ow, oh, plan }] where plan is the cell's own letterbox.
  */
-export const tilePlans = (w, h, side = YOLOE_INPUT, { grid = 2, overlap = 0.15 } = {}) => {
+/** Tile overlap as a fraction of a step. Shared with proxy-plan's detectorPlan,
+ *  which derives the source resolution from the SMALLEST (corner) cell — the
+ *  two must agree or the cap starves the tiles it is sizing for. */
+export const TILE_OVERLAP = 0.15
+
+export const tilePlans = (w, h, side = YOLOE_INPUT, { grid = 2, overlap = TILE_OVERLAP } = {}) => {
     const out = []
     const stepX = w / grid
     const stepY = h / grid

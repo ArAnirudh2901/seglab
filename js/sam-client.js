@@ -414,7 +414,7 @@ const getDetectWorker = () => {
 
 /** One detect on the disposable worker; terminates it after `idleMs` (0 = now —
  *  the true wasm-arena free). Inline fallback when a worker can't be built. */
-const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => {
+const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs, keepAlive = false) => {
     let w = null
     try { w = getDetectWorker() } catch { /* inline below */ }
     if (!w) {
@@ -465,10 +465,18 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => 
         return await withTimeout(roundtrip, timeoutMs, label)
     } finally {
         detectPending.delete(id)
+        // keepAlive: the caller has another pass of the SAME search coming and
+        // will dispose itself. Without it a two-pass (escalated) search under
+        // 'dispose now' rebuilds the whole YOLOE session between its own halves.
+        if (keepAlive) return
         if (idleMs > 0) detectIdleTimer = setTimeout(disposeDetectWorker, idleMs)
         else disposeDetectWorker()
     }
 }
+
+/** Terminate the detect worker now — the only true free of its ORT arena.
+ *  Exported for a caller holding it across the passes of one search. */
+export const disposeDetector = () => disposeDetectWorker()
 
 /**
  * Open-vocabulary detection over a 640² letterboxed RGB frame (`frame.data`
@@ -482,7 +490,9 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => 
  * `evict` drops the SAM embedding first so the two lanes never peak together;
  * `idleMs` (0 = now) sets when the worker is terminated.
  */
-export const detectText = async (frames, phrases, { threshold = 0.25, revision = null, idleMs = 0, evict = false } = {}) => {
+export const detectText = async (frames, phrases, {
+    threshold = 0.25, revision = null, idleMs = 0, evict = false, keepAlive = false,
+} = {}) => {
     if (evict) await releaseDocument()
     const { lookupPhrases, rememberPhrases } = await import('./text-embed-store.js')
     const { hits } = await lookupPhrases(phrases)
@@ -491,7 +501,7 @@ export const detectText = async (frames, phrases, { threshold = 0.25, revision =
         'detect',
         () => callDetectWorker(
             { lane: 'text', frames, phrases, known, threshold },
-            frames.map((f) => f.data.buffer), DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs,
+            frames.map((f) => f.data.buffer), DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs, keepAlive,
         ),
         { priority: 'normal', revision },
     )
