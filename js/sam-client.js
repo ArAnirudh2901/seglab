@@ -284,9 +284,6 @@ export const cycleCandidate = (delta = 1) => {
     return r ? finishSegment(r, null, Date.now()) : null
 }
 
-/** How many candidates are parked for the current selection (0 = none). */
-export const candidateCount = () => sam21Candidates()?.count ?? 0
-
 /**
  * Idle-time image encode. `revision` lets an input event obsolete a queued
  * prewarm before it begins; an already-running kernel still completes safely
@@ -472,11 +469,6 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => 
         else disposeDetectWorker()
     }
 }
-
-/** Terminate the detect worker NOW, reclaiming its wasm arena.
- *  Exported because the SAM lane must call it before an encode — see
- *  encodeImage/segment. */
-export const disposeDetector = () => disposeDetectWorker()
 
 /**
  * Open-vocabulary detection over a 640² letterboxed RGB frame (`frame.data`

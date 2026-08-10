@@ -126,11 +126,3 @@ export const rememberPhrases = async (phrases, vectors) => {
     scheduleFlush()
 }
 
-export const textEmbedCacheSize = () => (cache ? cache.size : 0)
-
-export const clearTextEmbeds = async () => {
-    cache = new Map()
-    loadPromise = Promise.resolve(cache)
-    if (!opfsAvailable()) return
-    try { await (await getDir()).removeEntry(FILE) } catch { /* nothing stored */ }
-}

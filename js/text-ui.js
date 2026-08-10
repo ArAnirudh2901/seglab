@@ -5,7 +5,7 @@
  * state or DOM here; app.js owns the input, overlay, and selection glue.
  */
 import {
-    clippedEdges, collapseToObject, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, dropClippedDuplicates, letterboxPlan, nms, normalizePhrase, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
+    clippedEdges, clusterObjects, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, dropClippedDuplicates, letterboxPlan, nms, normalizePhrase, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
 } from './text-core.js'
 import { expandQuery } from './search-taxonomy.js'
 import { getTransform, getBoundedOriginal } from './asset-store.js'
@@ -285,7 +285,7 @@ export const detectStages = async (phrase, { rankThreshold = 0.08 } = {}) => {
     const afterRelative = above.filter((d) => d.score >= floor)
     const afterNms = nms(afterRelative, 0.5)
     const ranked = rankDetections(focused, { threshold, iou: 0.5, topK: 8, relative: 0.5 })
-    const candidates = norm.multi ? ranked : collapseToObject(ranked)
+    const candidates = norm.multi ? ranked : clusterObjects(ranked)
     return {
         norm: { core: norm.core, objectCore: norm.objectCore, headCore: norm.headCore, multi: norm.multi, color: norm.color },
         original: bounds,
@@ -344,6 +344,6 @@ export const detectCandidates = async (phrase, { rankThreshold = 0.08, idleMs = 
         threshold: norm.color && focused !== mapped ? 0 : rankThreshold,
         iou: 0.5, topK: 8, relative: 0.5,
     }).map((d) => toCandidate(d, kx, ky))
-    const candidates = norm.multi ? ranked : collapseToObject(ranked)
+    const candidates = norm.multi ? ranked : clusterObjects(ranked)
     return { candidates, multi: norm.multi, backend: `yoloe-text:${backend}`, display: norm.display }
 }

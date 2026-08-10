@@ -166,25 +166,31 @@ const sameObject = (a, b, gap) => {
     return false
 }
 
-/** Collapse detector fragments of ONE object into a single box. A singular
- *  phrase means one thing, so grow the top box with every fragment that
- *  belongs to it (transitively) and drop the rest; a distinct second object
- *  stays separate and loses to the top box. */
-export const collapseToObject = (dets, { gap = 1.5 } = {}) => {
+/** Group detector fragments into distinct objects. Fragments of one thing merge
+ *  transitively into a single box; a second object that stays apart is its own
+ *  cluster and is KEPT — several instances of the class the phrase named are all
+ *  answers, not rivals for one slot. Best score first. */
+export const clusterObjects = (dets, { gap = 1.5 } = {}) => {
     if (dets.length <= 1) return dets
     const order = [...dets].sort((p, q) => q.score - p.score)
-    let box = order[0].box.slice()
-    const used = new Set([0])
-    for (let grew = true; grew;) {
-        grew = false
-        for (let i = 1; i < order.length; i += 1) {
-            if (used.has(i) || !sameObject(box, order[i].box, gap)) continue
-            box = boxUnion(box, order[i].box)
-            used.add(i)
-            grew = true
+    const used = new Array(order.length).fill(false)
+    const out = []
+    for (let seed = 0; seed < order.length; seed += 1) {
+        if (used[seed]) continue
+        used[seed] = true
+        let box = order[seed].box.slice()
+        for (let grew = true; grew;) {
+            grew = false
+            for (let i = seed + 1; i < order.length; i += 1) {
+                if (used[i] || !sameObject(box, order[i].box, gap)) continue
+                box = boxUnion(box, order[i].box)
+                used[i] = true
+                grew = true
+            }
         }
+        out.push({ ...order[seed], box })
     }
-    return [{ ...order[0], box }]
+    return out
 }
 
 /** Where a w×h frame sits inside the padded square: scaled by `k` to dw×dh at

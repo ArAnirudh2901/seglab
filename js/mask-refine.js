@@ -324,15 +324,6 @@ export const refineField = (field, rgba, w, h, bbox, {
     return [x0, y0, x1, y1]
 }
 
-/** Rec.601 luma in [0,1] from packed RGBA. */
-export const lumaFromRGBA = (rgba, w, h) => {
-    const out = new Float32Array(w * h)
-    for (let i = 0, j = 0; i < out.length; i += 1, j += 4) {
-        out[i] = (0.299 * rgba[j] + 0.587 * rgba[j + 1] + 0.114 * rgba[j + 2]) / 255
-    }
-    return out
-}
-
 /**
  * Narrow-band alpha (§10 step 3). Inside and outside stay hard; only a strip
  * around the zero crossing gets a soft ramp, so hair and foliage keep a real

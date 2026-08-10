@@ -6,7 +6,7 @@
  * via CDN) with Playwright Chromium through the window.__seglab test hooks.
  *
  * Suites:
- *   T  — pure logic (text-core, edge-refine, capability, policy, sizing)
+ *   T  — pure logic (text-core, capability, policy, sizing)
  *   Q  — heavy-job queue contracts (node-side, no browser)
  *   S  — memory-contract static source scans
  *   A  — lite (memory-locked) browser phases: 1024 proxy, unsafe-flag lockout,
@@ -51,13 +51,12 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import {
-  classifyPixelColor, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
+  classifyPixelColor, clusterObjects, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
 } from './js/text-core.js'
 import {
   buildFacets, expandQuery, labelMatchesQuery, regionOf, suggest,
 } from './js/search-taxonomy.js'
 import { classifyCapability, probeTextLane } from './js/capability.js'
-import { refineMaskEdges } from './js/edge-refine.js'
 import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
 import { decidePressure } from './js/memory-governor.js'
 import { boxFraction, chooseCandidate, cleanRegions, fieldArea, promptFit, stabilityScore } from './js/mask-select.js'
@@ -379,14 +378,14 @@ try {
     { box: [1105, 690, 1420, 900], score: 0.31, label: 'train' }, // rear (gap)
     { box: [1780, 800, 1840, 880], score: 0.2, label: 'train' }, // far small object
   ]
-  const [merged] = collapseToObject(fragments)
-  const twoTrains = collapseToObject([
+  const [merged] = clusterObjects(fragments)
+  const twoTrains = clusterObjects([
     { box: [0, 0, 300, 300], score: 0.5 }, { box: [1400, 0, 1700, 300], score: 0.4 },
   ])
   check(
-    'text-core: singular phrase collapses split fragments, not distinct objects',
+    'text-core: fragments of one object merge; distinct instances are both kept',
     merged.box[0] === 560 && merged.box[2] === 1420 && merged.box[3] === 920
-      && twoTrains.length === 1 && twoTrains[0].box[2] === 300,
+      && twoTrains.length === 2 && twoTrains[0].box[2] === 300 && twoTrains[1].box[0] === 1400,
     `merged=[${merged.box}] distinct kept ${twoTrains.length}`,
   )
 
@@ -574,36 +573,6 @@ try {
     `dom=${dom?.color}`,
   )
 
-  // Edge refiner: boundary-local soft alpha (unchanged contract).
-  const ew = 37
-  const eh = 29
-  const edgeMask = new Uint8ClampedArray(ew * eh * 4)
-  const edgeGuide = new Float32Array(ew * eh)
-  for (let y = 0; y < eh; y += 1) {
-    for (let x = 0; x < ew; x += 1) {
-      const i = y * ew + x
-      const j = i * 4
-      const inside = x >= 9 && x <= 27 && y >= 7 && y <= 22
-      edgeMask[j] = edgeMask[j + 1] = edgeMask[j + 2] = inside ? 255 : 0
-      edgeMask[j + 3] = 255
-      edgeGuide[i] = (x + y) / (ew + eh - 2)
-    }
-  }
-  const edgeBefore = edgeMask.slice()
-  const edgeResult = refineMaskEdges(edgeMask, ew, eh, edgeGuide, { band: 4, radius: 5 })
-  let soft = 0
-  for (let i = 0; i < ew * eh; i += 1) {
-    const v = edgeMask[i * 4]
-    if (v > 0 && v < 255) soft += 1
-  }
-  check(
-    'edge refiner: boundary stays local while producing soft alpha',
-    edgeResult.bandPixels > 0 && soft > 0
-      && edgeMask[(14 * ew + 18) * 4] === edgeBefore[(14 * ew + 18) * 4]
-      && edgeMask[0] === edgeBefore[0],
-    `band=${edgeResult.bandPixels}, soft=${soft}`,
-  )
-
   /* ── Policy: the memory-trust lock ── */
   const gpu = { webgpu: true, f16: true, textureLimit: 16384, storageBufferLimit: 256 * 1024 * 1024 }
   const fourGB = classifyCapability({ ...gpu, browserMemoryGB: 4 })
@@ -625,21 +594,16 @@ try {
     JSON.stringify({ pro: phosmith16GB.profile, ultra: phosmith24GB.profile, src: phosmith16GB.memorySource }),
   )
 
-  /* ── Text lane: refused on WebKit, untouched everywhere else ── */
-  const CHROME = 'Google Inc.'
-  const WEBKIT = 'Apple Computer, Inc.'
+  /* ── Text lane: on everywhere by default, ?text=0 is the only opt-out ── */
   check(
-    'capability: the text lane is refused on WebKit only — Chrome and Firefox are unaffected',
-    probeTextLane('', WEBKIT).ok === false
-      && probeTextLane('', WEBKIT).reason === 'webkit-memory-ceiling'
-      && probeTextLane('', CHROME).ok === true && probeTextLane('', '').ok === true,
-    JSON.stringify({ webkit: probeTextLane('', WEBKIT), chrome: probeTextLane('', CHROME).reason }),
+    'capability: the text lane is on by default on every engine, including WebKit',
+    probeTextLane('').ok === true && probeTextLane('').reason === 'ok',
+    JSON.stringify(probeTextLane('')),
   )
   check(
-    'capability: ?text=1 overrides the WebKit refusal, ?text=0 disables the lane anywhere',
-    probeTextLane('?text=1', WEBKIT).ok === true && probeTextLane('?text=1', WEBKIT).reason === 'forced'
-      && probeTextLane('?text=0', CHROME).ok === false && probeTextLane('?text=0', CHROME).reason === 'disabled',
-    JSON.stringify({ forced: probeTextLane('?text=1', WEBKIT), off: probeTextLane('?text=0', CHROME) }),
+    'capability: ?text=0 disables the lane',
+    probeTextLane('?text=0').ok === false && probeTextLane('?text=0').reason === 'disabled',
+    JSON.stringify(probeTextLane('?text=0')),
   )
 
   const liteDefault = resolveBudget('', browserEightGB)
@@ -1282,7 +1246,7 @@ try {
   await run.enter('S')
   {
     const jsFiles = ['app.js', 'asset-store.js', 'image-io.js', 'capability.js', 'policy.js',
-      'sam-client.js', 'sam-core.js', 'edge-refine.js',
+      'sam-client.js', 'sam-core.js',
       'sam21-lane.js', 'sam21-host.js', 'sam21-client.js', 'sam21-adapter.js',
       'export-hd.js', 'yoloe-detect.js', 'detect-worker.js', 'embed-store.js', 'text-core.js',
       'ort-loader.js', 'search-taxonomy.js', 'mask-refine.js', 'sam21-store.js',

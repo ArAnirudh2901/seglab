@@ -111,6 +111,7 @@ const state = {
     textMulti: false,         // phrase implied "all/every"
     textBackend: null,        // 'detector:device:dtype' that actually ran the last search
     textDriven: false,        // this selection came from a detector box, not a pointer
+    boxDrawn: false,          // state.box came from a drag — only then is it drawn
     mask: null,               // DERIVED: baseMask ∪ liveMask — the composed selection
     maskRaw: null,            // baseMask ∪ live raw decoder mask (E toggle)
     showRaw: false,
@@ -799,12 +800,8 @@ for (const ev of ['pointerdown', 'pointerup', 'keydown', 'wheel']) {
 // Modes where include/exclude applies — via the sign toggle or right/Alt-click.
 const SIGN_MODES = new Set(['click', 'magic', 'color', 'region', 'rect', 'ellipse', 'polygon'])
 
-// Refusing the text lane up front beats letting it run: on WebKit it takes the
-// whole tab with it, and the user loses the image and every mask edit.
 const TEXT_LANE = probeTextLane()
-const TEXT_LANE_REFUSAL = TEXT_LANE.reason === 'disabled'
-    ? 'Text search is switched off for this session (?text=0).'
-    : 'Text search needs more memory than Safari gives a tab — click or box the object instead, or use Chrome for this image.'
+const TEXT_LANE_REFUSAL = 'Text search is switched off for this session (?text=0).'
 if (!TEXT_LANE.ok) {
     els.modes.text.disabled = true
     els.modes.text.title = TEXT_LANE_REFUSAL
@@ -866,6 +863,7 @@ const refreshButtons = () => {
 function clearPrompts() {
     state.clicks = []
     state.box = null
+    state.boxDrawn = false
     state.lasso = null
     state.manual = null
     state.polygonDraft = []
@@ -1404,6 +1402,7 @@ els.overlay.addEventListener('pointerup', (e) => {
         if (Math.abs(x - sx) > 8 && Math.abs(y - sy) > 8) {
             state.manual = null
             state.box = [Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)]
+            state.boxDrawn = true
             state.lasso = null // a box replaces a lasso region
             bumpRevision()
             scheduleRun()
@@ -1798,17 +1797,24 @@ async function runDetect(phrase) {
             return
         }
         state.textMulti = res.multi
-        // Singular phrase, one object: select it outright — no refine, no tap.
-        if (!res.multi && res.candidates.length === 1) {
+        // Every match is the SAME class: the phrase named that class, so all of
+        // them are the answer — take them without asking. Only a mixed-label
+        // result is a real choice, and that falls through to the chips below.
+        const oneClass = new Set(res.candidates.map((c) => c.label)).size === 1
+        if (oneClass) {
             state.textCandidates = res.candidates
             clearRefine()
             els.selectall.hidden = true
-            setStatus(`Selecting “${phrase.trim()}”…`)
-            selectCandidate(0)
+            if (res.candidates.length === 1) {
+                setStatus(`Selecting “${phrase.trim()}”…`)
+                selectCandidate(0)
+            } else {
+                await selectAll(`“${phrase.trim()}”`)
+            }
             return
         }
-        // Several instances: group them into sub-class refine chips (one
-        // detection pass, filtering is free) and show every match to start.
+        // Mixed labels: group them into sub-class refine chips (one detection
+        // pass, filtering is free) and show every match to start.
         setupFacets(res.candidates)
         els.selectall.hidden = state.textCandidates.length < 2
         const n = state.textCandidates.length
@@ -1836,6 +1842,9 @@ const selectCandidate = (i) => {
     const c = state.textCandidates[i]
     if (!c) return
     state.box = c.box.slice()
+    // Kept as a prompt so a later click refines INSIDE the detected object, but
+    // never drawn: the user typed a phrase, they did not drag a box.
+    state.boxDrawn = false
     state.clicks = []
     state.lasso = null
     state.manual = null
@@ -1847,8 +1856,9 @@ const selectCandidate = (i) => {
     scheduleRun()
 }
 
-/** Union every candidate into one mask (multi-instance: "all bottles"). */
-async function selectAll() {
+/** Union every candidate into one mask (multi-instance: "all bottles").
+ *  Never bind straight to an event — arg 1 would be the Event. */
+async function selectAll(noun = 'objects') {
     const boxes = state.textCandidates.map((c) => c.box.slice())
     if (boxes.length === 0 || state.running) return
     bumpRevision()
@@ -1858,7 +1868,7 @@ async function selectAll() {
     clearRefine()
     state.manual = null
     els.selectall.hidden = true
-    setStatus(`Selecting ${boxes.length} objects…`)
+    setStatus(`Selecting ${boxes.length} ${noun}…`)
     try {
         let union = null
         for (const box of boxes) {
@@ -1879,7 +1889,7 @@ async function selectAll() {
         clearLive()
         recomposeMask()
         state.box = null
-        setStatus(`Selected ${boxes.length} objects`)
+        setStatus(`Selected ${boxes.length} ${noun}`)
         renderOverlay()
         refreshButtons()
     } finally {
@@ -2062,7 +2072,7 @@ els.textinput.addEventListener('keydown', (e) => {
 })
 els.textinput.addEventListener('focus', renderAutocomplete)
 els.textinput.addEventListener('blur', () => setTimeout(hideAutocomplete, 120))
-els.selectall.addEventListener('click', selectAll)
+els.selectall.addEventListener('click', () => selectAll())
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
@@ -2124,8 +2134,8 @@ function paintOverlay() {
 
     const markerR = Math.max(4, Math.min(width, height) * 0.009)
 
-    // Persisted box (dashed).
-    if (state.box) {
+    // Persisted box (dashed) — only the one the user dragged.
+    if (state.box && state.boxDrawn) {
         ctx.setLineDash([7, 5])
         ctx.strokeStyle = ACCENT
         ctx.lineWidth = 1.75
@@ -2685,6 +2695,14 @@ window.__seglab = {
             return res
                 ? { n: res.candidates.length, backend: res.backend, labels: res.candidates.map((c) => c.label).slice(0, 6) }
                 : { n: 0, backend: null }
+        } catch (err) { return { error: String(err?.message || err) } }
+    },
+    // Every ranking stage in ORIGINAL px — says which stage dropped, merged or
+    // truncated the box the detector actually saw.
+    testDetectStages: async (phrase) => {
+        try {
+            const { detectStages } = await import('./text-ui.js')
+            return await detectStages(phrase)
         } catch (err) { return { error: String(err?.message || err) } }
     },
     // Raw detector scores before ranking — separates "phrase unknown" from

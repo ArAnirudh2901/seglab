@@ -88,9 +88,6 @@ export const disposeYoloe = () => {
     try { s?.release?.() } catch { /* already gone */ }
 }
 
-export const yoloeLoaded = () => !!session
-export const yoloeBackend = () => backend
-
 /**
  * Detect over `frame` — { data: RGB bytes, width, height } already letterboxed
  * into the 640² square (top-left) by the caller — conditioned on `txtFeats`, a

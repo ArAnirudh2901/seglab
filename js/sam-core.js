@@ -1,73 +1,13 @@
 /**
  * sam-core (pure — no DOM, no model runtime)
  * ----------------------------------------------
- * Prompt/mask math for the on-device segmentation engine: mapping click/box
- * coordinates into the model's reshaped input space, building prompt tensor
- * payloads, picking the best of SAM's three candidate masks, and converting
- * a mask tensor into RGBA. Dependency-free so it can be unit-tested headless.
+ * Prompt/mask math for the on-device segmentation engine: picking the best of
+ * SAM's three candidate masks, mask channel composition, and mapping prompts
+ * into crop space. Dependency-free so it can be unit-tested headless.
  *
- * Coordinate model: SAM resizes the source so its longest side hits the
- * model input size (1024) — `reshaped_input_sizes` is that resized [h, w].
- * Prompts must be expressed in THAT space, while post_process_masks returns
- * masks back in the source's own size. All helpers here take the source
- * dims + reshaped pair so both ends agree on one reference frame.
+ * Prompts reach the decoder in proxy space; sam21-lane owns the scaling into
+ * model-input space, so nothing here needs the reshaped [h, w] pair.
  */
-
-/** Scale one source-space point into reshaped-input space. */
-export const scalePointToReshaped = (x, y, srcW, srcH, reshaped) => [
-    (x * reshaped[1]) / srcW,
-    (y * reshaped[0]) / srcH,
-]
-
-/**
- * Build the point-prompt payload from `[x, y, label]` clicks (label 1 =
- * include, 0 = exclude). Returns plain arrays + dims; the engine wraps them
- * in Tensors (this module stays runtime-free).
- *
- * @param {Array<[number, number, 0|1]>} clicks  source-space clicks
- * @param {number} srcW
- * @param {number} srcH
- * @param {[number, number]} reshaped  [h, w] model-input size
- */
-export const buildPointPrompt = (clicks, srcW, srcH, reshaped) => {
-    if (!Array.isArray(clicks) || clicks.length === 0) return null
-    const n = clicks.length
-    const points = new Float32Array(n * 2)
-    const labels = new BigInt64Array(n)
-    for (let i = 0; i < n; i += 1) {
-        const [x, y, label] = clicks[i]
-        const [rx, ry] = scalePointToReshaped(x, y, srcW, srcH, reshaped)
-        points[i * 2] = rx
-        points[i * 2 + 1] = ry
-        labels[i] = BigInt(label ? 1 : 0)
-    }
-    return {
-        points,
-        pointDims: [1, 1, n, 2],
-        labels,
-        labelDims: [1, 1, n],
-    }
-}
-
-/**
- * Build the box-prompt payload from a source-space `[x0, y0, x1, y1]` box.
- * Also reports the box centre (source space): when the prompt is ONLY a box,
- * the engine adds the centre as a positive click, both because whole-object
- * box selection benefits from an interior anchor and because the
- * transformers.js SAM forward() derives default labels from `input_points`
- * and cannot run point-free.
- */
-export const buildBoxPrompt = (box, srcW, srcH, reshaped) => {
-    if (!Array.isArray(box) || box.length !== 4) return null
-    const [x0, y0, x1, y1] = box
-    const [rx0, ry0] = scalePointToReshaped(Math.min(x0, x1), Math.min(y0, y1), srcW, srcH, reshaped)
-    const [rx1, ry1] = scalePointToReshaped(Math.max(x0, x1), Math.max(y0, y1), srcW, srcH, reshaped)
-    return {
-        box: new Float32Array([rx0, ry0, rx1, ry1]),
-        boxDims: [1, 1, 4],
-        center: [(Math.min(x0, x1) + Math.max(x0, x1)) / 2, (Math.min(y0, y1) + Math.max(y0, y1)) / 2],
-    }
-}
 
 /**
  * Under an ambiguous prompt, a candidate covering ≥ this much of the frame is
@@ -115,25 +55,6 @@ export const maskChannelCoverages = (maskData, width, height, channels) => {
         out[c] = count / size
     }
     return out
-}
-
-/**
- * Extract one channel of a post-processed bool mask tensor ([1, C, H, W],
- * Uint8 0/1 data) as opaque white-on-black RGBA.
- */
-export const maskChannelToRGBA = (maskData, width, height, channel) => {
-    const size = width * height
-    const offset = channel * size
-    const rgba = new Uint8ClampedArray(size * 4)
-    for (let i = 0; i < size; i += 1) {
-        const v = maskData[offset + i] ? 255 : 0
-        const j = i * 4
-        rgba[j] = v
-        rgba[j + 1] = v
-        rgba[j + 2] = v
-        rgba[j + 3] = 255
-    }
-    return rgba
 }
 
 /** Coverage + bbox of a white-on-black RGBA mask (reads the R channel). */
@@ -280,114 +201,6 @@ const labelComponents = (bin, w, h) => {
     return { labels, areas }
 }
 
-/** Component label at (or within `radius` of) a seed point — a positive
- *  click can land a few pixels outside the mask the decoder returned. */
-const labelNearSeed = (labels, w, h, x, y, radius = 16) => {
-    const cx = Math.round(x)
-    const cy = Math.round(y)
-    for (let r = 0; r <= radius; r += 1) {
-        for (let dy = -r; dy <= r; dy += 1) {
-            for (let dx = -r; dx <= r; dx += 1) {
-                if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue // ring only
-                const px = cx + dx
-                const py = cy + dy
-                if (px < 0 || py < 0 || px >= w || py >= h) continue
-                const l = labels[py * w + px]
-                if (l) return l
-            }
-        }
-    }
-    return 0
-}
-
-/**
- * Clean a decoded mask in place:
- *   1. keep components containing (or near) a positive seed;
- *   2. keep unseeded components ≥ 1% of the largest kept one (an object
- *      split in two by an occluder — a bike behind a tree — must survive
- *      even though only one half was clicked);
- *   3. drop the rest (threshold crumbs/islands);
- *   4. fill interior holes below ~1% of the mask area (upsample pinholes) —
- *      big legitimate gaps (background seen through a frame) stay open.
- *
- * @param {Uint8ClampedArray} rgba  white-on-black mask, modified in place
- * @param {Array<[number, number]>} seeds  positive prompt points
- * @returns {{ kept: number, dropped: number, holesFilled: number }}
- */
-export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
-    const size = w * h
-    const bin = new Uint8Array(size)
-    let fgArea = 0
-    for (let i = 0; i < size; i += 1) {
-        if (rgba[i * 4] >= 64) { bin[i] = 1; fgArea += 1 }
-    }
-    if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
-
-    const { labels, areas } = labelComponents(bin, w, h)
-    const keep = new Set()
-    for (const [sx, sy] of seeds) {
-        const l = labelNearSeed(labels, w, h, sx, sy)
-        if (l) keep.add(l)
-    }
-    let largestKept = 0
-    if (keep.size === 0) {
-        // No seed hit anything (box/lasso edge cases) — keep the largest.
-        let best = 1
-        for (let k = 1; k < areas.length; k += 1) if (areas[k] > areas[best - 1]) best = k + 1
-        keep.add(best)
-    }
-    for (const l of keep) largestKept = Math.max(largestKept, areas[l - 1])
-    const minUnseeded = Math.max(16, largestKept * 0.005)
-    for (let k = 0; k < areas.length; k += 1) {
-        if (!keep.has(k + 1) && areas[k] >= minUnseeded) keep.add(k + 1)
-    }
-
-    let dropped = 0
-    for (let i = 0; i < size; i += 1) {
-        if (bin[i] && !keep.has(labels[i])) {
-            bin[i] = 0
-            dropped += 1
-            const j = i * 4
-            rgba[j] = 0
-            rgba[j + 1] = 0
-            rgba[j + 2] = 0
-        }
-    }
-
-    // Hole fill: label the background; components that never touch the
-    // image border are holes — fill the small ones.
-    const inv = new Uint8Array(size)
-    for (let i = 0; i < size; i += 1) inv[i] = bin[i] ? 0 : 1
-    const bg = labelComponents(inv, w, h)
-    const touchesBorder = new Set()
-    for (let x = 0; x < w; x += 1) {
-        if (bg.labels[x]) touchesBorder.add(bg.labels[x])
-        if (bg.labels[(h - 1) * w + x]) touchesBorder.add(bg.labels[(h - 1) * w + x])
-    }
-    for (let y = 0; y < h; y += 1) {
-        if (bg.labels[y * w]) touchesBorder.add(bg.labels[y * w])
-        if (bg.labels[y * w + w - 1]) touchesBorder.add(bg.labels[y * w + w - 1])
-    }
-    const maxHole = Math.max(64, (fgArea - dropped) * 0.01)
-    const fillLabel = new Set()
-    for (let k = 0; k < bg.areas.length; k += 1) {
-        if (!touchesBorder.has(k + 1) && bg.areas[k] <= maxHole) fillLabel.add(k + 1)
-    }
-    let holesFilled = 0
-    if (fillLabel.size) {
-        for (let i = 0; i < size; i += 1) {
-            if (fillLabel.has(bg.labels[i])) {
-                holesFilled += 1
-                const j = i * 4
-                rgba[j] = 255
-                rgba[j + 1] = 255
-                rgba[j + 2] = 255
-            }
-        }
-    }
-    return { kept: keep.size, dropped, holesFilled }
-}
-
 /** Component count of a mask (verify/debug hook). */
 export const countMaskComponents = (rgba, w, h) => {
     const bin = new Uint8Array(w * h)
@@ -424,21 +237,6 @@ export const mapPromptsToCrop = (prompts, proxyToOriginal, rect) => {
         clampPoly,
         clampMargin: (prompts.clampMargin || 0) * proxyToOriginal,
     }
-}
-
-/** IoU of two white-on-black RGBA masks of identical dims (R ≥ 128 = on).
- *  Used to sanity-gate a crop re-decode against the mask the user approved:
- *  a low IoU means the decoder grabbed a different object — distrust it. */
-export const maskIoU = (a, b) => {
-    let inter = 0
-    let union = 0
-    for (let i = 0; i < a.length; i += 4) {
-        const av = a[i] >= 128
-        const bv = b[i] >= 128
-        if (av && bv) inter += 1
-        if (av || bv) union += 1
-    }
-    return union ? inter / union : 0
 }
 
 /**

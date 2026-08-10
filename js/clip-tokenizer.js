@@ -88,8 +88,6 @@ export const loadTokenizer = (progress) => {
     return loadPromise
 }
 
-export const tokenizerLoaded = () => !!encoder
-
 /** Greedy BPE over one pre-tokenized word; `</w>` marks the final symbol. */
 const bpe = (token) => {
     const hit = bpeCache.get(token)

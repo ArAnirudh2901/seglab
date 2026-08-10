@@ -15,7 +15,6 @@
  */
 
 const MIB = 1024 * 1024
-const PROFILES = ['lite', 'standard', 'pro', 'ultra']
 const MODES = new Set(['conservative', 'balanced', 'performance'])
 
 const safeGB = (value, max) => {
@@ -186,27 +185,17 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
 }
 
 /**
- * Text lane availability. The open-vocab lane peaks ~1.6 GB (Chrome, survives);
- * WebKit reaps its web process at ~1.0 GB, taking the tab with it, so on WebKit
- * the lane cannot complete — the mask lane is unaffected and still runs there.
- *
- * The constraint is a per-process ceiling, which exposes no feature to detect,
- * so this tests the *engine*. `navigator.vendor` is the narrowest instrument
- * available: WebKit alone reports "Apple Computer, Inc." — Chrome reports
- * "Google Inc." and Firefox reports "" on every platform, including macOS, so
- * this never catches them. It does correctly catch iOS Chrome/Firefox, which
- * are WebKit underneath and share the ceiling. `?text=1` overrides it (the
- * ceiling may move); `?text=0` disables the lane anywhere.
+ * Text lane availability. Previously refused on WebKit (`navigator.vendor ===
+ * "Apple Computer, Inc."`) on the theory that the lane hit a ~1 GB per-process
+ * ceiling and took the tab with it. Re-measured 2026-08-09: it completes fine
+ * on Safari (peaks ~6.3 GB, tab survives) — see the corrected memory. The
+ * ceiling doesn't exist, so WebKit is no longer refused; `?text=0` still
+ * disables the lane anywhere it isn't wanted.
  */
 export const probeTextLane = (
     search = typeof location !== 'undefined' ? location.search : '',
-    vendor = typeof navigator === 'undefined' ? '' : navigator.vendor,
 ) => {
     const q = new URLSearchParams(search).get('text')
     if (q === '0') return { ok: false, reason: 'disabled' }
-    if (q === '1') return { ok: true, reason: 'forced' }
-    if (String(vendor || '') === 'Apple Computer, Inc.') return { ok: false, reason: 'webkit-memory-ceiling' }
     return { ok: true, reason: 'ok' }
 }
-
-export const RESOURCE_PROFILES = PROFILES

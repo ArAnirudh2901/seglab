@@ -156,17 +156,3 @@ export const clearStore = async () => {
     try { await (await navigator.storage.getDirectory()).removeEntry(DIR, { recursive: true }) } catch { /* absent */ }
 }
 
-export const storeStats = async () => {
-    if (!available()) return { available: false, count: 0, bytes: 0 }
-    try {
-        const dir = await getDir()
-        let count = 0
-        let bytes = 0
-        for await (const [name, handle] of dir.entries()) {
-            if (handle.kind !== 'file' || name.endsWith('.tmp')) continue
-            count += 1
-            bytes += (await handle.getFile()).size
-        }
-        return { available: true, count, bytes }
-    } catch { return { available: false, count: 0, bytes: 0 } }
-}
