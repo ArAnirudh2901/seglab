@@ -13,9 +13,9 @@
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
 import {
-    cancelBefore, clientState, cycleCandidate, detectorResidentMB, disposeDetectorIfIdle, encodeImage,
-    encoderReady, engineState, forgetEncoder, releaseDocument, releaseEmbeddings, segment, subscribe,
-    warmEncoder, warmUp, relievePressure,
+    cancelBefore, candidateShape, clientState, cycleCandidate, detectorResidentMB, disposeDetectorIfIdle,
+    encodeImage, encoderReady, engineState, forgetEncoder, pickCandidate, releaseDocument,
+    releaseEmbeddings, segment, subscribe, warmEncoder, warmUp, relievePressure,
 } from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import {
@@ -128,7 +128,7 @@ const els = {
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipModel: $('chip-model'), chipTiming: $('chip-timing'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
     signtoggle: $('signtoggle'), textwrap: $('textwrap'), textinput: $('textinput'), selectall: $('selectall'),
-    autocomplete: $('autocomplete'), refine: $('refine'),
+    autocomplete: $('autocomplete'), refine: $('refine'), scope: $('scope'),
     toleranceWrap: $('tolerance-wrap'), tolerance: $('tolerance'), toleranceValue: $('tolerance-value'),
     modes: {
         click: $('mode-click'), box: $('mode-box'),
@@ -183,6 +183,9 @@ const state = {
     modelPull: null,          // transient 'sam21 ⬇ 43%' text while weights stream in
     imageEpoch: 0,            // newest requested import; stale queued files never decode
     preprocessEpoch: 0,       // invalidates a queued idle encode on any user input
+    scope: null,              // { count, index, items } SAM's readings of the current click
+    scopeAt: null,            // [x, y] canonical anchor for the scope control
+    ghost: null,              // { alpha, side } coarse preview of a hovered candidate
 }
 
 // Commit bookkeeping for the headless gate: every finished run records
@@ -202,6 +205,9 @@ const bumpRevision = () => {
     // not-yet-started idle encode from jumping ahead of the user's selection.
     state.preprocessEpoch += 1
     clearHdPatch() // a new selection retires the escalation patch
+    // The scope control describes the PREVIOUS result and is anchored at the
+    // previous prompt; the run about to start replaces both.
+    hideScope()
     cancelBefore(state.revision)
 }
 
@@ -1017,21 +1023,125 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'c' || e.key === 'C') cycleSelection(e.shiftKey ? -1 : 1)
 })
 
-function cycleSelection(delta) {
-    if (state.running || !state.liveMask) return
-    const res = cycleCandidate(delta)
-    if (!res) { setStatus('No other candidate for this click'); return }
+/* ─── Scope control — SAM's other readings of the same click ───────────────
+ *
+ * One point on a rose makes "the petal" and "the bloom" equally correct, and
+ * §10a establishes that no ranking rule picks between them: measured on one
+ * click at confidence 0.94, the three candidates covered 1.9 / 6.3 / 13.2 % of
+ * the frame. That is the "it left parts out" complaint, and it is a UI problem
+ * — the right answer was always in memory, reachable only by knowing to press
+ * C. This surfaces the choice at the click, sized so the user can see which is
+ * which before committing to one.
+ *
+ * A repaint, not a decode: picking a candidate re-runs only the post pipeline
+ * over a parked plane. Hovering costs even less — a 256² threshold, no
+ * upsample and no guided filter (sam21-adapter §sam21CandidateShape). */
+
+const hideScope = () => {
+    state.scope = null
+    state.scopeAt = null
+    if (state.ghost) { state.ghost = null; renderOverlay() }
+    if (els.scope) { els.scope.hidden = true; els.scope.replaceChildren() }
+}
+
+/** Anchor the control at the prompt the user actually made. */
+const scopeAnchor = () => {
+    const last = [...state.clicks].reverse().find((c) => c[2] === 1) || state.clicks[state.clicks.length - 1]
+    if (last) return [last[0], last[1]]
+    if (state.box) return [(state.box[0] + state.box[2]) / 2, state.box[3]]
+    return null
+}
+
+const placeScope = () => {
+    if (!state.scopeAt) return
+    const rect = els.overlay.getBoundingClientRect()
+    if (!rect.width) return
+    const k = rect.width / els.overlay.width
+    const x = state.scopeAt[0] * k
+    const y = state.scopeAt[1] * (rect.height / els.overlay.height)
+    const w = els.scope.offsetWidth || 160
+    const h = els.scope.offsetHeight || 28
+    // Clear of the selection, not on it: the control exists to compare shapes,
+    // and a bar parked over the subject hides the evidence. Falls back to the
+    // click when the mask has not been rasterised yet (first paint).
+    const b = layerCache.bounds && layerCache.mask
+        ? [layerCache.bounds[1] * (rect.height / layerCache.mask.height),
+            layerCache.bounds[3] * (rect.height / layerCache.mask.height)]
+        : [y, y]
+    const top = (b[1] + 14 + h < rect.height) ? b[1] + 14
+        : (b[0] - 14 - h > 6 ? b[0] - 14 - h : Math.max(6, Math.min(rect.height - h - 6, y + 18)))
+    els.scope.style.left = `${Math.min(rect.width - w / 2 - 6, Math.max(w / 2 + 6, x))}px`
+    els.scope.style.top = `${top}px`
+}
+
+const previewCandidate = (index) => {
+    state.ghost = index === null ? null : candidateShape(index)
+    renderOverlay()
+}
+
+const renderScope = () => {
+    const info = state.scope
+    if (!els.scope) return
+    // One reading is not a choice, and a committed-only selection has no live
+    // object to re-read. Both mean there is nothing to offer.
+    if (!info || info.count < 2 || !state.liveMask || !state.scopeAt) { hideScope(); return }
+    const frag = document.createDocumentFragment()
+    info.items.forEach((item, i) => {
+        const b = document.createElement('button')
+        b.type = 'button'
+        const pct = item.coverage * 100
+        b.textContent = `${pct < 1 ? pct.toFixed(1) : Math.round(pct)}%`
+        b.title = `${(item.coverage * 100).toFixed(1)}% of the frame · confidence ${item.score.toFixed(2)}`
+        b.setAttribute('aria-pressed', String(i === info.index))
+        b.addEventListener('click', () => selectScope(i))
+        // Hover shows the shape without taking it — the point is to compare.
+        b.addEventListener('pointerenter', () => { if (i !== state.scope?.index) previewCandidate(i) })
+        b.addEventListener('pointerleave', () => previewCandidate(null))
+        b.addEventListener('focus', () => { if (i !== state.scope?.index) previewCandidate(i) })
+        b.addEventListener('blur', () => previewCandidate(null))
+        frag.append(b)
+    })
+    const key = document.createElement('span')
+    key.className = 'scope-key'
+    key.textContent = 'C'
+    key.title = 'C grows the selection, shift+C shrinks it'
+    frag.append(key)
+    els.scope.replaceChildren(frag)
+    els.scope.hidden = false
+    placeScope()
+}
+
+/** Adopt a repainted candidate — shared by the pointer and the C key. */
+const adoptCandidate = (res) => {
+    state.ghost = null
     state.liveMask = res.imageData
     state.liveRaw = res.rawImageData
     state.liveSummary = res.summary
     recomposeMask()
     state.score = res.score
+    state.scope = res.candidates || state.scope
     renderOverlay()
     refreshButtons()
+    renderScope()
     const c = res.candidates
     const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
     setStatus(`Candidate ${(c?.index ?? 0) + 1}/${c?.count ?? 1} — ${(coverage * 100).toFixed(1)}% of frame · C for the next, shift+C for the previous`)
 }
+
+function selectScope(index) {
+    if (state.running || !state.liveMask || index === state.scope?.index) return
+    const res = pickCandidate(index)
+    if (res) adoptCandidate(res)
+}
+
+function cycleSelection(delta) {
+    if (state.running || !state.liveMask) return
+    const res = cycleCandidate(delta)
+    if (!res) { setStatus('No other candidate for this click'); return }
+    adoptCandidate(res)
+}
+
+addEventListener('resize', () => { if (state.scope) placeScope() })
 
 /* ─── Pointer handling ───────────────────────────────────────────────────── */
 
@@ -1191,6 +1301,7 @@ const clearLive = () => {
     state.liveMask = null
     state.liveRaw = null
     state.liveSummary = null
+    hideScope()
 }
 
 const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
@@ -1598,6 +1709,10 @@ async function runNow() {
             state.liveSummary = res.summary
             recomposeMask()
             state.score = res.score
+            // Offer SAM's other readings of this click at the click itself.
+            state.scope = res.candidates || null
+            state.scopeAt = scopeAnchor()
+            renderScope()
             const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
             // The hint is only honest when there is something to cycle TO.
             const more = (res.candidates?.count ?? 1) > 1 ? ' · C for another interpretation' : ''
@@ -2160,10 +2275,20 @@ const getMaskLayers = (mask) => {
     // single crisp line is what tells the user which pixels are actually in.
     const core = new ImageData(width, height)
     const c = core.data
+    // The core's extent, free in this pass — the scope control uses it to sit
+    // clear of the selection instead of on top of the thing being judged.
+    let minX = width; let minY = height; let maxX = -1; let maxY = -1
     for (let i = 0; i < d.length; i += 4) {
         d[i] = 53; d[i + 1] = 224; d[i + 2] = 194
         d[i + 3] = src[i]
-        if (src[i] >= 128) { c[i] = 255; c[i + 1] = 255; c[i + 2] = 255; c[i + 3] = 255 }
+        if (src[i] >= 128) {
+            c[i] = 255; c[i + 1] = 255; c[i + 2] = 255; c[i + 3] = 255
+            const p = i >> 2; const x = p % width; const y = (p - x) / width
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+        }
     }
     const fill = new OffscreenCanvas(width, height)
     fill.getContext('2d').putImageData(img, 0, 0)
@@ -2184,7 +2309,7 @@ const getMaskLayers = (mask) => {
     rc.fillStyle = ACCENT
     rc.fillRect(0, 0, width, height)
 
-    layerCache = { mask, fill, ring }
+    layerCache = { mask, fill, ring, bounds: maxX < 0 ? null : [minX, minY, maxX, maxY] }
     return layerCache
 }
 
@@ -2227,6 +2352,28 @@ function paintOverlay() {
         ctx.drawImage(ring, 0, 0)
         ctx.shadowBlur = 0
         ctx.drawImage(ring, 0, 0) // opaque line on top of its own halo
+        ctx.restore()
+    }
+
+    // Hover preview of another candidate. Field-resolution and smoothed on
+    // purpose: it is a "roughly this much" answer, and pretending otherwise
+    // would cost the post pipeline the hover exists to avoid.
+    if (state.ghost) {
+        const g = state.ghost
+        if (!g.canvas) {
+            const img = new ImageData(g.side, g.side)
+            for (let i = 0; i < g.alpha.length; i += 1) {
+                const o = i * 4
+                img.data[o] = 255; img.data[o + 1] = 214; img.data[o + 2] = 120
+                img.data[o + 3] = g.alpha[i]
+            }
+            g.canvas = new OffscreenCanvas(g.side, g.side)
+            g.canvas.getContext('2d').putImageData(img, 0, 0)
+        }
+        ctx.save()
+        ctx.imageSmoothingEnabled = true
+        ctx.globalAlpha = 0.42
+        ctx.drawImage(g.canvas, 0, 0, width, height)
         ctx.restore()
     }
 
@@ -2354,6 +2501,10 @@ function paintOverlay() {
         ctx.strokeStyle = 'rgba(255,255,255,0.9)'
         ctx.stroke()
     }
+
+    // The scope control is placed off the mask's extent, which only exists once
+    // the layers are rasterised — so re-place it here, after that has happened.
+    if (state.scope && els.scope && !els.scope.hidden) placeScope()
 }
 
 /* ─── Cutout export ──────────────────────────────────────────────────────── */

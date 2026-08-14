@@ -914,6 +914,37 @@ reported rose (`scratchpad/rose.mjs`) it adds 513 px, all of them shadowed
 crevices *inside* the bloom — background to a colour ground truth, part of the
 flower to a human.
 
+### 10d. Showing the three, instead of hiding them behind a key
+
+Arbitration picks the best *default*; it cannot pick the right answer, because
+on an ambiguous click there is no single right answer to pick (§10a). The
+remaining failure is therefore not a math failure — it is that the user has no
+way to know a second reading exists. `C` cycled them, and `C` is a key nobody
+discovers.
+
+The three candidates are already parked in memory, ordered small→large, and
+picking one costs a repaint (upsample + guided filter over a plane that is
+already decoded), not a decode. So the cost of *showing* them is a row of pills:
+`#scope`, one button per candidate, labelled with its coverage of the frame and
+titled with its confidence, `aria-pressed` on the active one. Measured on the
+demo scene: `3% / 6% / 34%`, default 6%, and clicking the 3% pill takes the
+mask from 0.0638 to 0.0304 coverage with no decode.
+
+Two details are what make it usable rather than merely present:
+
+- **Hover previews without taking.** `sam21CandidateShape` thresholds the parked
+  256² field into an alpha plane — no upsample, no guided filter — and the
+  overlay draws it as an amber wash under the live selection. The point is to
+  *compare* before committing, and a preview that paid the post pipeline would
+  cost more than the mistake it prevents.
+- **The bar sits off the mask.** `getMaskLayers` already walks every pixel to
+  build the border core, so it records the core's extent in the same pass; the
+  control is placed below that extent, not below the click. A bar parked on the
+  subject hides the evidence the user opened it to look at.
+
+`C` still works, and the pill row shows it as a hint — the control teaches the
+shortcut rather than replacing it.
+
 ---
 
 ## 11. Configuration collapse
@@ -1056,9 +1087,9 @@ drive on its own. Run them through the dev-browser harness against
 `scripts/dev-server.mjs` on :8788 — COI headers and model caching both depend on
 that server, so a plain static server will not reproduce the conditions.
 
-`verify.mjs` now carries 200 `check()` assertions across 3060 lines, including
+`verify.mjs` now carries 202 `check()` assertions across 3134 lines, including
 both RAW fixture phases. `--fast` runs the three that need no browser (pure
-logic, heavy-job queue, static source scans — 116 assertions) and stops before
+logic, heavy-job queue, static source scans — 118 assertions) and stops before
 the browser phases; those need Playwright's Chromium and the dev server on
 :8788. The profile-related assertions phase 0 was meant to rewrite are gone with
 the presets — what is left refers to the single config.

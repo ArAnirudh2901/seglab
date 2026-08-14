@@ -335,8 +335,18 @@ const orderCandidates = ({ imageKey, canvas, w, h, planes, scores }) => {
     return { imageKey, canvas, w, h, rows, index }
 }
 
-const candidateInfo = () =>
-    (candidates ? { count: candidates.rows.length, index: candidates.index } : null)
+// `items` is what lets the UI show the choice instead of hiding it behind a
+// keystroke: each candidate's share of the frame, in the same small→large order
+// the control moves in. Coverage comes from the parked field (cells above
+// threshold / 256²), so it costs nothing and needs no post pipeline.
+const candidateInfo = () => (candidates ? {
+    count: candidates.rows.length,
+    index: candidates.index,
+    items: candidates.rows.map((r) => ({
+        coverage: r.area / (MASK_SIDE * MASK_SIDE),
+        score: r.score,
+    })),
+} : null)
 
 /**
  * Move to the next/previous candidate and re-run the post pipeline on it.
@@ -347,9 +357,21 @@ const candidateInfo = () =>
 export const sam21Cycle = (delta = 1, imageKey = null) => {
     if (!candidates || candidates.rows.length < 2) return null
     if (imageKey && candidates.imageKey !== imageKey) return null
-    const t0 = performance.now()
     const n = candidates.rows.length
-    candidates.index = (candidates.index + (delta < 0 ? n - 1 : 1)) % n
+    return sam21PickCandidate((candidates.index + (delta < 0 ? n - 1 : 1)) % n, imageKey)
+}
+
+/**
+ * Jump straight to candidate `index` — what a pointer does, where `sam21Cycle`
+ * is what the keyboard does. Same repaint, same contract.
+ */
+export const sam21PickCandidate = (index, imageKey = null) => {
+    if (!candidates || candidates.rows.length < 2) return null
+    if (imageKey && candidates.imageKey !== imageKey) return null
+    const n = candidates.rows.length
+    if (!(index >= 0 && index < n)) return null
+    const t0 = performance.now()
+    candidates.index = index
     const row = candidates.rows[candidates.index]
     const { canvas, w, h } = candidates
     const { rgba, rawRgba, bandPixels } = postProcess(canvas, candidates.imageKey, row.p, w, h)
@@ -374,6 +396,24 @@ export const sam21Cycle = (delta = 1, imageKey = null) => {
 /** How many candidates are parked, and which one is showing. */
 export const sam21Candidates = (imageKey = null) =>
     (candidates && (!imageKey || candidates.imageKey === imageKey) ? candidateInfo() : null)
+
+/**
+ * A candidate's shape at FIELD resolution, for a hover preview — 256² alpha,
+ * thresholded, no upsample and no guided filter.
+ *
+ * Deliberately not `postProcess`: previewing every candidate at full quality
+ * would pay the whole post pipeline (the expensive half of a click) for a mask
+ * the user is only pointing at. A blocky ghost answers "roughly what would I
+ * get" while the exact answer stays one click away.
+ */
+export const sam21CandidateShape = (index, imageKey = null) => {
+    if (!candidates || !(index >= 0 && index < candidates.rows.length)) return null
+    if (imageKey && candidates.imageKey !== imageKey) return null
+    const field = candidates.rows[index].p
+    const alpha = new Uint8ClampedArray(MASK_SIDE * MASK_SIDE)
+    for (let i = 0; i < alpha.length; i += 1) alpha[i] = field[i] > 0 ? 255 : 0
+    return { alpha, side: MASK_SIDE }
+}
 
 let lastField = null
 /** The refined score field behind the current mask, for the export path. */

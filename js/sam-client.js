@@ -18,7 +18,9 @@
 
 import { summarizeMaskRGBA, validateClickMask } from './sam-core.js'
 import { enqueueHeavy, cancelHeavyBefore, onHeavyActivity, STALE } from './heavy-job-queue.js'
-import { sam21Candidates, sam21Cycle, sam21HdCompose, sam21Segment } from './sam21-adapter.js'
+import {
+    sam21Candidates, sam21CandidateShape, sam21Cycle, sam21HdCompose, sam21PickCandidate, sam21Segment,
+} from './sam21-adapter.js'
 import { LANE } from './sam21-lane.js'
 import { noteModel } from './model-registry.js'
 
@@ -286,6 +288,15 @@ export const cycleCandidate = (delta = 1) => {
     const r = sam21Cycle(delta)
     return r ? finishSegment(r, null, Date.now()) : null
 }
+
+/** Same repaint, addressed absolutely — what a pointer on the scope control does. */
+export const pickCandidate = (index) => {
+    const r = sam21PickCandidate(index)
+    return r ? finishSegment(r, null, Date.now()) : null
+}
+
+/** A candidate's coarse shape (256² alpha) for a hover preview. */
+export const candidateShape = (index) => sam21CandidateShape(index)
 
 /**
  * Idle-time image encode. `revision` lets an input event obsolete a queued

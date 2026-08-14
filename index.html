@@ -231,6 +231,45 @@
         touch-action: none;
     }
 
+    /* Scope control — the three readings of one click, anchored near it.
+       Positioned in JS from the click point, clamped inside the stage. */
+    #scope {
+        position: absolute;
+        z-index: 4;
+        display: flex;
+        align-items: stretch;
+        gap: 2px;
+        padding: 3px;
+        border-radius: 999px;
+        background: rgba(12, 15, 20, 0.86);
+        border: 1px solid var(--line);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(6px);
+        transform: translate(-50%, 0);
+        white-space: nowrap;
+    }
+    #scope[hidden] { display: none; }
+    #scope button {
+        font: 500 11px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: var(--dim);
+        background: transparent;
+        border: 0;
+        border-radius: 999px;
+        padding: 5px 9px;
+        cursor: pointer;
+    }
+    #scope button:hover { color: var(--text); background: var(--panel-2); }
+    #scope button[aria-pressed="true"] {
+        color: #06231e;
+        background: var(--accent);
+    }
+    #scope .scope-key {
+        align-self: center;
+        padding: 0 7px 0 5px;
+        color: var(--dim);
+        font: 500 10px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
     /* Import overlay. The spinner animates transform only, so it keeps
        spinning on the compositor even while the main thread is busy. */
     #prep {
@@ -364,6 +403,9 @@
         <canvas id="view"></canvas>
         <canvas id="photo"></canvas>
         <canvas id="overlay"></canvas>
+        <!-- SAM returns several readings of one click (a part, the object, the
+             group it belongs to). Showing them beats hiding them behind C. -->
+        <div id="scope" role="group" aria-label="What this click selected" hidden></div>
     </div>
     <div id="prep" hidden>
         <div class="prep-card">

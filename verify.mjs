@@ -1458,8 +1458,8 @@ try {
       'decode-core.js', 'proxy-plan.js', 'cv-refine-client.js', 'cv-refine-worker.js',
       'raw-develop-client.js', 'raw-develop-worker.js']
     const sources = Object.fromEntries(jsFiles.map((f) => [f, readFileSync(path.join(ROOT, 'js', f), 'utf8')]))
+    sources['index.html'] = readFileSync(path.join(ROOT, 'index.html'), 'utf8')
     const all = Object.values(sources).join('\n') + readFileSync(path.join(ROOT, 'sw.js'), 'utf8')
-      + readFileSync(path.join(ROOT, 'index.html'), 'utf8')
     check('static: no toDataURL in source', !/\btoDataURL\s*\(/.test(all), 'clean')
     check(
       'static: no Python runtime (Pyodide/PyScript/…) and no full OpenCV.js',
@@ -1497,9 +1497,30 @@ try {
       // The fill alone leaves the user guessing which pixels are in; the border
       // is what makes a wrong SAM candidate visible on the first click.
       'static: the selection is drawn with a border, not fill alone',
-      /layerCache = \{ mask, fill, ring \}/.test(sources['app.js'])
+      /layerCache = \{ mask, fill, ring,/.test(sources['app.js'])
         && /drawImage\(ring, 0, 0\)/.test(sources['app.js']),
       'overlay paints a cached ring',
+    )
+    check(
+      // SAM's three readings of one click are a hierarchy, and no ranking rule
+      // resolves a genuinely ambiguous first click (sam21-multimask). The fix
+      // is to SHOW the alternatives; C alone is a key nobody discovers.
+      'static: the candidate hierarchy is surfaced, not hidden behind a key',
+      /id="scope"/.test(sources['index.html'])
+        && /export const sam21CandidateShape/.test(sources['sam21-adapter.js'])
+        && /const renderScope = \(\)/.test(sources['app.js'])
+        && /aria-pressed/.test(sources['app.js']),
+      'the scope control renders one pressable pill per candidate',
+    )
+    check(
+      // Picking a parked plane re-runs post only. A decode here would make the
+      // control cost more than the C key it replaces.
+      'static: picking a candidate is a repaint, not a decode',
+      /sam21PickCandidate/.test(sources['sam-client.js'])
+        && !/decode/i.test(
+          (sources['sam21-adapter.js'].match(/export const sam21PickCandidate[\s\S]{0,600}?\n\}/) || [''])[0],
+        ),
+      'pickCandidate reuses the parked field',
     )
     // The four checks that used to live here all asserted properties of the
     // SlimSAM engine — that it stayed the only lane, that its OPFS persistence
