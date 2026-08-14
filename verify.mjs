@@ -51,7 +51,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import {
-  classifyPixelColor, clusterObjects, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
+  classifyPixelColor, clusterObjects, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, filterToSubject, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
 } from './js/text-core.js'
 import {
   buildFacets, expandQuery, labelMatchesQuery, regionOf, suggest,
@@ -62,6 +62,12 @@ import { decidePressure } from './js/memory-governor.js'
 import { boxFraction, chooseCandidate, cleanRegions, fieldArea, promptFit, stabilityScore } from './js/mask-select.js'
 import { refineField } from './js/mask-refine.js'
 import { getBoundedProxySize, displayPlan, decodeBudgetMP, interactionPlan } from './js/proxy-plan.js'
+import {
+  SHORT_EDGE_LADDER, affordableShortEdge, estimatePostMsPerMP, explainFit, fitLevel, observePost,
+  bandShape, FIXED_SHARE, planMsPerMP, observeBandFraction,
+  savePostFit, loadPostFit, clearPostFit, FIT_TTL_MS,
+  affordableCells, observeDetect, saveDetectMsPerCell, loadDetectMsPerCell,
+} from './js/hardware-fit.js'
 import {
   composeChannels, maskChannelCoverages, maskToChannel, pickBestMask, pointInMask, RUNAWAY_COVERAGE,
 } from './js/sam-core.js'
@@ -319,6 +325,32 @@ try {
         && head('muscari') === null
         && head('a cluster of tightly packed blue florets') === null,
       'plain phrases unchanged',
+    )
+    // Absent subject → nothing. Present subject → the subject ALONE: the five
+    // flowers were false positives in both photos, not only in the one without
+    // a dog, and returning them alongside the dog is the same bug half-fixed.
+    const subject = new Set(['dog', 'beagle'])
+    const scene = [
+      { box: [0, 0, 10, 10], score: 0.4, label: 'the dog sitting among the flowers' },
+      { box: [20, 0, 30, 10], score: 0.3, label: 'flower' },
+      { box: [40, 0, 50, 10], score: 0.3, label: 'flower' },
+    ]
+    check(
+      'text-core: setting-only match returns nothing (no dog → no boxes)',
+      filterToSubject(scene, subject) === null,
+      `${scene.length} setting boxes dropped`,
+    )
+    const withDog = [{ box: [0, 0, 9, 9], score: 0.5, label: 'beagle' }, ...scene]
+    const kept = filterToSubject(withDog, subject)
+    check(
+      'text-core: with the subject present, only the subject is selected',
+      kept?.length === 1 && kept[0].label === 'beagle',
+      `kept ${kept?.map((d) => d.label).join(',')}`,
+    )
+    check(
+      'text-core: a phrase with no subject to separate passes through untouched',
+      filterToSubject(scene, null) === scene,
+      'null subject is identity',
     )
   }
   // A cluster-sized box around two real instances is a group guess, not a
@@ -1074,6 +1106,177 @@ try {
     )
   }
 
+  /* ── hardware-fit: llmfit's judgement adapted to what a page can see. The
+     proxy costs CPU post-processing (60-70% of a warm click) and nothing else —
+     encode/decode are flat in proxy size — so the short edge is spent against a
+     click-latency budget, and a real click replaces the estimate. ── */
+  {
+    const B = { ...PROFILE_PRESETS.standard8, proxyMode: 'auto' }
+    const dims = (w, h, b) => {
+      const p = interactionPlan(w, h, b)
+      return [Math.round(w * p.scale), Math.round(h * p.scale)]
+    }
+    // The whole safety property: an unjudged device is sized exactly as before.
+    check(
+      'fit: no throughput figure changes nothing',
+      affordableShortEdge(B, 1.5) === B.proxyShortMax
+        && affordableShortEdge({ ...B, postBudgetMs: 0, postMsPerMP: 200 }, 1.5) === B.proxyShortMax
+        && affordableShortEdge({ ...B, postMsPerMP: 0 }, 1.5) === B.proxyShortMax
+        && dims(6000, 4000, B)[1] === 1024,
+      'ladder needs BOTH a budget and a rate',
+    )
+    // 105 ms/MP measured on Apple metal-3: 1.57 MP costs 165 ms of a 220 ms
+    // budget, so a capable machine keeps the full per-axis proxy.
+    const fast = { ...B, postMsPerMP: 105 }
+    const [fw, fh] = dims(6000, 4000, fast)
+    check(
+      'fit: a measured-fast device keeps the full 1024 short edge',
+      fw === 1536 && fh === 1024 && explainFit(6000, 4000, fast).fit === 'perfect',
+      JSON.stringify(explainFit(6000, 4000, fast)),
+    )
+    // Mobile estimate (3.0x class penalty, x1.3 headroom = 410 ms/MP).
+    const slow = { ...B, postMsPerMP: estimatePostMsPerMP({ mobile: true, gpuTier: 'accelerated' }).msPerMP }
+    const [sw, sh] = dims(6000, 4000, slow)
+    check(
+      'fit: a slow device walks the ladder down instead of missing the budget',
+      slow.postMsPerMP === 410 && sh === 640 && sw === 960
+        && SHORT_EDGE_LADDER.includes(sh) && explainFit(6000, 4000, slow).fit === 'marginal',
+      JSON.stringify({ msPerMP: slow.postMsPerMP, proxy: [sw, sh] }),
+    )
+    // Penalties overlap (a phone is also weak-GPU, also few-core); compounding
+    // them would multiply one device class into a rate nothing measured.
+    const est = estimatePostMsPerMP({ mobile: true, integratedGPU: true, logicalProcessors: 4, gpuTier: 'basic' })
+    check(
+      'fit: overlapping class penalties take the worst, never the product',
+      est.penalty === 3.0 && est.reasons.length === 5 && est.msPerMP === 410,
+      JSON.stringify(est),
+    )
+    // Bands are one-sided: surplus cannot buy quality above the encoder's edge.
+    check(
+      'fit: bands run perfect/good/marginal/tight and only the top bound binds',
+      fitLevel(0.4) === 'perfect' && fitLevel(0.9) === 'good'
+        && fitLevel(1.2) === 'marginal' && fitLevel(1.4) === 'tight' && fitLevel(0) === 'perfect',
+      'one-sided utilisation',
+    )
+    // Two terms, because the measurement has two: a fixed cost per PROXY
+    // megapixel (upsample + full-frame matte) and a variable one per REFINED
+    // megapixel (guided filter + band re-matte). Measured 2026-08-14 over a
+    // 12-point click grid: the same 1.376 MP proxy cost 12.2 ms for a 9.7 kpx
+    // band and 52.6 ms for a frame-spanning one — a 4.3x spread that a
+    // one-quantity ms/MP figure would have charged to the machine.
+    check(
+      'fit: cost shape splits the fixed per-proxy half from the per-band half',
+      Math.abs(bandShape(1) - 1) < 1e-9 && Math.abs(bandShape(0) - FIXED_SHARE) < 1e-9
+        && Math.abs(bandShape(0.5) - 0.61) < 1e-9
+        && bandShape(-1) === FIXED_SHARE && bandShape(4) === 1,
+      JSON.stringify({ full: bandShape(1), none: bandShape(0), half: bandShape(0.5) }),
+    )
+    // The measured rate is a DEVICE constant: the same 12 clicks, normalised
+    // through the shape, return 37-39 ms/MP across a 140x range of band area.
+    const sameDevice = [
+      observePost(0, 12.2, 1.376, 0.0071),  // 9.7 kpx band
+      observePost(0, 18.7, 1.376, 0.1864),  // 257 kpx
+      observePost(0, 52.6, 1.376, 1),       // the whole frame
+    ]
+    check(
+      'fit: one device measures one rate whatever the click selected',
+      Math.max(...sameDevice) - Math.min(...sameDevice) <= 6
+        && sameDevice.every((r) => r >= 33 && r <= 45),
+      JSON.stringify({ rates: sameDevice }),
+    )
+    // A click that never reported its band is DROPPED, not guessed at: charging
+    // a compact selection to the machine reports it ~4.5x slower than it is.
+    check(
+      'fit: a click with no band measurement cannot move the rate',
+      observePost(105, 189, 1.8, 0) === 105 && observePost(105, 189, 0, 1) === 105
+        && observePost(105, 0, 1.8, 1) === 105 && observePost(0, 189, 1.8, 0) === 0,
+      'unnormalisable samples are dropped',
+    )
+    // Rate averages honestly (the scene bias moved to the fraction); the
+    // FRACTION is what keeps its asymmetry — clicks are whatever the user
+    // selected, so the cheap majority must not re-authorise a proxy the next
+    // frame-spanning selection cannot pay for.
+    let frac = observeBandFraction(0, 1)
+    for (let i = 0; i < 4; i += 1) frac = observeBandFraction(frac, 0.02)
+    check(
+      'fit: a wide band is believed at once, a narrow one has to repeat',
+      observeBandFraction(0.1, 1) === 0.55 && frac > 0.35 && frac < 0.7
+        && observeBandFraction(0.4, 0) === 0.4 && observeBandFraction(0.2, 9) === 0.6,
+      JSON.stringify({ widened: observeBandFraction(0.1, 1), after4Narrow: frac }),
+    )
+    // Planning uses the band this device actually refines; unknown = worst case,
+    // so a first click is never sized on a cheap selection it has not made yet.
+    check(
+      'fit: an unmeasured band plans for the full frame',
+      planMsPerMP({ postMsPerMP: 100 }) === 100
+        && planMsPerMP({ postMsPerMP: 100, postBandFraction: 0.5 }) === 61
+        && planMsPerMP({ postMsPerMP: 0, postBandFraction: 0.5 }) === 0,
+      'fraction 1 until measured',
+    )
+    // A judged panorama is still bounded by the long-edge and pixel caps.
+    const [pw2, ph2] = dims(8000, 1000, slow)
+    check(
+      'fit: judgement never widens a panorama past the existing caps',
+      pw2 <= B.proxyLongMax && pw2 * ph2 <= B.proxyPixelMax,
+      JSON.stringify({ pano: [pw2, ph2] }),
+    )
+    /* The stored judgement EXPIRES. It describes the machine as it was that day
+       — on battery, throttled, sharing the CPU — and the fit only ratchets
+       downward, so without a stop a bad afternoon would follow a laptop for
+       weeks. Node has no localStorage; a Map stub is enough to exercise it. */
+    {
+      const store = new Map()
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k),
+      }
+      const now = Date.now()
+      savePostFit({ msPerMP: 88, bandFraction: 0.4 }, now)
+      const fresh = loadPostFit(now + 60_000)
+      const stale = loadPostFit(now + FIT_TTL_MS + 1)
+      store.set('seglab.postfit', JSON.stringify({ r: 4, f: 0.4, t: now }))
+      const absurd = loadPostFit(now)
+      store.set('seglab.postfit', 'not json')
+      const junk = loadPostFit(now)
+      savePostFit({ msPerMP: 88, bandFraction: 0.4 }, now)
+      clearPostFit()
+      check(
+        'fit: the stored measurement survives a reload, expires, and refuses junk',
+        fresh?.msPerMP === 88 && fresh.bandFraction === 0.4
+          && stale === null && absurd === null && junk === null && loadPostFit(now) === null,
+        JSON.stringify({ fresh, staleAfterDays: FIT_TTL_MS / 86_400_000 }),
+      )
+      /* Detector lane: the same judgement on the axis a stopwatch can see. It
+         clamps the memory-derived cell cap, never raises it — an ORT arena
+         cannot be timed, so that cap stays with the class signals in policy. */
+      const cellB = { ...PROFILE_PRESETS.standard8 }
+      const cells = (msPerCell) => affordableCells({ ...cellB, detectorMsPerCell: msPerCell })
+      check(
+        'fit: measured per-cell latency reproduces the tile rungs',
+        affordableCells(cellB) === Infinity && affordableCells({ ...cellB, detectorBudgetMs: 0, detectorMsPerCell: 140 }) === Infinity
+          && cells(140) >= 10 && cells(420) >= 5 && cells(420) < 10 && cells(900) < 5 && cells(9000) === 1,
+        JSON.stringify({ ref: cells(140), slow: cells(420), verySlow: cells(900) }),
+      )
+      const cheap = observeDetect(0, 1400, 10)
+      check(
+        'fit: a slow search is believed at once, a fast one has to repeat',
+        cheap === 140 && observeDetect(140, 4200, 5) === 490
+          && observeDetect(140, 100, 5) < 140 && observeDetect(140, 0, 5) === 140,
+        JSON.stringify({ seeded: cheap, spike: observeDetect(140, 4200, 5) }),
+      )
+      saveDetectMsPerCell(240, now)
+      const cellFresh = loadDetectMsPerCell(now + 1000)
+      const cellStale = loadDetectMsPerCell(now + FIT_TTL_MS + 1)
+      check(
+        'fit: the detector measurement persists and expires on the same clock',
+        cellFresh === 240 && cellStale === 0,
+        JSON.stringify({ cellFresh, cellStale }),
+      )
+      delete globalThis.localStorage
+    }
+  }
+
   /* ── Display formula: viewport-anchored, decode-budget-gated ── */
   const liteB = { ...PROFILE_PRESETS.standard8 }
   const vp = { w: 1728, h: 1117, dpr: 2 }
@@ -1249,7 +1452,7 @@ try {
       'sam-client.js', 'sam-core.js',
       'sam21-lane.js', 'sam21-host.js', 'sam21-client.js', 'sam21-adapter.js',
       'export-hd.js', 'yoloe-detect.js', 'detect-worker.js', 'embed-store.js', 'text-core.js',
-      'ort-loader.js', 'search-taxonomy.js', 'mask-refine.js', 'sam21-store.js',
+      'ort-loader.js', 'gpu-adapter.js', 'search-taxonomy.js', 'mask-refine.js', 'sam21-store.js',
       'text-encode.js', 'clip-tokenizer.js', 'text-embed-store.js',
       'text-ui.js', 'image-raw.js', 'heavy-job-queue.js', 'decode-worker.js', 'decode-client.js',
       'decode-core.js', 'proxy-plan.js', 'cv-refine-client.js', 'cv-refine-worker.js',
@@ -1270,6 +1473,33 @@ try {
         && /ensureWarm\(\)/.test(sources['app.js'])
         && !/^bootProbe\.then\(\(\) => warmUp/m.test(sources['app.js']),
       'app.js warms post-import only',
+    )
+    // WebKit ships no byte-level memory API, so the allocation ledger is the
+    // governor's ONLY input there. The text lane runs in its own worker with
+    // its own ORT arena and was absent from that ledger entirely — the one
+    // engine with no measurement was also blind to the heaviest lane.
+    check(
+      'static: the ledger counts the text lane (the only governor input on WebKit)',
+      /mb \+= detectorResidentMB\(\)/.test(sources['app.js'])
+        && /export const detectorResidentMB/.test(sources['sam-client.js']),
+      'detect worker residency is in estimateFootprintMB',
+    )
+    check(
+      // Terminating mid-detection rejects the in-flight call, which the user
+      // reads as a failed search rather than as memory relief.
+      'static: a shed frees the detect worker only when it is idle',
+      /disposeDetectorIfIdle\(\)/.test(sources['app.js'])
+        && !/[^f]\bdisposeDetector\(\)/.test(sources['app.js'])
+        && /if \(!detectWorker \|\| detectPending\.size\) return false/.test(sources['sam-client.js']),
+      'shedMemory uses the idle-guarded dispose',
+    )
+    check(
+      // The fill alone leaves the user guessing which pixels are in; the border
+      // is what makes a wrong SAM candidate visible on the first click.
+      'static: the selection is drawn with a border, not fill alone',
+      /layerCache = \{ mask, fill, ring \}/.test(sources['app.js'])
+        && /drawImage\(ring, 0, 0\)/.test(sources['app.js']),
+      'overlay paints a cached ring',
     )
     // The four checks that used to live here all asserted properties of the
     // SlimSAM engine — that it stayed the only lane, that its OPFS persistence
@@ -1721,6 +1951,57 @@ try {
     sDot.maskSummary && bDot[0] <= geo.dot.x * p && geo.dot.x * p <= bDot[2] && sDot.maskSummary.coverage < dotFrac * 40,
     `coverage ${((sDot.maskSummary?.coverage || 0) * 100).toFixed(2)}% (dot ${(dotFrac * 100).toFixed(3)}%)`,
   )
+
+  /* ── I2: click → first mask paint stays inside the device's click budget.
+     The invariant used to be a claim in the design doc against a number nothing
+     read (50 ms, measured 240-350). This is the gate: real clicks, real
+     post-processing, over objects of deliberately different band size — the
+     quantity postMs actually scales with. Median, not max: one scheduling
+     hiccup on a shared CI box is not a broken invariant, so the max gets a
+     looser bound and is reported either way. ── */
+  {
+    const points = [
+      { x: geo.disc.x * p, y: geo.disc.y * p },
+      { x: (geo.square.x + geo.square.w / 2) * p, y: (geo.square.y + geo.square.h / 2) * p },
+      { x: geo.dot.x * p, y: geo.dot.y * p },
+      { x: geo.disc.x * p, y: geo.disc.y * p },
+      { x: geo.dot.x * p, y: geo.dot.y * p },
+    ]
+    const gate = await page.evaluate(async (pts) => {
+      const runs = []
+      for (const pt of pts) {
+        window.__seglab.reset()
+        const s = await window.__seglab.clickAt(pt.x, pt.y)
+        const r = s.lastRun || {}
+        runs.push({ postMs: r.postMs || 0, bandPixels: r.bandPixels || 0, encoded: !!r.encoded })
+      }
+      return { runs, fit: window.__seglab.hardwareFit(), budget: await window.__seglab.resourceBudget() }
+    }, points)
+    const warm = gate.runs.filter((r) => !r.encoded && r.postMs > 0)
+    const times = warm.map((r) => r.postMs).sort((a, b) => a - b)
+    const median = times[Math.floor(times.length / 2)] || 0
+    const worst = times[times.length - 1] || 0
+    const budgetMs = gate.fit.postBudgetMs || 220
+    check(
+      `I2: post-processing holds the click budget over ${warm.length} clicks (${budgetMs} ms)`,
+      warm.length >= 4 && median > 0 && median <= budgetMs && worst <= budgetMs * 2,
+      `median ${median.toFixed(1)}ms, worst ${worst.toFixed(1)}ms of ${budgetMs}ms — [${times.map((t) => t.toFixed(0)).join(', ')}]`,
+    )
+    // The gate is only meaningful if the cost model got its normaliser: postMs
+    // without the band it was spent on cannot be attributed to the device.
+    check(
+      'I2: every warm click reports the band it refined, and benches the device',
+      warm.length > 0 && warm.every((r) => r.bandPixels > 0)
+        && gate.budget.postMsPerMPSource === 'measured'
+        && gate.fit.bandFraction > 0 && gate.fit.bandFraction <= 1,
+      JSON.stringify({
+        bands: warm.map((r) => r.bandPixels),
+        msPerMP: gate.fit.fullBandMsPerMP,
+        fraction: gate.fit.bandFraction,
+        source: gate.budget.postMsPerMPSource,
+      }),
+    )
+  }
 
   // Lasso clamp.
   await page.evaluate(() => window.__seglab.reset())

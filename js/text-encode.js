@@ -21,6 +21,7 @@
  */
 
 import { CONTEXT, EOT, loadTokenizer, tokenize } from './clip-tokenizer.js'
+import { webgpuWorthTrying } from './gpu-adapter.js'
 import { loadOrt } from './ort-loader.js'
 
 export const DIM = 512
@@ -59,7 +60,9 @@ const embedTokens = async (tokens, progress) => {
 
 const buildSession = async (ort) => {
     let lastErr
-    for (const ep of ['webgpu', 'wasm']) {
+    // Skip a software adapter: it builds and then runs slower than WASM.
+    const eps = (await webgpuWorthTrying()) ? ['webgpu', 'wasm'] : ['wasm']
+    for (const ep of eps) {
         try {
             return {
                 session: await ort.InferenceSession.create(modelURL, {

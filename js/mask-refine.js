@@ -39,41 +39,63 @@
  */
 const CHROMA_EPS = 3
 
-/** Summed-area table of `src` (w×h) into a (w+1)×(h+1) Float64Array.
- *  f64 because a 1024² field of ~10-magnitude logits overflows f32 precision
- *  well before the corner. */
-const integral = (src, w, h) => {
-    const S = new Float64Array((w + 1) * (h + 1))
+/**
+ * Box mean of radius r — two separable running-sum passes, O(1) per pixel.
+ *
+ * Was a summed-area table. A SAT needs f64 (a 1024² plane of ~10-magnitude
+ * logits overflows f32 well before the corner) and a whole extra (w+1)(h+1)
+ * plane, and the filter calls this 17 times per click. The running window never
+ * accumulates more than 2r+1 terms, so f32 is exact enough and the table is
+ * gone. At the shipped settings (radius 8, scale 4) r is 2 — a 5-tap window.
+ *
+ * `tmp` is the horizontal intermediate; pass one in to reuse it across calls.
+ * Edge windows divide by their own clipped width/height, so no border darkening
+ * — same rule the SAT used.
+ */
+const boxMean = (src, w, h, r, tmp = new Float32Array(w * h)) => {
+    const out = new Float32Array(w * h)
+    // Clipped-window width depends only on x, so the division leaves the hot
+    // loop entirely — it was the most expensive instruction in it.
+    const invW = new Float32Array(w)
+    for (let x = 0; x < w; x += 1) {
+        invW[x] = 1 / ((x + r >= w ? w - 1 : x + r) - (x - r < 0 ? 0 : x - r) + 1)
+    }
     for (let y = 0; y < h; y += 1) {
-        let run = 0
         const row = y * w
-        const out = (y + 1) * (w + 1)
-        const prev = y * (w + 1)
+        let sum = 0
+        for (let x = 0, e = r < w ? r : w - 1; x <= e; x += 1) sum += src[row + x]
         for (let x = 0; x < w; x += 1) {
-            run += src[row + x]
-            S[out + x + 1] = S[prev + x + 1] + run
+            tmp[row + x] = sum * invW[x]
+            const add = x + r + 1
+            if (add < w) sum += src[row + add]
+            if (x >= r) sum -= src[row + x - r]
         }
     }
-    return S
-}
-
-/** Box mean of radius r, O(1) per pixel from the SAT. Edges use the clipped
- *  window's own area, so no darkening at the border. */
-const boxMean = (src, w, h, r) => {
-    const S = integral(src, w, h)
-    const out = new Float32Array(w * h)
-    const W = w + 1
+    // Column sums advance a row at a time, so the vertical pass still reads
+    // sequentially — a per-column loop would stride the whole plane w times.
+    const col = new Float32Array(w)
+    for (let y = 0, e = r < h ? r : h - 1; y <= e; y += 1) {
+        const row = y * w
+        for (let x = 0; x < w; x += 1) col[x] += tmp[row + x]
+    }
     for (let y = 0; y < h; y += 1) {
-        const y0 = y - r < 0 ? 0 : y - r
-        const y1 = y + r + 1 > h ? h : y + r + 1
-        const rowT = y0 * W
-        const rowB = y1 * W
+        const inv = 1 / ((y + r >= h ? h - 1 : y + r) - (y - r < 0 ? 0 : y - r) + 1)
         const dst = y * w
-        for (let x = 0; x < w; x += 1) {
-            const x0 = x - r < 0 ? 0 : x - r
-            const x1 = x + r + 1 > w ? w : x + r + 1
-            const sum = S[rowB + x1] - S[rowB + x0] - S[rowT + x1] + S[rowT + x0]
-            out[dst + x] = sum / ((y1 - y0) * (x1 - x0))
+        // Emit, advance and retire in one traversal; three separate loops over
+        // the row read `col` three times for no reason.
+        const addRow = y + r + 1 < h ? (y + r + 1) * w : -1
+        const subRow = y >= r ? (y - r) * w : -1
+        if (addRow >= 0 && subRow >= 0) {
+            for (let x = 0; x < w; x += 1) {
+                out[dst + x] = col[x] * inv
+                col[x] += tmp[addRow + x] - tmp[subRow + x]
+            }
+        } else if (addRow >= 0) {
+            for (let x = 0; x < w; x += 1) { out[dst + x] = col[x] * inv; col[x] += tmp[addRow + x] }
+        } else if (subRow >= 0) {
+            for (let x = 0; x < w; x += 1) { out[dst + x] = col[x] * inv; col[x] -= tmp[subRow + x] }
+        } else {
+            for (let x = 0; x < w; x += 1) out[dst + x] = col[x] * inv
         }
     }
     return out
@@ -100,6 +122,39 @@ const downsample = (src, w, h, s, dw, dh) => {
     return out
 }
 
+/** The same downsample over four planes in ONE traversal. The colour filter
+ *  reduces three guide channels and the field together, and four separate calls
+ *  walk the same full-res block four times. */
+const downsample4 = (a, b, c, d, w, h, s, dw, dh) => {
+    const oa = new Float32Array(dw * dh)
+    const ob = new Float32Array(dw * dh)
+    const oc = new Float32Array(dw * dh)
+    const od = new Float32Array(dw * dh)
+    for (let y = 0; y < dh; y += 1) {
+        const y0 = y * s
+        const y1 = Math.min(h, y0 + s)
+        const drow = y * dw
+        for (let x = 0; x < dw; x += 1) {
+            const x0 = x * s
+            const x1 = Math.min(w, x0 + s)
+            let sa = 0, sb = 0, sc = 0, sd = 0
+            for (let yy = y0; yy < y1; yy += 1) {
+                const row = yy * w
+                for (let xx = x0; xx < x1; xx += 1) {
+                    const i = row + xx
+                    sa += a[i]; sb += b[i]; sc += c[i]; sd += d[i]
+                }
+            }
+            const inv = 1 / ((y1 - y0) * (x1 - x0))
+            oa[drow + x] = sa * inv
+            ob[drow + x] = sb * inv
+            oc[drow + x] = sc * inv
+            od[drow + x] = sd * inv
+        }
+    }
+    return [oa, ob, oc, od]
+}
+
 /** Bilinear upsample of a coefficient plane back to w×h. */
 const upsample = (src, dw, dh, w, h) => {
     const out = new Float32Array(w * h)
@@ -120,6 +175,58 @@ const upsample = (src, dw, dh, w, h) => {
             const wx = fx - x0
             out[dst + x] = (src[r0 + x0] * (1 - wx) + src[r0 + x1] * wx) * (1 - wy)
                 + (src[r1 + x0] * (1 - wx) + src[r1 + x1] * wx) * wy
+        }
+    }
+    return out
+}
+
+/**
+ * Upsample the four coefficient planes and composite them against the guide in
+ * ONE full-res pass: out = ar·R + ag·G + ab·B + b.
+ *
+ * Materialising each plane at w×h first meant four Float32Array(w·h) allocations
+ * and five passes over the largest buffers in the filter — and at scale 4 the
+ * full-res half is 16x the area of the coefficient half, so it dominated.
+ * Bilinear weights are shared across all four reads.
+ */
+const compositeUp = (ar, ag, ab, b, dw, dh, R, G, B, w, h) => {
+    const out = new Float32Array(w * h)
+    const sx = dw / w
+    const sy = dh / h
+    // Column geometry repeats on every row — hoisting it takes three Math calls
+    // and a floor out of the largest inner loop in the filter.
+    const cx0s = new Int32Array(w)
+    const cx1s = new Int32Array(w)
+    const wxs = new Float32Array(w)
+    for (let x = 0; x < w; x += 1) {
+        const fx = Math.min(dw - 1, Math.max(0, (x + 0.5) * sx - 0.5))
+        const c0 = Math.floor(fx)
+        cx0s[x] = c0
+        cx1s[x] = Math.min(dw - 1, c0 + 1)
+        wxs[x] = fx - c0
+    }
+    for (let y = 0; y < h; y += 1) {
+        const fy = Math.min(dh - 1, Math.max(0, (y + 0.5) * sy - 0.5))
+        const cy0 = Math.floor(fy)
+        const cy1 = Math.min(dh - 1, cy0 + 1)
+        const wy = fy - cy0
+        const r0 = cy0 * dw
+        const r1 = cy1 * dw
+        const dst = y * w
+        for (let x = 0; x < w; x += 1) {
+            const cx0 = cx0s[x]
+            const cx1 = cx1s[x]
+            const wx = wxs[x]
+            const w00 = (1 - wx) * (1 - wy)
+            const w10 = wx * (1 - wy)
+            const w01 = (1 - wx) * wy
+            const w11 = wx * wy
+            const i00 = r0 + cx0, i10 = r0 + cx1, i01 = r1 + cx0, i11 = r1 + cx1
+            const j = dst + x
+            out[j] = (ar[i00] * w00 + ar[i10] * w10 + ar[i01] * w01 + ar[i11] * w11) * R[j]
+                + (ag[i00] * w00 + ag[i10] * w10 + ag[i01] * w01 + ag[i11] * w11) * G[j]
+                + (ab[i00] * w00 + ab[i10] * w10 + ab[i01] * w01 + ab[i11] * w11) * B[j]
+                + (b[i00] * w00 + b[i10] * w10 + b[i01] * w01 + b[i11] * w11)
         }
     }
     return out
@@ -205,13 +312,13 @@ export const guidedFilterColor = (p, R, G, B, w, h, {
     const r = Math.max(1, Math.round(radius / s))
     const n = dw * dh
 
-    const dr = s > 1 ? downsample(R, w, h, s, dw, dh) : R
-    const dg = s > 1 ? downsample(G, w, h, s, dw, dh) : G
-    const db = s > 1 ? downsample(B, w, h, s, dw, dh) : B
-    const P = s > 1 ? downsample(p, w, h, s, dw, dh) : p
+    const [dr, dg, db, P] = s > 1
+        ? downsample4(R, G, B, p, w, h, s, dw, dh)
+        : [R, G, B, p]
 
     const t = new Float32Array(n)
-    const mean = (src) => boxMean(src, dw, dh, r)
+    const scratch = new Float32Array(n)   // boxMean's horizontal pass, 17 reuses
+    const mean = (src) => boxMean(src, dw, dh, r, scratch)
     const prod = (a, b) => { for (let i = 0; i < n; i += 1) t[i] = a[i] * b[i]; return mean(t) }
 
     const mr = mean(dr), mg = mean(dg), mb = mean(db), mp = mean(P)
@@ -252,12 +359,7 @@ export const guidedFilterColor = (p, R, G, B, w, h, {
         bb[i] = mp[i] - xr * mr[i] - xg * mg[i] - xb * mb[i]
     }
 
-    const up = (src) => (s > 1 ? upsample(boxMean(src, dw, dh, r), dw, dh, w, h) : boxMean(src, dw, dh, r))
-    const Ar = up(ar), Ag = up(ag), Ab = up(ab), Bo = up(bb)
-
-    const out = new Float32Array(w * h)
-    for (let i = 0; i < w * h; i += 1) out[i] = Ar[i] * R[i] + Ag[i] * G[i] + Ab[i] * B[i] + Bo[i]
-    return out
+    return compositeUp(mean(ar), mean(ag), mean(ab), mean(bb), dw, dh, R, G, B, w, h)
 }
 
 /**

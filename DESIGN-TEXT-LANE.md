@@ -108,6 +108,14 @@ Disposal returns the GPU side (293 → 115 MB) and almost nothing on the rendere
 side; the renderer only comes back when the worker terminates, which is why
 `detect-worker-terminated` after every phrase is load-bearing.
 
+**This table is also the ledger entry.** Because the lane lives in its own
+worker, none of it reached the memory governor's allocation ledger — and on
+WebKit that ledger is the governor's *only* input, so the app's heaviest lane
+was invisible on the one engine that cannot measure. `detectorResidentMB`
+(`js/sam-client.js`) charges 700 MB, 1030 MB on WebKit, for as long as a detect
+worker is up — keyed on the worker, not the session, for the reason in the
+paragraph above. See DESIGN-MASK-LANE §9.2 for the shed side of it.
+
 ## 4. Quantization
 
 One scheme per op family, chosen by kernel support — not per device, and not per
@@ -178,6 +186,38 @@ Cost is 5 inferences per search instead of 1 — all on one session, in one work
 message, because a worker respawn per tile would dwarf the saving. Measured
 1.6–3.3 s per search, and only on images large enough to need it.
 
+### 6.1 The setting is not the subject — both halves of it
+
+The detector scores a phrase as a **bag of words**, so a phrase whose *setting*
+is in the photo matches whether or not its subject is. Measured on the canonical
+NEF: `"the dog sitting among the flowers"` returned 5 boxes and `"snow covering
+the flowers"` 6 — every one a flower, in an image with no dog and no snow.
+
+`normalizePhrase` splits a post-modifier off the subject (`headCore`), and the
+subject gets its own detector slots plus its taxonomy expansion. That yields two
+separate rules, and shipping only the first left the bug half-fixed:
+
+1. **No subject hit anywhere → return nothing.** The compound match is the
+   setting bleeding through, and the honest answer is "not here".
+2. **A subject hit → select the subject *only*.** This is the half that was
+   missing. In a photo that does contain a dog, the flower boxes still scored,
+   still survived NMS, and still arrived as candidates — so the user asked for a
+   dog and got a dog plus five flowers. The setting exists to condition the
+   score. It was never something the user asked to select.
+
+Both live in `filterToSubject` (`js/text-core.js`), which is pure and pinned by
+`verify.mjs` in both directions, including the identity case: a phrase with no
+post-modifier (`"orange tulip"`, `"a cluster of tightly packed blue florets"`)
+has no setting to separate and passes through untouched. A gate that fired on
+ordinary phrases would reject every real search.
+
+**Escalation asks about the subject too.** The 2×2 → 3×3 retry fires when
+nothing clears the rank threshold. Judged over *all* labels, a well-scoring
+setting satisfied that bar and skipped the finer pass — so a small subject in a
+rich setting was answered "nothing here" without ever looking harder, which is
+exactly the case §6's resolution floor exists for. The check is now
+subject-scoped.
+
 ## 7. The detector proxy, and its cap
 
 The lane has its own proxy, separate from the interaction frame: `buildFrames`
@@ -192,6 +232,17 @@ may run. Cells are what cost memory, so the grid comes from that budget and the
 source resolution is DERIVED from the grid it bought — two independent numbers
 could disagree and starve an axis. `detectorMaxSide`/`detectorMaxMP` are
 guardrails behind it, not the working limit.
+
+That knob has **two** ceilings, because a cell costs two things. Memory stays
+with the class signals in `policy.js` (mobile, GPU tier, integrated GPU,
+reported RAM) — an ORT arena only grows and cannot be timed. **Latency** is
+measured: `yoloe-detect` reports `inferMs` per cell (from after the session
+exists, so a cold build is not charged to the device), `text-ui` accumulates it
+across both passes of a search, and `hardware-fit` divides by cells and clamps
+`detectorMaxCells` against `detectorBudgetMs` (2500 ms). On the measured
+~140 ms/cell reference that reproduces today's 10 cells; ~420 ms/cell demotes
+to the 2×2 pass, past ~900 to full frame only. It only ever lowers the cap.
+`?detect=0` turns the latency clamp off.
 
 The derived size lands exactly on the geometry it is sizing for, so on a capable
 device the cap never binds:

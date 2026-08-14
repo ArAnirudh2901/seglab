@@ -90,6 +90,14 @@ export const loadOrt = ({ threads = autoThreads } = {}) => {
                     + 'Run `node scripts/download-models.mjs` to restore lib/ort-web/.')
                 ort.env.wasm.wasmPaths = base
                 ort.env.wasm.numThreads = typeof threads === 'function' ? threads() : threads
+                // ORT requests its OWN adapter (bundle: requestAdapter({power-
+                // Preference, forceFallbackAdapter})), so without this the lanes
+                // get the browser default while capability.js probed with
+                // 'high-performance' — on a dual-GPU Mac, a different GPU. Only
+                // read before the first session, and loadOrt is memoised.
+                // Deprecated upstream for env.webgpu.device, not used: owning
+                // the device would break the release-frees-976 MB contract.
+                if (ort.env.webgpu) ort.env.webgpu.powerPreference = 'high-performance'
                 return ort
             } catch { /* next source */ }
         }

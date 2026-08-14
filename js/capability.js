@@ -14,6 +14,8 @@
  * silently turn a low-memory device into an unsafe large-canvas configuration.
  */
 
+import { inferBackend, profileAdapter, requestAdapter } from './gpu-adapter.js'
+
 const MIB = 1024 * 1024
 const MODES = new Set(['conservative', 'balanced', 'performance'])
 
@@ -57,11 +59,20 @@ export const readPhosmithResources = () => normalizePhosmithResources(
 // installed RAM). Unverified budgets never enter it.
 
 
-const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit }) => {
-    if (!webgpu || fallback) return 'none'
+/**
+ * No f16 is now 'none', not 'basic'. checkDevice refuses such an adapter and
+ * there is no lane to demote to, so 'basic' claimed acceleration the app cannot
+ * deliver — and policy read this field to set `samWebGPU`. 'basic' now means
+ * what it says: a real f16 GPU whose limits sit under what the lane sizes for.
+ * `software` is separate from `fallback`: a blocklisted driver puts Chrome on
+ * SwiftShader with isFallbackAdapter false.
+ */
+const gpuTierFor = ({ webgpu, fallback, software, f16, legacyBackend, textureLimit, storageBufferLimit }) => {
+    if (!webgpu || fallback || software || !f16) return 'none'
     const textureReady = !textureLimit || textureLimit >= 8192
     const storageReady = !storageBufferLimit || storageBufferLimit >= 128 * MIB
-    return f16 && textureReady && storageReady ? 'accelerated' : 'basic'
+    // d3d11/GL is Chrome's compatibility path — hardware too old for d3d12.
+    return textureReady && storageReady && !legacyBackend ? 'accelerated' : 'basic'
 }
 
 /**
@@ -115,7 +126,18 @@ export const classifyCapability = (input = {}) => {
     return {
         webgpu: !!input.webgpu,
         fallback: !!input.fallback,
+        software: !!input.software,
         f16: !!input.f16,
+        subgroups: !!input.subgroups,
+        // Adapter identity. May be '' (browsers minimise it) — read unknown as
+        // "no opinion", never "weak".
+        gpuVendor: input.gpuVendor || '',
+        gpuArchitecture: input.gpuArchitecture || '',
+        // 'd3d12' | 'metal' | 'vulkan' | 'd3d11' | … — '' unless Chrome's WebGPU
+        // Developer Features flag is on, so never a precondition for anything.
+        gpuBackend: input.gpuBackend || '',
+        legacyBackend: !!input.legacyBackend,
+        integratedGPU: !!input.integratedGPU,
         // Keep this public alias for existing integrations/tests.
         deviceMemoryGB: browserMemoryGB,
         browserMemoryGB,
@@ -158,7 +180,9 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
     const raw = {
         webgpu: false,
         fallback: false,
+        software: false,
         f16: false,
+        subgroups: false,
         browserMemoryGB: nav.deviceMemory || 0,
         logicalProcessors: nav.hardwareConcurrency || 0,
         mobile,
@@ -167,20 +191,25 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
         hostResources,
     }
     try {
-        if (nav.gpu) {
-            // The browser may decline the preference (for example on battery),
-            // so a regular request remains a valid fallback.
-            const adapter = await nav.gpu.requestAdapter({ powerPreference: 'high-performance' })
-                || await nav.gpu.requestAdapter()
-            if (adapter) {
-                raw.webgpu = true
-                raw.fallback = !!adapter.isFallbackAdapter
-                raw.f16 = adapter.features?.has?.('shader-f16') || false
-                raw.textureLimit = adapter.limits?.maxTextureDimension2D || 0
-                raw.storageBufferLimit = adapter.limits?.maxStorageBufferBindingSize || 0
-            }
+        // Same request the mask lane makes — see gpu-adapter.
+        const adapter = await requestAdapter()
+        const gpu = profileAdapter(adapter)
+        if (gpu) {
+            raw.webgpu = true
+            raw.fallback = !!adapter.isFallbackAdapter
+            raw.software = gpu.software
+            raw.f16 = gpu.f16
+            raw.subgroups = gpu.subgroups
+            raw.textureLimit = gpu.textureLimit
+            raw.storageBufferLimit = gpu.storageBufferLimit
+            raw.gpuVendor = gpu.vendor
+            raw.gpuArchitecture = gpu.architecture
+            raw.gpuBackend = inferBackend(gpu)
+            raw.legacyBackend = gpu.legacyBackend
+            raw.integratedGPU = gpu.integrated
+            raw.gpuName = gpu.name
         }
-    } catch { /* WebGPU is optional; the engine has a WASM lane. */ }
+    } catch { /* WebGPU is optional here; the lane gates on it separately. */ }
     return classifyCapability(raw)
 }
 

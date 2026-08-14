@@ -70,7 +70,8 @@ These replace the preset table. They are assertions, testable in `verify.mjs`.
 
 ```
 I1  per-tab peak resident never exceeds 900 MB
-I2  click → first mask paint never exceeds 50 ms
+I2  click → first mask paint stays inside the device's click budget
+    (`postBudgetMs`, 220 ms; see js/hardware-fit.js)
 I3  no two heavy jobs are ever in flight ON THE MACHINE
 ```
 
@@ -443,6 +444,61 @@ Three guards, tested in `verify.mjs`:
 - **Manual `?proxy=` opts out** — an explicit number is the user's.
 - **Pressure L3 sets `proxyShortMax = 0`** — the boost goes first.
 
+### 8.1b What the proxy costs, and what pays for it **[MEASURED]**
+
+The proxy is the only knob that moves click latency at all: encode and decode
+are **flat** in proxy size (the encoder squashes to 1024², the decoder emits
+256²). Everything the proxy scales is CPU post-processing, and post-processing
+is 60–70 % of a warm click. `js/hardware-fit.js` spends that cost against
+`postBudgetMs` and walks the short edge down a ladder when a device cannot pay
+— llmfit's technique (class-table estimate → utilisation band → quantisation
+walk → real benchmark replaces the estimate), adapted to what a page can see.
+
+The cost has **two** terms, not one. Measured 2026-08-14 (Apple metal-3,
+headless Chromium, a 1536×896 proxy, a 12-point click grid × 3 repeats,
+per-stage timings from `js/mask-refine.js`):
+
+| stage | scales with | cost |
+|---|---|---|
+| `upsampleLogits` | proxy | ~6.0 ms |
+| `bandAlpha` (full frame) | proxy | ~2.2 ms |
+| raw-mask copy | proxy | ~0.3 ms |
+| `refineField` (guided filter) | refined rect | ~24.6 ms/MP |
+| `bandAlphaRect` | refined rect | ~4.8 ms/MP |
+
+⇒ **8.6 ms per proxy-MP fixed + ~30 ms per rect-MP**. On the *same* 1.376 MP
+proxy that is 12.2 ms for a 9.7 kpx band and 52.6 ms for a frame-spanning one —
+a 4.3× spread that a single ms/MP figure charges to the machine. So the model
+carries the scene explicitly:
+
+```
+postMs = proxyMP × rate × (0.22 + 0.78 × bandFraction)
+```
+
+Normalised through that shape, eleven of the twelve clicks return **35.6–43.3
+ms/MP** across a 140× range of band area — a genuine device constant.
+`sam21-adapter` reports `bandPixels` per click so `app.js` can feed the rate
+and the fraction back separately; a click that reports no band is dropped
+rather than normalised by a guess. The stored figure expires after 14 days
+(`?post=reset` forces it) — it describes the machine as it was that day, on
+battery or thermally throttled, and the fit only ever ratchets downward.
+
+Two levers that look like they should help and do not:
+
+- **Narrowing `BAND = 6`.** Frame-spanning rects on `streetlight.jpg` are
+  genuine object extent (coverage 17–19 %), not a fat band: thresholding at 3
+  logit units saves ~2.8 ms on the worst real case and nothing at all on a
+  spanning object. Block-skipping prototypes (128 px and 192 px blocks with a
+  24 px halo) were **slower** than one rect refine.
+- **Trading guided-filter scale.** 4 → 6 → 8 moved the refine stage
+  3.53 → 3.27 → 3.13 ms — ~11 % of one stage, ~0.4 ms per click — because
+  extraction, downsample and `compositeUp` are full-resolution regardless.
+  r=8/s=4 is measured-optimal for quality (§10b) and stays.
+
+The same judgement runs on the text lane's tile grid: `detectorMaxCells` is
+clamped by measured per-cell inference (`detectorBudgetMs`, 2500 ms) on top of
+the class-derived memory cap, which stays — an ORT arena cannot be timed.
+
 ### 8.2 SAM encode — on demand, in a worker
 
 ```
@@ -473,7 +529,7 @@ avoids ~150–300 MB of avoidable spike.
 ### 8.3 Click — the responsiveness path
 
 ```
-decoder: warm, fp16, static-shaped, enableGraphCapture: true
+decoder: warm, fp16, static-shaped   (graph capture was tried and rejected — §12)
 inputs:  already GPU-resident  → zero uploads, zero casts, zero dispatch setup
 paint:   composite mask as a GPU texture
 refine:  guided filter (§10) runs AFTER first paint, repaints if better
@@ -487,6 +543,34 @@ not in tension: none of these touch numerics.
 
 Share **one** `GPUDevice` between ORT and the compositor so buffers pass without
 cross-device copies.
+
+### 8.3a What the selection looks like — fill *and* border
+
+A 32%-alpha tint alone answers "something is selected" but not "which pixels".
+That distinction is the whole product: §10c establishes that single-click mask
+quality is finished and that what is left is SAM choosing the wrong *object*
+(§10a — three candidates at 1.9 / 6.3 / 13.2 % coverage on one measured click).
+A user cannot cycle with `C` toward the right interpretation without seeing
+exactly where the current one ends, and a translucent wash over a busy photo
+does not show that.
+
+The border is built once per committed mask, next to the tinted fill, and cached
+on the same key:
+
+1. threshold the mask to a **hard core** at alpha ≥ 128 — dilating the feathered
+   alpha directly gives a wide soft double band instead of one line;
+2. draw that core eight times at ±`r`, which *is* its dilation, then
+   `destination-out` the core itself: what survives is a band hugging the
+   outside of the selection;
+3. tint it with the accent, and paint it under a `shadowBlur` halo — the accent
+   alone disappears against a light subject.
+
+Eight `drawImage` calls, not a JS dilation pass, and never on `pointermove`: a
+brush stroke keeps drawing its own transient preview and picks the border up at
+commit. `r` is relative to the frame (`0.003 × min(w,h)`, floor 2 px), so the
+line reads the same on a 1024 px proxy and a 4000 px native frame, and it is
+built at mask resolution — display scaling is CSS, so the border stays exactly
+on the boundary at any zoom.
 
 ### 8.4 Export
 
@@ -634,6 +718,39 @@ session → YOLOE session.
 Projections are **arithmetic on known tensor shapes**, not guesses:
 `1×256×64×64×2 bytes = 2 MB`, and so on. That is what makes I1 enforceable
 rather than aspirational.
+
+### 9.2 The ledger has to be complete, because on WebKit it is the only input
+
+`decidePressure` reads three signals: measured agent-cluster bytes
+(`measureUserAgentSpecificMemory`), JS heap, and the app's own allocation
+ledger. The first two are Chromium-only. On WebKit the ledger is not a
+cross-check — it *is* the governor, and anything missing from it is not merely
+under-counted, it is invisible.
+
+The text lane was missing from it. It runs in a **separate worker with its own
+ORT arena**, so none of it appears in the SAM lane's status object the ledger was
+built from. Measured in that worker's process (DESIGN-TEXT-LANE §3, staged
+per-PID table): 326 MB idle → 962 MB with the session built → 1034 MB after the
+first run. Disposing the *session* returns only the GPU share (854 MB floor);
+the arena comes back when the **worker** is terminated. So residency is keyed on
+the worker, and the app charges itself 700 MB while one is up — 1030 MB on
+WebKit, which is where the heavier figure was observed before a process reap.
+
+Two consequences, both required for the entry to mean anything:
+
+- **The shed can act on it.** `shedMemory(≥1)` now terminates an idle detect
+  worker. It refuses while a detection is in flight — terminating mid-search
+  rejects the call, which the user reads as a failed search, not as relief.
+- **It must not fire during normal operation.** On the product path the lanes
+  never peak together (`detectorEvictOnEncode` drops the embedding first), so a
+  text search sits at roughly base + worker-warm + detector ≈ 1.6 GB, which is
+  the 1607 MB actually measured. A search *with* an encoder live projects past
+  the budget — and that case measures 2558 MB, so the shed is correct there.
+
+What this does **not** do is bound the lane's own peak. That is still policy's
+job (`detectorMaxCells` demotes to 5 wherever `deviceMemory` is unreadable —
+WebKit and Gecko), and §"detectorDispose" in DESIGN-TEXT-LANE records why
+terminating after *every* search makes the peak worse rather than better.
 
 ---
 
@@ -895,25 +1012,30 @@ in this repo is the better choice.
 
 ## 14. Work phases
 
-| Phase | Work | Gate |
-|---|---|---|
-| 0 | Config collapse + WebGPU/`shader-f16` hard gate | one code path exists |
-| 1 | Preview-first import + admission controller + **cross-tab Web Lock** | **I1, I3 assertable** |
-| 2 | YOLOE-first routing + visibility dormancy | ships value with no new model |
-| 3 | Conversion pipeline + **measure encoder arena on the Air** | go/no-go for `small` |
-| 4 | SAM2 lane: split lifecycle, GPU-resident, graph capture, `device.lost` | **I2 assertable** |
-| 5 | Logit upsampling + guided filter | quality target |
-| 6 | OPFS embedding persistence (cross-tab shared) → Phosmith | — |
+**All seven phases are done.** The table is kept because the *ordering* is the
+part worth remembering, and because several sections below still refer to a
+phase by number.
 
-**The ordering is deliberate.** Phases 1–2 deliver the responsiveness and memory
-guarantees *independently of SAM*, so the riskiest work (3–4) sits behind a
-product that already works. Phase 3 gates phase 4: if the measured arena blows
-I1, drop to `tiny` before building anything on top.
+| Phase | Work | Gate | State |
+|---|---|---|---|
+| 0 | Config collapse + WebGPU/`shader-f16` hard gate | one code path exists | shipped — §11 |
+| 1 | Preview-first import + admission controller + **cross-tab Web Lock** | **I1, I3 assertable** | shipped — §8.1, §9 |
+| 2 | YOLOE-first routing + visibility dormancy | ships value with no new model | shipped, then superseded: dormancy never fired on visibility and was replaced by the idle-exit rung (§8.5) |
+| 3 | Conversion pipeline + **measure encoder arena on the Air** | go/no-go for `small` | shipped — arena measured, `small` kept (§6.1) |
+| 4 | SAM2 lane: split lifecycle, GPU-resident, `device.lost` | **I2 assertable** | shipped, minus graph capture (§12 row 6 rules it out) |
+| 5 | Logit upsampling + guided filter | quality target | shipped and **finished** — §10c |
+| 6 | OPFS embedding persistence (cross-tab shared) → Phosmith | — | shipped — §8.5 |
 
-**The Web Lock belongs in phase 1**, not later. It is the same file and the same
-abstraction as the admission controller, so building it then costs almost
-nothing; retrofitting cross-tab safety afterwards means revisiting every heavy
-call site.
+**The ordering was deliberate.** Phases 1–2 delivered the responsiveness and
+memory guarantees *independently of SAM*, so the riskiest work (3–4) sat behind
+a product that already worked. Phase 3 gated phase 4: had the measured arena
+blown I1, the fallback was `tiny` — it did not, and §6.1 later showed `tiny`
+would have bought nothing anyway.
+
+**The Web Lock belonged in phase 1**, not later. It is the same file and the same
+abstraction as the admission controller, so building it then cost almost
+nothing; retrofitting cross-tab safety afterwards would have meant revisiting
+every heavy call site.
 
 ---
 
@@ -922,7 +1044,7 @@ call site.
 | Invariant | How |
 |---|---|
 | I1 | `measureUserAgentSpecificMemory()` sampled across import → encode → click → export, on the Air, with `2680558334.nef` |
-| I2 | `performance.mark` around click → first paint; p95 over 100 clicks |
+| I2 | phase A drives five real clicks over objects of deliberately different band size and asserts the median `lastRun.postMs` against `postBudgetMs` (max gets 2x slack — one CI scheduling hiccup is not a broken invariant); a second check asserts every warm click reported `bandPixels`, without which the figure cannot be attributed to the device |
 | I3 | queue assertion: in-flight heavy count never exceeds 1 **per tab** |
 | I3 cross-tab | three tabs, encode triggered in all three within one second; assert the lock serialises them and total peak stays under ~1 GB |
 | dormancy | hidden tab settles to ~30 MB within the shed window; re-focus restores a working decoder |
@@ -934,20 +1056,27 @@ drive on its own. Run them through the dev-browser harness against
 `scripts/dev-server.mjs` on :8788 — COI headers and model caching both depend on
 that server, so a plain static server will not reproduce the conditions.
 
-Add to `verify.mjs`, which already carries 101 checks including both RAW fixture
-phases. Existing profile-related assertions (93 hits across 1558 lines) need
-rewriting for the single config as part of phase 0.
+`verify.mjs` now carries 200 `check()` assertions across 3060 lines, including
+both RAW fixture phases. `--fast` runs the three that need no browser (pure
+logic, heavy-job queue, static source scans — 116 assertions) and stops before
+the browser phases; those need Playwright's Chromium and the dev server on
+:8788. The profile-related assertions phase 0 was meant to rewrite are gone with
+the presets — what is left refers to the single config.
 
 ---
 
 ## 16. Risks and open questions
 
+Three rows that used to head this table are settled and have been removed:
+`enableGraphCapture` (**ruled out**, §12 row 6 — it is not a risk because it is
+not used), Hiera op coverage on ORT-Web WebGPU (**proven** by the shipped lane),
+and the unmeasured encoder arena (**measured** — §9.1, and §6.1 shows `tiny`
+would not have helped).
+
 | Risk | Impact | Mitigation |
 |---|---|---|
-| `enableGraphCapture` unsupported in pinned ORT-Web `1.26.0-dev.20260416` | +5–15 ms/click | degrades, does not break; verify before treating as load-bearing |
-| Hiera op coverage on ORT-Web WebGPU for darktable's specific export | blocks phase 4 | proven in general ([webgpu-sam2]); phase 3 settles it for these files |
-| Encoder arena estimate (~500–650 MB) is unmeasured | may exceed I1 | phase 3 gate; fall back to `tiny` |
 | fp16 conversion mistypes a head | silent quality loss | §7 step 4 is mandatory and gating |
+| WebKit exposes no byte-level memory API | the governor cannot measure, only estimate | the allocation ledger is the sole input there and must therefore stay complete — it now counts the text lane's worker, which it did not (§9) |
 | OPFS quota under many cached embeddings | eviction churn | LRU cap; embeddings are recoverable by re-encode |
 | `GPUDevice.lost` under multi-tab GPU pressure | session dies mid-use | mandatory handler (§8.5): invalidate, rebuild on next use |
 | Many tabs at steady state still sum (5 × 270 MB) | aggregate pressure no tab can see | dormancy (§8.5) bounds hidden tabs to ~30 MB; accepted residual risk |
@@ -958,18 +1087,28 @@ rewriting for the single config as part of phase 0.
 declare `tiling: true` with fixed tile inputs, so their peak is bounded
 independent of source resolution — architecturally the cheapest lanes available.
 They fit at fp32; note darktable sets `fp16: false` explicitly for several, so
-validate before converting. Revisit after phase 6.
+validate before converting. Phase 6 is done, so this is now simply open — it is
+the next lane if there is one, not a scheduled item.
 
 ---
 
 ## 17. Appendix
 
-### A. Cleanup owed
-- `models/` carries 304 MB of dead weight: Grounding DINO (144 MB) and OWLv2
-  (156 MB), removed from the app but still on disk and still advertised in
-  `models/manifest.json:6-15`.
-- `scripts/export-sam21.py` and `spikes/sam21/` (162 MB) exist from the graph
-  inspection that produced §6.3.
+### A. On-disk inventory *(nothing owed)*
+The cleanup this section used to demand is done. Current state, for the next
+person who wonders whether something on disk is dead:
+
+- `models/` — **204 MB, all shipping**: `sam21/` 88 MB (the mask lane),
+  `yoloe/` 53 MB and `clip-text/` 64 MB (the text lane). Grounding DINO and
+  OWLv2 are gone from disk and from the manifest.
+- `models/manifest.json` describes the **mask-lane** bundle only (ORT + the two
+  SAM graphs) and carries `"detector": null`. That is the offline/vendoring
+  gate's scope, not a claim that the text lane's models do not exist.
+- `spikes/` — 6.7 MB (`sam21/` 1.9 MB, `debug/` 4.6 MB, `yoloe/` 264 KB): the
+  graph inspection behind §6.3 and the measurement scripts behind §9.1. Kept
+  deliberately; it is scripts and JSON, not weights.
+- `scripts/export-sam21.py`, `export-yoloe-text.py`, `export-clip-text.py` are
+  the reproducible conversion path for the three shipped models (§7). Keep.
 
 ### B. Test images
 - `2680558334.nef` — Nikon Z 8, High Efficiency (TicoRAW). **LibRaw cannot

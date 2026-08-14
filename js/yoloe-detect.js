@@ -22,6 +22,7 @@
  */
 
 import { YOLOE_INPUT } from './text-core.js'
+import { webgpuWorthTrying } from './gpu-adapter.js'
 import { loadOrt } from './ort-loader.js'
 
 /**
@@ -43,10 +44,12 @@ let sessionPromise = null
 let backend = null // 'webgpu' | 'wasm' — the EP that actually built
 
 /** Build the session, trying WebGPU then WASM (ORT falls back silently inside a
- *  multi-EP list, so probe one at a time to record the EP). */
+ *  multi-EP list, so probe one at a time to record the EP). A software adapter is
+ *  skipped outright — it builds fine and then runs slower than WASM. */
 const buildSession = async (ort) => {
     let lastErr
-    for (const ep of ['webgpu', 'wasm']) {
+    const eps = (await webgpuWorthTrying()) ? ['webgpu', 'wasm'] : ['wasm']
+    for (const ep of eps) {
         try {
             const s = await ort.InferenceSession.create(modelURL, {
                 executionProviders: [ep],
@@ -106,6 +109,10 @@ export const detectYoloe = async ({ frame, txtFeats, threshold = 0.25, dispose =
     const ort = await loadOrt()
     const s = await loadYoloe()
     const side = YOLOE_INPUT
+    // Per-cell cost, measured from HERE — after the session exists. A cold
+    // build is a one-off of the worker's life; hardware-fit budgets the part
+    // that repeats per cell.
+    const t0 = performance.now()
     try {
         // RGB bytes → NCHW float32 [0,1]. frame is exactly side², 3-channel.
         const d = frame.data
@@ -138,7 +145,7 @@ export const detectYoloe = async ({ frame, txtFeats, threshold = 0.25, dispose =
                 classIdx: Math.round(data[b + 5]),
             })
         }
-        return { dets, backend }
+        return { dets, backend, inferMs: performance.now() - t0 }
     } finally {
         if (dispose) disposeYoloe()
         else scheduleIdle(idleMs)

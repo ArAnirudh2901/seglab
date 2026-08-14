@@ -13,10 +13,15 @@
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
 import {
-    cancelBefore, clientState, cycleCandidate, encodeImage, encoderReady, engineState, forgetEncoder,
-    releaseDocument, releaseEmbeddings, segment, subscribe, warmEncoder, warmUp, relievePressure,
+    cancelBefore, clientState, cycleCandidate, detectorResidentMB, disposeDetectorIfIdle, encodeImage,
+    encoderReady, engineState, forgetEncoder, releaseDocument, releaseEmbeddings, segment, subscribe,
+    warmEncoder, warmUp, relievePressure,
 } from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
+import {
+    observePost, observeBandFraction, savePostFit, explainFit,
+    observeDetect, saveDetectMsPerCell, affordableCells,
+} from './hardware-fit.js'
 import { createMemoryGovernor } from './memory-governor.js'
 import { probeCapability, probeTextLane, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset, getOriginalBlob, getAssetKey } from './asset-store.js'
@@ -24,7 +29,7 @@ import { saveSession, loadSession, clearSession } from './session-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
-import { detectCandidates } from './text-ui.js'
+import { detectCandidates, lastDetectCost } from './text-ui.js'
 import { suggest, buildFacets } from './search-taxonomy.js'
 import { modelRegistry, noteModel, isModelNoted, laneOfModel } from './model-registry.js'
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
@@ -57,6 +62,49 @@ const bootProbe = probeCapability().then((cap) => {
     capability = { profile: BUDGET.profile, error: String(err?.message || err) }
     return capability
 })
+
+/**
+ * hardware-fit's benchmark, run for free: every click already reports how long
+ * post-processing took for a proxy of known size, so the class estimate is only
+ * ever used until the first click of the session. Persisted per device.
+ * Skipped on the encoding click — that one's postMs sits behind a cold cache.
+ *
+ * Two figures, because postMs has two causes: the DEVICE's rate and the SCENE's
+ * band. A click whose refined area is unknown updates neither — dividing it by
+ * the proxy alone would credit a compact selection to the machine and report it
+ * ~4.5x slower than it is.
+ */
+const noteClickCost = (res) => {
+    const run = clientState.lastRun
+    if (!run || run.encoded || !(run.postMs > 0)) return
+    const mp = (res.width * res.height) / 1e6
+    if (!(mp > 0) || !(run.bandPixels > 0)) return
+    const fraction = run.bandPixels / (mp * 1e6)
+    const next = observePost(BUDGET.postMsPerMP, run.postMs, mp, fraction)
+    if (!next) return
+    BUDGET.postMsPerMP = next
+    BUDGET.postMsPerMPSource = 'measured'
+    BUDGET.postBandFraction = observeBandFraction(BUDGET.postBandFraction, fraction)
+    savePostFit({ msPerMP: next, bandFraction: BUDGET.postBandFraction })
+}
+
+/**
+ * The same benchmark for the text lane: a search reports its own inference time
+ * and the number of cells it ran, so the grid a device gets is sized on what
+ * that device measured rather than on class flags. Takes effect on the NEXT
+ * search (the plan for this one is already spent). Memory still caps cells from
+ * policy — this only ever lowers the ceiling further.
+ */
+const noteDetectCost = () => {
+    const cost = lastDetectCost()
+    if (!cost) return
+    const next = observeDetect(BUDGET.detectorMsPerCell, cost.inferMs, cost.cells)
+    if (!next) return
+    BUDGET.detectorMsPerCell = next
+    BUDGET.detectorMsPerCellSource = 'measured'
+    saveDetectMsPerCell(next)
+    BUDGET.detectorMaxCells = Math.min(BUDGET.detectorMaxCells, affordableCells(BUDGET))
+}
 
 // The mask lane warms at PAGE LOAD (see Boot), not at import. warmUp memoises,
 // so the import path calling it again is free.
@@ -660,6 +708,11 @@ const shedMemory = (level, { announce = true } = {}) => {
     const previous = BUDGET.pressureLevel || 0
     BUDGET = applyMemoryPressure(BUDGET, level)
     if ((BUDGET.pressureLevel || 0) >= 2) disposeCvRefine() // idle wasm worker goes first
+    // The policy change above only governs the NEXT search; a worker already
+    // resident keeps its arena until it is terminated, and on WebKit that arena
+    // is the largest thing the app is holding. Skipped while a search is in
+    // flight — see disposeDetectorIfIdle.
+    if (level >= 1) disposeDetectorIfIdle()
     if (announce && BUDGET.pressureLevel > previous) {
         if (BUDGET.pressureLevel >= 3) {
             setStatus('Memory pressure detected — running in safe mode.')
@@ -736,6 +789,12 @@ const estimateFootprintMB = () => {
         if (lane?.encoder || lane?.decoder) mb += LEDGER_MB.devicePool
         if (lane?.encoder) mb += LEDGER_MB.encoderSession
     }
+    // The text lane is a SEPARATE worker with its own ORT arena, and it was
+    // missing from the ledger entirely — on WebKit, where the ledger is the only
+    // input, the lane that peaks near a gigabyte was the one thing the governor
+    // could not see. Freed only by terminating the worker, so residency tracks
+    // the worker (sam-client §DETECT_RESIDENT_MB).
+    mb += detectorResidentMB()
     // Buffers the app sizes itself, so these are exact rather than anchored.
     const px = (w, h) => ((w || 0) * (h || 0) * 4) / (1024 * 1024)
     mb += px(els.view?.width, els.view?.height)
@@ -743,6 +802,8 @@ const estimateFootprintMB = () => {
     mb += px(els.photo?.naturalWidth, els.photo?.naturalHeight)   // decoded preview
     const tf = getTransform?.()
     if (tf?.workingActive) mb += px(tf.workingW, tf.workingH)
+    // Overlay layer cache: tinted fill + border ring, both frame-sized.
+    if (layerCache?.fill) mb += 2 * px(els.overlay?.width, els.overlay?.height)
     return mb
 }
 
@@ -1524,6 +1585,7 @@ async function runNow() {
 
         logCommit(revision, res.usable ? 'committed' : 'unusable')
         console.log('[seglab][ui] selection-result', { revision, usable: res.usable, lane: res.lane, score: res.score, encoded: res.encoded })
+        noteClickCost(res)
         if (res.encoded) state.encodePending = false // paid; the cache serves the rest
         if (!res.usable) {
             // Only the live object misses; committed regions survive.
@@ -1785,6 +1847,7 @@ async function runDetect(phrase) {
         // One open-vocabulary lane: the phrase conditions the detector directly,
         // so there is no vocabulary to miss and nothing to fall back to.
         const res = await detectCandidates(phrase, { idleMs, evict, budget: BUDGET })
+        noteDetectCost()
         if (revision !== state.revision) return // superseded by newer input
         state.textBackend = res?.backend || null
         refreshChips()
@@ -2079,23 +2142,49 @@ els.selectall.addEventListener('click', () => selectAll())
 // Layers rebuild only when the committed mask object changes. A brush stroke
 // draws its own lightweight canvas preview, so pointermove never allocates a
 // full-size overlay or runs an 8-pass outline dilation on the UI thread.
-let layerCache = { mask: null, fill: null }
+let layerCache = { mask: null, fill: null, ring: null }
 
-/** Colorize the white-on-black mask; cached per committed mask object. */
+// Outline offsets — the union of the shape shifted this way IS its dilation, so
+// the border costs 8 GPU-side drawImage calls instead of a JS dilation pass.
+const RING_DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1]]
+
+/** Colorize the white-on-black mask + trace its border; cached per mask object. */
 const getMaskLayers = (mask) => {
     if (layerCache.mask === mask) return layerCache
     const { width, height, data: src } = mask
     // luma → alpha + accent tint in one pass — no intermediate canvas/readback.
     const img = new ImageData(width, height)
     const d = img.data
+    // The border traces a HARD core, not the tinted fill: the refined mask has a
+    // feathered edge, and dilating a soft alpha gives a wide double band where a
+    // single crisp line is what tells the user which pixels are actually in.
+    const core = new ImageData(width, height)
+    const c = core.data
     for (let i = 0; i < d.length; i += 4) {
         d[i] = 53; d[i + 1] = 224; d[i + 2] = 194
         d[i + 3] = src[i]
+        if (src[i] >= 128) { c[i] = 255; c[i + 1] = 255; c[i + 2] = 255; c[i + 3] = 255 }
     }
     const fill = new OffscreenCanvas(width, height)
     fill.getContext('2d').putImageData(img, 0, 0)
 
-    layerCache = { mask, fill }
+    // Dilate the core and subtract it: what is left is a band that hugs the
+    // outside of the selection, at mask resolution, so it stays exact under any
+    // display scale. Width is relative to the frame, not fixed px, so it reads
+    // the same on a 900 px proxy and a 4000 px native frame.
+    const solid = new OffscreenCanvas(width, height)
+    solid.getContext('2d').putImageData(core, 0, 0)
+    const r = Math.max(2, Math.round(Math.min(width, height) * 0.003))
+    const ring = new OffscreenCanvas(width, height)
+    const rc = ring.getContext('2d')
+    for (const [dx, dy] of RING_DIRS) rc.drawImage(solid, dx * r, dy * r)
+    rc.globalCompositeOperation = 'destination-out'
+    rc.drawImage(solid, 0, 0)
+    rc.globalCompositeOperation = 'source-in'
+    rc.fillStyle = ACCENT
+    rc.fillRect(0, 0, width, height)
+
+    layerCache = { mask, fill, ring }
     return layerCache
 }
 
@@ -2126,10 +2215,19 @@ function paintOverlay() {
         ctx.fillRect(0, 0, width, height)
         ctx.restore()
     } else if (shownMask) {
-        const { fill } = getMaskLayers(shownMask)
+        const { fill, ring } = getMaskLayers(shownMask)
         ctx.globalAlpha = 0.32
         ctx.drawImage(fill, 0, 0)
         ctx.globalAlpha = 1
+        // The border carries a dark halo because the accent alone vanishes over
+        // a light subject, and the boundary is the one thing the user checks.
+        ctx.save()
+        ctx.shadowColor = 'rgba(0,0,0,0.55)'
+        ctx.shadowBlur = Math.max(2, Math.min(width, height) * 0.004)
+        ctx.drawImage(ring, 0, 0)
+        ctx.shadowBlur = 0
+        ctx.drawImage(ring, 0, 0) // opaque line on top of its own halo
+        ctx.restore()
     }
 
     const markerR = Math.max(4, Math.min(width, height) * 0.009)
@@ -2456,6 +2554,13 @@ window.__seglab = {
         manual: state.manual?.kind || null,
         escalated: !!getHdPatch(state.revision),
     }),
+    // llmfit ships the inputs behind every estimate; so does this. Reports the
+    // judgement for the loaded image, or for w×h if one is given.
+    hardwareFit: (w, h) => explainFit(
+        w || els.view.width || 1,
+        h || els.view.height || 1,
+        BUDGET,
+    ),
     maskStats: () => {
         if (!state.mask) return null
         const { data, width, height } = state.mask

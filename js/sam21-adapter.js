@@ -239,7 +239,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const t2 = performance.now()
     const w = canvas.width
     const h = canvas.height
-    const { rgba, rawRgba } = postProcess(canvas, imageKey, dec.logits, w, h)
+    const { rgba, rawRgba, bandPixels } = postProcess(canvas, imageKey, dec.logits, w, h)
 
     // Park every candidate SAM already computed, ordered small → large, so the
     // app can answer "you took the wrong part of it" with a repaint. The
@@ -260,6 +260,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
         encodeMs: +encodeMs.toFixed(1),
         decodeMs: +decodeMs.toFixed(1),
         postMs: +(performance.now() - t2).toFixed(1),
+        bandPixels,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),
@@ -286,10 +287,16 @@ const postProcess = (canvas, imageKey, logits, w, h) => {
     // Guided filter against the photo's own luma: pulls the boundary onto the
     // real object edge instead of wherever the 256² grid put it.
     let rgba = rawRgba
+    // Pixels the refinement actually walked — the quantity post-processing cost
+    // scales with, and hardware-fit's normaliser. The proxy's own area is not:
+    // measured over a 12-point click grid, ONE 1.376 MP proxy cost 12.2 ms for
+    // a 9.7 kpx band and 52.6 ms for a frame-spanning one.
+    let bandPixels = 0
     try {
         const px = guidePixels(canvas, imageKey, w, h)
         const rect = px && refineField(field, px, w, h, bbox, { radius: 8, eps: 1e-4, scale: 4 })
         if (rect) {
+            bandPixels = (rect[2] - rect[0]) * (rect[3] - rect[1])
             // Refinement only rewrote `rect`; the rest of the field is
             // untouched, so copy the raw mask and re-threshold just that band
             // instead of paying a second full-frame pass.
@@ -301,7 +308,7 @@ const postProcess = (canvas, imageKey, logits, w, h) => {
     // 8256×5504 is what makes edges stair-step, and no amount of export-time
     // filtering recovers from it (§10).
     lastField = { imageKey, w, h, field }
-    return { rgba, rawRgba }
+    return { rgba, rawRgba, bandPixels }
 }
 
 /* ─── Candidate cycling ───────────────────────────────────────────────────────
@@ -345,7 +352,7 @@ export const sam21Cycle = (delta = 1, imageKey = null) => {
     candidates.index = (candidates.index + (delta < 0 ? n - 1 : 1)) % n
     const row = candidates.rows[candidates.index]
     const { canvas, w, h } = candidates
-    const { rgba, rawRgba } = postProcess(canvas, candidates.imageKey, row.p, w, h)
+    const { rgba, rawRgba, bandPixels } = postProcess(canvas, candidates.imageKey, row.p, w, h)
     return {
         rgba,
         rawRgba,
@@ -356,6 +363,7 @@ export const sam21Cycle = (delta = 1, imageKey = null) => {
         encodeMs: 0,
         decodeMs: 0,
         postMs: +(performance.now() - t0).toFixed(1),
+        bandPixels,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),

@@ -434,6 +434,24 @@ export const dropClippedDuplicates = (dets, { cover = 0.7 } = {}) => {
 export const pruneContainers = (dets, { cover = 0.7 } = {}) => dets.filter((d) =>
     dets.filter((m) => m !== d && containment(d.box, m.box) >= cover).length < 2)
 
+/**
+ * Keep only what the phrase's SUBJECT matched; null when it matched nothing.
+ *
+ * The detector scores a phrase as a bag of words, so the setting keeps scoring
+ * on its own: "the dog sitting among the flowers" boxed 5 flowers in a photo
+ * with no dog. Answering "nothing" there is the gate. The other half is that a
+ * photo WITH a dog returned the dog AND the flowers — the setting exists to
+ * condition the score, and was never something the user asked to select.
+ *
+ * `subject` is null for a phrase with no post-modifier ("orange tulip"), where
+ * the subject IS the whole phrase and there is nothing to separate.
+ */
+export const filterToSubject = (dets, subject) => {
+    if (!subject) return dets
+    const hits = dets.filter((d) => subject.has(d.label))
+    return hits.length ? hits : null
+}
+
 /** Threshold → NMS → container prune → top-K, high score first. `relative`
  *  also drops boxes far below the best match: an open-vocabulary detector can
  *  emit low-scoring, scene-sized guesses alongside real hits, and they outlive

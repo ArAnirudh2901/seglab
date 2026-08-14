@@ -16,6 +16,9 @@
 
 import { loadOrt as loadOrtShared, webgpuEP } from './ort-loader.js'
 import { chooseCandidate, cleanRegions } from './mask-select.js'
+import {
+    computeLimits, inferBackend, MIN_STORAGE_BUFFER, preprocWorkgroup, profileAdapter, requestAdapter,
+} from './gpu-adapter.js'
 
 const DIR = new URL('../models/sam21/', import.meta.url).href
 
@@ -36,19 +39,35 @@ const IMAGENET_STD = [0.229, 0.224, 0.225]
 
 /** fp32 → fp16 bits. Float16Array where available (Chrome 135+), else manual. */
 const HAS_F16 = typeof Float16Array !== 'undefined'
+const F32 = new Float32Array(1)
+const F32_BITS = new Uint32Array(F32.buffer)
 const f32to16 = (src) => {
     if (HAS_F16) return new Uint16Array(new Float16Array(src).buffer)
     const out = new Uint16Array(src.length)
-    const buf = new DataView(new ArrayBuffer(4))
     for (let i = 0; i < src.length; i += 1) {
-        buf.setFloat32(0, src[i])
-        const x = buf.getUint32(0)
+        F32[0] = src[i]
+        const x = F32_BITS[0]
         const sign = (x >>> 16) & 0x8000
-        let exp = ((x >>> 23) & 0xff) - 112
-        const man = x & 0x7fffff
-        if (exp <= 0) { out[i] = sign; continue }
-        if (exp >= 0x1f) { out[i] = sign | 0x7c00; continue }
-        out[i] = sign | (exp << 10) | (man >>> 13)
+        const abs = x & 0x7fffffff
+        if (abs >= 0x7f800000) {                        // Inf / NaN
+            out[i] = sign | 0x7c00 | (abs > 0x7f800000 ? 0x200 : 0)
+        } else if (abs < 0x38800000) {                  // < 2^-14: half subnormal
+            // No clamp: rounding up to 0x400 IS the smallest normal, and
+            // pinning it to 0x3ff loses a ULP at the boundary. Math.round breaks
+            // ties away from zero, IEEE breaks them to even — undo that.
+            const s = Math.abs(F32[0]) * 0x1000000
+            let m = Math.round(s)
+            if (m - s === 0.5 && (m & 1)) m -= 1
+            out[i] = sign | m
+        } else {
+            // Round to nearest even, NOT truncate: dropping 13 mantissa bits
+            // biased every value toward zero by up to 1 ULP. The +0x0fff carries
+            // into the exponent on mantissa overflow, so no separate case.
+            const h = ((abs + 0x0fff + ((abs >>> 13) & 1)) >>> 13) - 0x1c000
+            // h, not (h & 0x7fff): at |x| >= 2^17 the masked value wraps below
+            // 0x7c00 and 131072 packed as -0 instead of Inf.
+            out[i] = h >= 0x7c00 ? sign | 0x7c00 : sign | h
+        }
     }
     return out
 }
@@ -151,7 +170,16 @@ const GRAPH_OPT = 'all'
 // This does NOT weaken the memory contract: the pressure governor still sheds
 // the encoder at L1 and everything at L2 regardless of this timer, and the host
 // still exits on its own idle rung.
-const ENCODER_IDLE_MS = (typeof navigator !== 'undefined' && !navigator.userAgentData) ? 20_000 : 5000
+//
+// WebKit specifically. `!navigator.userAgentData` — what this used to test —
+// also matches Gecko, which has neither the Metal compile cost nor the
+// inference-count crash, so Firefox was holding ~1 GB for 20 s to dodge a bug it
+// does not have. navigator.vendor is 'Apple Computer, Inc.' on every WebKit
+// browser (including iOS Chrome, correctly) and '' on Gecko.
+const IS_WEBKIT = typeof navigator !== 'undefined'
+    && !navigator.userAgentData
+    && /apple/i.test(navigator.vendor || '')
+const ENCODER_IDLE_MS = IS_WEBKIT ? 20_000 : 5000
 
 let onDeviceLost = null
 /** Host hook: notify tabs so they can re-encode rather than show a failure. */
@@ -215,15 +243,30 @@ const trimEmbeds = () => {
 }
 
 /** Hard gate (§4): WebGPU + shader-f16 or nothing. A silent WASM fallback is a
- *  second, hidden product that OOMs — measured ~3 GB vs ~0.5 GB. */
+ *  second, hidden product that OOMs — measured ~3 GB vs ~0.5 GB.
+ *  Asks through gpu-adapter so the gate and the encoder see the SAME GPU. */
 export const checkDevice = async () => {
     if (typeof navigator === 'undefined' || !navigator.gpu) {
         return { ok: false, reason: 'WebGPU unavailable' }
     }
-    const adapter = await navigator.gpu.requestAdapter()
+    const adapter = await requestAdapter()
     if (!adapter) return { ok: false, reason: 'no WebGPU adapter' }
     if (!adapter.features.has('shader-f16')) return { ok: false, reason: 'no shader-f16' }
-    return { ok: true, vendor: adapter.info?.vendor || null, arch: adapter.info?.architecture || null }
+    const gpu = profileAdapter(adapter)
+    // SwiftShader/WARP/llvmpipe clear every check above and then run a ViT at
+    // minutes per image. isFallbackAdapter misses the blocklisted-driver path.
+    if (gpu.software) return { ok: false, reason: `software WebGPU adapter (${gpu.name || 'unknown'})` }
+    // Name the short limit here rather than failing inside an encode.
+    if (gpu.storageBufferLimit && gpu.storageBufferLimit < MIN_STORAGE_BUFFER) {
+        return { ok: false, reason: `WebGPU adapter storage buffer limit too small (${gpu.storageBufferLimit} B)` }
+    }
+    return {
+        ok: true,
+        vendor: gpu.vendor || null,
+        arch: gpu.architecture || null,
+        backend: inferBackend(gpu) || null,   // metal | d3d12 | vulkan — inferred; the adapter rarely says
+        gpu,
+    }
 }
 
 // `outputs` is a SESSION option in ORT-Web, not a per-run one — omit it and
@@ -285,26 +328,18 @@ const captureDevice = () => {
  */
 const ensureDevice = async (ort) => {
     if (!state.lost) return
-    const adapter = await navigator.gpu?.requestAdapter()
+    const adapter = await requestAdapter()
     if (!adapter) throw new Error('sam21: no WebGPU adapter for recovery')
-    // Carry the adapter's own limits over. ORT raises buffer/binding limits well
-    // above the defaults for a model this size; a default device would build and
-    // then fail on allocation.
-    const requiredLimits = {}
-    for (const k in adapter.limits) {
-        const v = adapter.limits[k]
-        if (typeof v === 'number') requiredLimits[k] = v
-    }
-    // GPUSupportedLimits exposes its values as prototype getters, so a for-in
-    // that yields nothing would silently hand back a DEFAULT device — which
-    // builds fine and then fails on the encoder's allocations. Name the ones
-    // that decide that outcome explicitly.
-    for (const k of ['maxBufferSize', 'maxStorageBufferBindingSize', 'maxComputeWorkgroupStorageSize']) {
-        if (typeof adapter.limits[k] === 'number') requiredLimits[k] = adapter.limits[k]
-    }
+    // Compute limits only. Copying every adapter limit at max — what this did —
+    // is the documented anti-pattern: the spec has implementations warn about it
+    // and the driver then supports more than the lane uses (D3D12 resource-heap
+    // tier, Metal argument-buffer width). A default device fails on the
+    // encoder's allocations, so the buffer limits still go up; render limits
+    // this lane never touches do not. Explicit list — GPUSupportedLimits keeps
+    // its values on the prototype, so a for-in copy is a silent-default trap.
     const dev = await adapter.requestDevice({
         requiredFeatures: adapter.features.has('shader-f16') ? ['shader-f16'] : [],
-        requiredLimits,
+        requiredLimits: computeLimits(adapter),
     })
     ort.env.webgpu.device = dev
     state.lost = false
@@ -440,9 +475,8 @@ export const releaseDecoder = () => {
 // every embedding with it, so this only fires while the encoder is holding the
 // device open, and otherwise waits for a moment when it is.
 const RUN_RECYCLE_AFTER = 300
-// Chromium is the engine without the bug and the one where a needless rebuild
-// costs real time, so it opts out; same signal as the SharedWorker gate.
-const NEEDS_RUN_RECYCLE = typeof navigator !== 'undefined' && !navigator.userAgentData
+// WebKit-only bug, so only WebKit pays the rebuild (see IS_WEBKIT).
+const NEEDS_RUN_RECYCLE = IS_WEBKIT
 let runsSinceRecycle = 0
 /** Count one inference; retire the decoder before WebKit's crash threshold. */
 const noteRun = () => {
@@ -461,6 +495,8 @@ export const releaseEmbedding = (key = null) => {
         for (const b of v.buffers) { try { b.destroy() } catch { /* gone */ } }
         state.embeds.delete(k)
         forgetPick(k)   // nothing to continue from once the embedding is gone
+        // The 8 MB readback is only useful to a tab that still has this image.
+        if (lastReadback?.key === k) lastReadback = null
     }
 }
 
@@ -471,6 +507,11 @@ export const releaseAll = () => {
     releaseEncoder()
     releaseDecoder()
     releaseEmbedding()
+    // The preproc texture + pipeline belong to the device this is giving up.
+    // buildPreproc would drop them lazily on the next device anyway, so this
+    // costs nothing and reclaims 4 MB now instead of at the next encode.
+    dropPreproc()
+    lastReadback = null   // its embedding is gone; nothing can consume it
     // Dropping the LAST session takes ORT's GPUDevice with it and ORT will not
     // build another by itself, so arm the recovery seam for the next encode.
     // Without this the governor's top rung left the lane dead until the worker
@@ -520,7 +561,7 @@ const toTensorCPU = (ort, bitmap) => {
    resampling, and dropping `willReadFrequently` does not either: the flag
    selects a different 2D backend whose filter disagrees with the old one on
    40 % of pixels (max |Δ| 0.018). Same flag, same pixels. */
-const PREPROC_WGSL = `
+const PREPROC_WGSL = (WG) => `
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 const SIDE: u32 = ${SIDE}u;
@@ -548,7 +589,7 @@ fn value(e: u32) -> f32 {
     let t = textureLoad(src, vec2u(p % SIDE, p / SIDE), 0);
     return (chan(t, c) - mean_of(c)) / std_of(c);
 }
-@compute @workgroup_size(64)
+@compute @workgroup_size(${WG})
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let w = gid.x;
     if (w >= arrayLength(&dst)) { return; }
@@ -567,8 +608,11 @@ const dropPreproc = () => {
 const buildPreproc = (dev) => {
     if (preproc?.device === dev) return preproc
     dropPreproc()
+    // Device-derived, not a constant — see preprocWorkgroup for the numbers.
+    const wg = preprocWorkgroup(dev)
     preproc = {
         device: dev,
+        wg,
         stage: new OffscreenCanvas(SIDE, SIDE),
         tex: dev.createTexture({
             size: [SIDE, SIDE],
@@ -578,7 +622,7 @@ const buildPreproc = (dev) => {
         }),
         pipeline: dev.createComputePipeline({
             layout: 'auto',
-            compute: { module: dev.createShaderModule({ code: PREPROC_WGSL }), entryPoint: 'main' },
+            compute: { module: dev.createShaderModule({ code: PREPROC_WGSL(wg) }), entryPoint: 'main' },
         }),
     }
     preproc.ctx = preproc.stage.getContext('2d', { willReadFrequently: true })
@@ -610,7 +654,7 @@ const toTensorGPU = (ort, bitmap, dev) => {
             { binding: 1, resource: { buffer } },
         ],
     }))
-    pass.dispatchWorkgroups(Math.ceil(bytes / 4 / 64))
+    pass.dispatchWorkgroups(Math.ceil(bytes / 4 / p.wg))
     pass.end()
     dev.queue.submit([enc.finish()])
     return {

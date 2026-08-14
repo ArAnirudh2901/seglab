@@ -4,6 +4,8 @@
  * GIF/BMP/RAW preview/demo/paste/drop) sizes through here.
  */
 
+import { affordableShortEdge } from './hardware-fit.js'
+
 /** Bounded proxy dimensions for a source. Throws on invalid dimensions. */
 export function getBoundedProxySize(sourceWidth, sourceHeight, maxLongSide = 768) {
     if (
@@ -44,13 +46,21 @@ export const interactionPlan = (w, h, budget = {}) => {
     // SHORT one reaches the encoder edge, bounded by a hard long-edge stop and
     // a total-pixel guard so a panorama cannot turn this into a huge buffer.
     // Auto mode only: an explicit ?proxy= is the user's number, not ours.
-    const shortTarget = Math.min(budget.proxyShortMax || 0, cap)
+    // hardware-fit lowers the short edge when this device's measured (or
+    // estimated) post-processing throughput cannot pay for the full one inside
+    // the click budget. Unjudged devices get proxyShortMax unchanged.
+    const aspect = longSide / Math.max(1, Math.min(w, h))
+    const affordable = affordableShortEdge(budget, aspect)
+    const shortTarget = Math.min(affordable, cap)
     if (!disabled && budget.proxyMode !== 'manual' && shortTarget > 0) {
-        const aspect = longSide / Math.max(1, Math.min(w, h))
         const pixelCap = budget.proxyPixelMax || 0
         let want = Math.floor(shortTarget * aspect) // floor: never overshoot the encoder edge
         if (pixelCap > 0) want = Math.min(want, Math.round(Math.sqrt(pixelCap * aspect)))
-        cap = Math.max(cap, Math.min(want, budget.proxyLongMax || 2048))
+        want = Math.min(want, budget.proxyLongMax || 2048)
+        // Judged DOWN, `want` IS the answer, not a floor to raise toward:
+        // proxyMax is a 1024 LONG-edge minimum, so Math.max would hand back the
+        // full frame and the latency the judgement was avoiding.
+        cap = affordable < (budget.proxyShortMax || 0) ? want : Math.max(cap, want)
     }
     const { scale, proxyActive } = getBoundedProxySize(w, h, cap)
     return {
@@ -58,6 +68,30 @@ export const interactionPlan = (w, h, budget = {}) => {
         proxyActive,
         proxyReason: disabled && !directSafe ? 'safety' : (proxyActive ? 'device' : 'native'),
     }
+}
+
+/**
+ * Every budget field interactionPlan reads, including the ones it reads through
+ * hardware-fit. A worker hop can only send a plain object, and the subset was
+ * hand-maintained at the call site until it drifted: the omitted per-axis and
+ * throughput keys gave an opaque format a 1024 long-edge proxy where the same
+ * image got 1536x1024 elsewhere. The list lives with the reader so a new knob
+ * cannot be added to one and forgotten in the other.
+ */
+export const INTERACTION_PLAN_FIELDS = [
+    'proxyMax', 'proxyMode', 'safeProxyMax',
+    'proxyShortMax', 'proxyLongMax', 'proxyPixelMax',
+    'directMaxMP', 'directMaxSide',
+    'postMsPerMP', 'postBandFraction', 'postBudgetMs',
+]
+
+/** Cloneable budget subset for `interactionPlan` across a worker boundary. */
+export const planBudget = (budget = {}) => {
+    const slim = {}
+    for (const key of INTERACTION_PLAN_FIELDS) {
+        if (budget[key] !== undefined) slim[key] = budget[key]
+    }
+    return slim
 }
 
 /**

@@ -243,6 +243,9 @@ function finishSegment(result, revision, startedAt) {
         encodeMs: result.encodeMs,
         decodeMs: result.decodeMs,
         postMs: result.postMs,
+        // What postMs was spent ON — the refined band, not the proxy. hardware-fit
+        // normalises by this, so it has to travel with the timing that produced it.
+        bandPixels: result.bandPixels || 0,
         encoded: result.encoded,
         score: result.score,
         lane: result.lane,
@@ -442,6 +445,7 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs, kee
         phrases.forEach((p, i) => { const v = known.get(p); if (v) txtFeats.set(v, i * DIM) })
         const results = []
         let backend = null
+        let inferMs = 0
         const all = payload.frames || []
         for (let i = 0; i < all.length; i += 1) {
             const r = await withTimeout(detectYoloe({
@@ -450,8 +454,9 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs, kee
             }), timeoutMs, label)
             results.push(r.dets)
             backend = r.backend
+            inferMs += r.inferMs || 0
         }
-        return { results, slotNames: phrases, backend, learned }
+        return { results, slotNames: phrases, backend, learned, inferMs, cells: results.length }
     }
     if (detectIdleTimer) { clearTimeout(detectIdleTimer); detectIdleTimer = null }
     detectSeq += 1
@@ -477,6 +482,37 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs, kee
 /** Terminate the detect worker now — the only true free of its ORT arena.
  *  Exported for a caller holding it across the passes of one search. */
 export const disposeDetector = () => disposeDetectWorker()
+
+/* What a live detect worker costs the app, for the governor's ledger — on
+ * WebKit the ledger is the ONLY input, and the text lane was entirely absent
+ * from it, so a lane that peaks near a gigabyte was invisible to the one
+ * engine with no byte API. Measured in the detect process (DESIGN-TEXT-LANE
+ * §"YOLOE lane, isolated"): 326 MB idle → 962 MB session built → 1034 MB first
+ * run, and disposing the SESSION only returns the GPU share (854 MB floor) —
+ * the arena goes back when the WORKER is terminated, which is why residency is
+ * keyed on the worker, not on the session. Safari runs the same lane heavier
+ * (~1.03 GB observed before a process reap), so it gets the pessimistic figure.
+ */
+// Same WebKit signal the lane uses (sam21-lane.js §IS_WEBKIT): vendor is
+// 'Apple Computer, Inc.' on every WebKit browser including iOS Chrome, and ''
+// on Gecko — a UA sniff for 'safari' would miss the first and catch neither.
+const IS_WEBKIT = typeof navigator !== 'undefined'
+    && !navigator.userAgentData
+    && /apple/i.test(navigator.vendor || '')
+const DETECT_RESIDENT_MB = IS_WEBKIT ? 1030 : 700
+
+/** MB the live detect worker is holding (0 when it is not up). Ledger input. */
+export const detectorResidentMB = () => (detectWorker ? DETECT_RESIDENT_MB : 0)
+
+/** Free the detect worker for a shed, but never out from under a running
+ *  search — terminating mid-detection rejects the in-flight call, which the
+ *  user sees as a failed search rather than as memory relief. Returns whether
+ *  it actually freed anything. */
+export const disposeDetectorIfIdle = () => {
+    if (!detectWorker || detectPending.size) return false
+    disposeDetectWorker()
+    return true
+}
 
 /**
  * Open-vocabulary detection over a 640² letterboxed RGB frame (`frame.data`

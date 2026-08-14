@@ -66,12 +66,15 @@ const runText = async (payload) => {
     // build (and, with idleMs 0, a whole worker respawn) per tile.
     const results = []
     let backend = null
+    let inferMs = 0
     for (const frame of payload.frames || []) {
         const r = await detectYoloe({ frame, txtFeats, threshold: payload.threshold, dispose: false })
         results.push(r.dets)
         backend = r.backend
+        inferMs += r.inferMs || 0
     }
-    return { results, slotNames: phrases, backend, learned }
+    // Inference only, session build excluded — hardware-fit divides it by cells.
+    return { results, slotNames: phrases, backend, learned, inferMs, cells: results.length }
 }
 
 self.onmessage = async (event) => {

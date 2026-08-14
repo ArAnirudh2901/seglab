@@ -5,7 +5,7 @@
  * state or DOM here; app.js owns the input, overlay, and selection glue.
  */
 import {
-    clippedEdges, clusterObjects, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, dropClippedDuplicates, letterboxPlan, nms, normalizePhrase, rankDetections, scaleBox, shrinkFactor, TILE_OVERLAP, tilePlans, unletterboxBox, YOLOE_INPUT,
+    clippedEdges, clusterObjects, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, dropClippedDuplicates, filterToSubject, letterboxPlan, nms, normalizePhrase, rankDetections, scaleBox, shrinkFactor, TILE_OVERLAP, tilePlans, unletterboxBox, YOLOE_INPUT,
 } from './text-core.js'
 import { expandQuery } from './search-taxonomy.js'
 import { getTransform, getBoundedOriginal } from './asset-store.js'
@@ -99,6 +99,16 @@ const buildFrames = async (cells, tf, plan) => {
     }
 }
 
+/**
+ * Inference cost of the last search — hardware-fit's detector benchmark, run
+ * for free. Accumulated across BOTH passes of an escalated search, and readable
+ * even when the search answered "nothing here": that answer is the two-pass
+ * case, so dropping it would only ever measure the cheap half. Same channel
+ * shape as the mask lane's `lastRun` (sam-client).
+ */
+let lastDetect = null
+export const lastDetectCost = () => lastDetect
+
 /** One detector sweep at `grid` → detections merged into ORIGINAL pixels.
  *  Null when the decode failed; `stale` when a newer request superseded this one. */
 const runPass = async (tf, phrases, fallbackLabel, grid, budget, opts) => {
@@ -106,7 +116,10 @@ const runPass = async (tf, phrases, fallbackLabel, grid, budget, opts) => {
     const cells = cellsFor(tf, YOLOE_INPUT, plan)
     const frames = await buildFrames(cells, tf, plan)
     if (!frames) return null
-    const { results, slotNames, backend, stale } = await detectText(frames, phrases, opts)
+    const { results, slotNames, backend, stale, inferMs, cells: ran } = await detectText(frames, phrases, opts)
+    if (inferMs > 0 && ran > 0) {
+        lastDetect = { inferMs: (lastDetect?.inferMs || 0) + inferMs, cells: (lastDetect?.cells || 0) + ran }
+    }
     if (stale) return { stale: true, mapped: [], backend }
     if (!results?.length) return { stale: false, mapped: [], backend }
     const bounds = { w: tf.originalW, h: tf.originalH }
@@ -335,6 +348,7 @@ export const detectCandidates = async (phrase, {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
+    lastDetect = null
     const phrases = slotPhrases(norm)
     // 0.05, not the 0.25 a closed-vocabulary detector wants. Measured on the
     // canonical NEF: an absent object ("a rusty bicycle") scores NOTHING even at
@@ -352,12 +366,20 @@ export const detectCandidates = async (phrase, {
         threshold: 0.05, idleMs, evict, keepAlive,
     })
     let first
+    // Escalation asks about the SUBJECT only. A setting slot that scores well
+    // ("flowers") would otherwise satisfy the bar and skip the finer pass, so a
+    // small subject in a rich setting answered "nothing here" without ever
+    // looking harder — the exact case the filter below drops.
+    const subjectSet = subjectSlots(norm)
+    const clearedBar = (r) => (r.mapped || []).some(
+        (d) => d.score >= rankThreshold && (!subjectSet || subjectSet.has(d.label)),
+    )
     try {
         first = await pass(TILE_GRID, hold)
         if (!first || first.stale) return null
         // Nothing cleared the bar — retry finer before answering "not here". A tiny
         // subject scores under the floor at 2x2 and well over it at 3x3 (ESCALATE_GRID).
-        if (!first.mapped.some((d) => d.score >= rankThreshold) && mayEscalate) {
+        if (!clearedBar(first) && mayEscalate) {
             const deeper = await pass(ESCALATE_GRID)
             if (deeper?.stale) return null
             if (deeper?.mapped.length) first = deeper
@@ -367,19 +389,14 @@ export const detectCandidates = async (phrase, {
     }
     const { mapped, backend } = first
     if (mapped.length === 0) return null
-    // The detector scores a phrase as a bag of words, so a phrase whose SETTING
-    // is in the photo matches even when its subject is absent: "the dog sitting
-    // among the flowers" boxed 5 flowers, "snow covering the flowers" boxed 6.
-    // The subject has its own slots, so require at least one hit from them —
-    // if there is no dog anywhere, the compound match is the flowers bleeding
-    // through and the honest answer is nothing.
-    const subject = subjectSlots(norm)
-    if (subject && !mapped.some((d) => subject.has(d.label))) return null
+    // Setting bleed-through — both halves of it (text-core §filterToSubject).
+    const hits = filterToSubject(mapped, subjectSet)
+    if (!hits) return null
     const kx = tf.proxyW / tf.originalW
     const ky = tf.proxyH / tf.originalH
-    const focused = focusRequestedColor(mapped, norm.color)
+    const focused = focusRequestedColor(hits, norm.color)
     const ranked = rankDetections(focused, {
-        threshold: norm.color && focused !== mapped ? 0 : rankThreshold,
+        threshold: norm.color && focused !== hits ? 0 : rankThreshold,
         iou: 0.5, topK: 8, relative: 0.5,
     }).map((d) => toCandidate(d, kx, ky))
     const candidates = norm.multi ? ranked : clusterObjects(ranked)
