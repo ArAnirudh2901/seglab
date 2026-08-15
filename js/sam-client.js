@@ -484,9 +484,13 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs, kee
         // keepAlive: the caller has another pass of the SAME search coming and
         // will dispose itself. Without it a two-pass (escalated) search under
         // 'dispose now' rebuilds the whole YOLOE session between its own halves.
-        if (keepAlive) return
-        if (idleMs > 0) detectIdleTimer = setTimeout(disposeDetectWorker, idleMs)
-        else disposeDetectWorker()
+        // Guarded, never an early return: a return inside finally REPLACES the
+        // try's value, so the caller got undefined and every keepAlive search
+        // died destructuring it.
+        if (!keepAlive) {
+            if (idleMs > 0) detectIdleTimer = setTimeout(disposeDetectWorker, idleMs)
+            else disposeDetectWorker()
+        }
     }
 }
 

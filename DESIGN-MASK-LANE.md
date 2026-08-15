@@ -1087,9 +1087,9 @@ drive on its own. Run them through the dev-browser harness against
 `scripts/dev-server.mjs` on :8788 — COI headers and model caching both depend on
 that server, so a plain static server will not reproduce the conditions.
 
-`verify.mjs` now carries 202 `check()` assertions across 3134 lines, including
+`verify.mjs` now carries 203 `check()` assertions across 3143 lines, including
 both RAW fixture phases. `--fast` runs the three that need no browser (pure
-logic, heavy-job queue, static source scans — 118 assertions) and stops before
+logic, heavy-job queue, static source scans — 119 assertions) and stops before
 the browser phases; those need Playwright's Chromium and the dev server on
 :8788. The profile-related assertions phase 0 was meant to rewrite are gone with
 the presets — what is left refers to the single config.

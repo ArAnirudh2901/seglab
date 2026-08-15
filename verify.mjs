@@ -1494,6 +1494,15 @@ try {
       'shedMemory uses the idle-guarded dispose',
     )
     check(
+      // A `return` inside finally REPLACES the try's value. The keepAlive path
+      // (an escalating two-pass search) therefore resolved undefined, and every
+      // caller died destructuring `results` off it — a whole lane, silently.
+      'static: the detect worker\'s cleanup never swallows the result',
+      !/if \(keepAlive\) return\b/.test(sources['sam-client.js'])
+        && /if \(!keepAlive\) \{/.test(sources['sam-client.js']),
+      'finally only schedules disposal',
+    )
+    check(
       // The fill alone leaves the user guessing which pixels are in; the border
       // is what makes a wrong SAM candidate visible on the first click.
       'static: the selection is drawn with a border, not fill alone',
