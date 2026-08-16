@@ -120,24 +120,208 @@ export const composeChannels = (ops, width, height, floor = null) => {
 }
 
 /**
+ * One axis of a chebyshev dilation: two sweeps carrying the distance since the
+ * last set cell. Cost is one read/write per cell and does not depend on the
+ * radius, which is what keeps the mask-wide morphology linear.
+ */
+const spread = (src, dst, n, step, base, r) => {
+    let d = r + 1
+    for (let i = 0; i < n; i += 1) {
+        const p = base + i * step
+        d = src[p] ? 0 : d + 1
+        dst[p] = d <= r ? 1 : 0
+    }
+    d = r + 1
+    for (let i = n - 1; i >= 0; i -= 1) {
+        const p = base + i * step
+        d = src[p] ? 0 : d + 1
+        if (d <= r) dst[p] = 1
+    }
+}
+
+/** Chebyshev dilation of a binary field, separably: along x, then along y. */
+const dilateBinary = (src, dst, tmp, width, r, [x0, y0, x1, y1]) => {
+    for (let y = y0; y < y1; y += 1) spread(src, tmp, x1 - x0, 1, y * width + x0, r)
+    for (let x = x0; x < x1; x += 1) spread(tmp, dst, y1 - y0, width, y0 * width + x, r)
+}
+
+/**
  * Dilate a 1-channel mask by `radius` px (chebyshev). Subtract ops grow by a
  * safety margin so removing an object never leaves a boundary-residue ring
  * where two decodes of the same object disagree by a pixel.
  */
 export const dilateChannel = (chan, width, height, radius = 2) => {
     if (!radius) return chan
-    const out = new Uint8Array(chan.length)
-    for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-            if (!chan[y * width + x]) continue
-            const x0 = Math.max(0, x - radius)
-            const x1 = Math.min(width - 1, x + radius)
-            const y0 = Math.max(0, y - radius)
-            const y1 = Math.min(height - 1, y + radius)
-            for (let yy = y0; yy <= y1; yy += 1) out.fill(255, yy * width + x0, yy * width + x1 + 1)
+    const n = chan.length
+    const bin = new Uint8Array(n)
+    for (let i = 0; i < n; i += 1) bin[i] = chan[i] ? 1 : 0
+    const tmp = new Uint8Array(n)
+    const out = new Uint8Array(n)
+    dilateBinary(bin, out, tmp, width, radius, [0, 0, width, height])
+    for (let i = 0; i < n; i += 1) out[i] = out[i] ? 255 : 0
+    return out
+}
+
+/* ─── Boundary regularisation (the composed selection) ────────────────────── */
+
+// Everything below works inside the selection's bounding box grown by the
+// kernel. Nothing outside it can change, so a small object in a large frame
+// costs its own area instead of the frame's. `rect` is an INCLUSIVE bbox, the
+// shape summarizeMaskRGBA returns; the result is [x0, y0, x1, y1) exclusive.
+const workRect = (rect, width, height, margin) => (rect
+    ? [Math.max(0, Math.floor(rect[0]) - margin), Math.max(0, Math.floor(rect[1]) - margin),
+        Math.min(width, Math.floor(rect[2]) + 1 + margin), Math.min(height, Math.floor(rect[3]) + 1 + margin)]
+    : [0, 0, width, height])
+
+/**
+ * Close hairline gaps in the composed selection — a morphological closing of
+ * the ≥128 core, written back at full value.
+ *
+ * Two objects selected one after the other each stop a pixel short of the edge
+ * they share, so their union keeps a slit of background along it. The outline
+ * is a dilation of the core, so a two-pixel slit gets drawn as a border THROUGH
+ * the middle of what the user selected as one thing. A closing joins gaps
+ * narrower than 2r and leaves every other boundary exactly where it was.
+ *
+ * Add-only: it can never drop a selected pixel, so no object is lost to it.
+ * Outside the frame reads as foreground for the erosion, so a slit that runs
+ * off the frame edge closes to the edge instead of leaving a notch there.
+ * Returns the number of pixels filled.
+ */
+export const bridgeGaps = (rgba, width, height, { radius = 2, rect = null } = {}) => {
+    const r = Math.max(1, Math.round(radius))
+    const [x0, y0, x1, y1] = workRect(rect, width, height, r + 1)
+    if (x1 <= x0 || y1 <= y0) return 0
+    const n = width * height
+    const core = new Uint8Array(n)
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) core[row + x] = rgba[(row + x) * 4] >= 128 ? 1 : 0
+    }
+    const tmp = new Uint8Array(n)
+    const dil = new Uint8Array(n)
+    dilateBinary(core, dil, tmp, width, r, [x0, y0, x1, y1])
+    // Erosion is the complement of the dilation of the complement, so one
+    // primitive covers both halves of the closing.
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) dil[row + x] = dil[row + x] ? 0 : 1
+    }
+    const back = new Uint8Array(n)
+    dilateBinary(dil, back, tmp, width, r, [x0, y0, x1, y1])
+    let filled = 0
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) {
+            const p = row + x
+            if (back[p] || core[p]) continue
+            const j = p * 4
+            rgba[j] = 255; rgba[j + 1] = 255; rgba[j + 2] = 255; rgba[j + 3] = 255
+            filled += 1
         }
     }
-    return out
+    return filled
+}
+
+// Whether clearing a cell keeps the shape connected: with its 8 neighbours read
+// as a ring, one 0→1 transition means they form a single arc, so the cell is on
+// a boundary. Two or more means it is the LINK between separate parts — a 1 px
+// wire is exactly that — and clearing it would sever them.
+const SIMPLE = new Uint8Array(256)
+for (let code = 0; code < 256; code += 1) {
+    let arcs = 0
+    for (let k = 0; k < 8; k += 1) {
+        if (!((code >> k) & 1) && ((code >> ((k + 1) & 7)) & 1)) arcs += 1
+    }
+    SIMPLE[code] = arcs === 1 ? 1 : 0
+}
+
+const nbrCode = (core, p, x, y, w, box) => {
+    const up = y > box[1]; const dn = y < box[3] - 1
+    const lf = x > box[0]; const rt = x < box[2] - 1
+    let c = 0
+    if (up && core[p - w]) c |= 1
+    if (up && rt && core[p - w + 1]) c |= 2
+    if (rt && core[p + 1]) c |= 4
+    if (dn && rt && core[p + w + 1]) c |= 8
+    if (dn && core[p + w]) c |= 16
+    if (dn && lf && core[p + w - 1]) c |= 32
+    if (lf && core[p - 1]) c |= 64
+    if (up && lf && core[p - w - 1]) c |= 128
+    return c
+}
+
+/**
+ * Smooth the selection boundary: replace each value by the mean of its
+ * (2r+1)² neighbourhood.
+ *
+ * The mask is a soft band around the decoder's own level set, and across a
+ * straight edge that band is close to linear — a box mean of a linear ramp is
+ * the same ramp, so a straight or diagonal edge comes back unmoved and only
+ * the pixel-scale wobble averages out. That is curvature smoothing of the
+ * level set, which is what a jagged staircase needs; a hard 0/255 median
+ * would instead re-quantise the edge it is meant to soften.
+ *
+ * The one thing a mean cannot be trusted with is a thin structure: a 1 px wire
+ * averages below the decision level along its whole length and disappears. A
+ * core cell is therefore never cleared unless its neighbours form a single arc
+ * — the standard connectivity test — so wires and spokes keep their spine.
+ *
+ * Sliding windows: two passes, one add and one drop per cell, independent of r.
+ * Returns the number of pixels changed.
+ */
+export const smoothBoundary = (rgba, width, height, { radius = 1, rect = null } = {}) => {
+    const r = Math.max(1, Math.round(radius))
+    const box = workRect(rect, width, height, r + 1)
+    const [x0, y0, x1, y1] = box
+    if (x1 <= x0 || y1 <= y0) return 0
+    const n = width * height
+    const core = new Uint8Array(n)
+    const sums = new Int32Array(n)
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        let s = 0
+        const seed = Math.min(x0 + r, x1 - 1)
+        for (let x = x0; x <= seed; x += 1) s += rgba[(row + x) * 4]
+        for (let x = x0; x < x1; x += 1) {
+            const p = row + x
+            sums[p] = s
+            core[p] = rgba[p * 4] >= 128 ? 1 : 0
+            const drop = x - r
+            const add = x + r + 1
+            if (drop >= x0) s -= rgba[(row + drop) * 4]
+            if (add < x1) s += rgba[(row + add) * 4]
+        }
+    }
+    let changed = 0
+    for (let x = x0; x < x1; x += 1) {
+        const wx = Math.min(x + r, x1 - 1) - Math.max(x - r, x0) + 1
+        let s = 0
+        const seed = Math.min(y0 + r, y1 - 1)
+        for (let y = y0; y <= seed; y += 1) s += sums[y * width + x]
+        for (let y = y0; y < y1; y += 1) {
+            const p = y * width + x
+            const wy = Math.min(y + r, y1 - 1) - Math.max(y - r, y0) + 1
+            const v = rgba[p * 4]
+            const m = Math.round(s / (wx * wy))
+            const drop = y - r
+            const add = y + r + 1
+            if (drop >= y0) s -= sums[drop * width + x]
+            if (add < y1) s += sums[add * width + x]
+            if (m === v) continue
+            if (v >= 128 && m < 128) {
+                // Against the RUNNING core, not a snapshot: two neighbouring
+                // cells can each be safe to clear on their own and sever the
+                // shape between them if both go.
+                if (!SIMPLE[nbrCode(core, p, x, y, width, box)]) continue
+                core[p] = 0
+            } else if (v < 128 && m >= 128) core[p] = 1
+            const j = p * 4
+            rgba[j] = m; rgba[j + 1] = m; rgba[j + 2] = m; rgba[j + 3] = 255
+            changed += 1
+        }
+    }
+    return changed
 }
 
 /** True when (x, y) — or any pixel within `tolerance` px — is selected. */
@@ -206,6 +390,47 @@ export const countMaskComponents = (rgba, w, h) => {
     const bin = new Uint8Array(w * h)
     for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
     return labelComponents(bin, w, h).areas.length
+}
+
+/**
+ * Per-component geometry of a thresholded mask (verify/debug hook). A count
+ * alone cannot tell speckle from a second object dragged in, which is the
+ * whole question region hygiene answers — so this reports what the rules
+ * themselves test: area, bbox, solidity, and whether a click landed in it.
+ * Sorted largest first, capped at `limit`.
+ */
+export const maskRegions = (rgba, w, h, clicks = [], limit = 12) => {
+    const bin = new Uint8Array(w * h)
+    for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
+    const { labels, areas } = labelComponents(bin, w, h)
+    const rows = areas.map((area, k) => ({
+        area, label: k + 1, x0: w, y0: h, x1: 0, y1: 0, clicked: false,
+    }))
+    for (let i = 0; i < labels.length; i += 1) {
+        const l = labels[i]
+        if (!l) continue
+        const r = rows[l - 1]
+        const y = (i / w) | 0
+        const x = i - y * w
+        if (x < r.x0) r.x0 = x
+        if (x >= r.x1) r.x1 = x + 1
+        if (y < r.y0) r.y0 = y
+        if (y >= r.y1) r.y1 = y + 1
+    }
+    for (const [cx, cy, label] of clicks) {
+        if (label !== 1) continue
+        const i = Math.min(h - 1, Math.max(0, Math.round(cy))) * w
+            + Math.min(w - 1, Math.max(0, Math.round(cx)))
+        if (labels[i]) rows[labels[i] - 1].clicked = true
+    }
+    const total = areas.reduce((a, b) => a + b, 0)
+    return rows.sort((a, b) => b.area - a.area).slice(0, limit).map((r) => ({
+        area: r.area,
+        share: total ? r.area / total : 0,
+        box: [r.x0, r.y0, r.x1, r.y1],
+        solidity: r.area / Math.max(1, Math.max(r.x1 - r.x0, r.y1 - r.y0) ** 2),
+        clicked: r.clicked,
+    }))
 }
 
 /* ─── Crop-space helpers (M1 crop pyramid / HD export) ──────────────────── */

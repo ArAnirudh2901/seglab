@@ -879,6 +879,7 @@ the question a click asks, and it is silent on every failure below:
 | no real boundary | a mushy field can score high | ranked down by SAM's own stability score |
 | hierarchy drift between clicks | click 2 may switch level, so a point on a sleeve reshapes the person into a sleeve | continuity: prefer the candidate agreeing with what the user was already shown |
 | speckle / enclosed gaps | shipped as-is | upstream SAM's `remove_small_regions`, both modes |
+| a repeated subject (rivets, grapes) drags its neighbours in | shipped as-is — too large for any size rule | separated, solid components with no click in them are dropped |
 
 The arbitration order is **prompt consistency → continuity → rank**, and the
 composition matters: an exclude click disqualifies the too-large candidate
@@ -909,10 +910,181 @@ dominance against ~0.9 for a compact subject with real speckle. Severing a wire
 anything is removed: dominance ≥ 0.85, ≤ 16 cells absolute, < 2% of the mask,
 and no include click in it.
 
+### Outliers are separated by space, not by size
+
+The size rule cannot reach the other half of the problem. A click on one of a
+*repeated* subject — one rivet in a plate of rivets, one grape — comes back with
+the neighbours attached, whole: far above 16 cells, and large enough that
+dominance drops under 0.85 on the way in, which switches the size rule off
+entirely. That is exactly the reported screenshot: one click, one rivet, two
+extra blobs.
+
+Those blobs differ from a severed wire by **distance and shape**, so that is
+what is tested. A component is removed when all of these hold:
+
+| condition | why |
+| --- | --- |
+| gap ≥ 15% of the anchor's long side, min 2 cells | Chebyshev gap between bounding boxes; the floor keeps a grid-severed neck out of it |
+| `area / long-side² ≥ 0.3` on **both** the anchor and the candidate | a disc scores ~0.8, a pole-with-wires ~0.1, a 2×300 wire 0.007 — so the streetlight turns the rule **off**, and a detached wire is never the thing removed. Bbox fill will not do this: an axis-aligned wire fills its own box perfectly |
+| no include click in it | as everywhere else, the user pointed at it |
+| an include click exists at all | the click is the anchor. At export scale the prompt is history and a box prompt never named a component, so with no click the rule does not run — otherwise it would delete the second blob of a deliberate two-click selection |
+
 Hole filling needs no gate: 0.000 IoU cost on the streetlight, and on the
 reported rose (`scratchpad/rose.mjs`) it adds 513 px, all of them shadowed
 crevices *inside* the bloom — background to a colour ground truth, part of the
 flower to a human.
+
+### Hygiene has to run where the mask is thresholded
+
+The gate above cleaned SAM's 256² grid, which is not where the mask is decided.
+Two stages run after it, and both were measured manufacturing detached
+components out of a field that reached them as a single one:
+
+- the **bicubic upsample** (Catmull-Rom, negative lobes) rings beside the
+  `-FILL` value hygiene itself writes, and severs a neck that is one cell wide
+  at 256² but sub-pixel at proxy scale;
+- the **colour guided filter** flips a near-zero plateau wherever a strong
+  colour edge runs just outside the boundary — a luma guide on a clean disc
+  produced a second component with nothing planted at all.
+
+That is the speckle in the reported screenshots: dots, dashes and one-pixel
+rings outside the contour, all of them born after the only pass that could
+have removed them. So the same rule runs again at proxy resolution, on the
+already-matted field, inside the mask's own bounding box (`upsampleLogits`
+returns that window from the pass it was already making). Every caller that
+thresholds a field now runs it — including `cropDecode`, which had none at all
+because it does not go through the lane's arbitration.
+
+The 16-cell floor is tuned on 256². The same speckle covers the same *fraction*
+of a finer field, so the threshold scales by area (171 px on a 1024×683 proxy)
+instead of being re-tuned per resolution, with 16 kept as the floor because on a
+coarser grid speckle still lands in single cells.
+
+Running per click at proxy resolution is a cost, so the labeller is built for
+it. Cells are read once in address order as **runs** (scanline run-length +
+union-find), not per-pixel flood fill: no `Int32Array` label plane (2.8 MB at
+proxy), no recursion stack, and the only scattered access is a union-find sized
+by run count — thousands — rather than by pixels. Dropped components are
+rewritten with `TypedArray.fill`, the scratch arrays live at module scope, and
+the pass returns the dirty rect so the RGBA repaint stays as small as the edit.
+
+| measured, per click | ms |
+| --- | --- |
+| `refineField` (guided filter), for scale | 12.8 – 14.5 |
+| proxy hygiene, typical subject | **1.04** |
+| proxy hygiene, mask spanning the whole 1024×683 frame | 3.3 – 5.0 |
+
+Equivalence with the flood fill it replaces is proven over 108 cases
+(side ∈ {16, 64, 256} × blob, blob+speckle, wires, noise, empty, full) — every
+one identical. On the planted case, 25/9/4 px speckle goes, a 600 px detached
+wire survives, a 36 px pinhole is filled, and a speckle the user clicked is
+never removed (`verify.mjs` phase T).
+
+### What real DSLR frames found that planted fields could not
+
+Planted cases prove the rules; they cannot find the places the rules are never
+asked. `.leak-probe.mjs` drives real frames through the real pipeline — four
+DSLR RAWs plus the tram crop, 27 clicks chosen to be hard (a rivet in a plate
+of rivets, one tulip beside its twin, a person occluded by a chair, a black
+shirt against a black neighbour, thin cable on dark wood, subjects cropped by
+the frame, and correction sequences with negatives) — and reports, per click,
+every component that holds no click: its area, its separation from the nearest
+clicked one, and its solidity. That is the rules' own vocabulary, so a leak
+arrives as a row rather than a screenshot. Two showed up.
+
+**The scan window was smaller than the stage that dirties it.** Hygiene was
+handed the mask box. The guided filter works on the *band* box plus a pad of
+`radius·2 + scale·2` — 24 px on the proxy path, up to 80 px on the native one —
+so it writes OUTSIDE the window that polices it, and a pixel it lifts over zero
+out there is a component nothing can ever see. One rivet click on
+`d750-lossless.nef` shipped exactly one such pixel, 3 px past the box. Every
+call site now scans `box ∪ refineField`'s returned rect, which costs nothing:
+both rects were already in hand, and `cropDecode` was discarding the second.
+
+**One honest second part switched the whole size rule off.** Dominance stands
+in for "the subject is legitimately fragmented", and a single real second
+component fakes it. A click on a seated person, whose leg the chair cuts off,
+scored 0.838 — under the 0.85 gate — so 26 specks of 40-80 px shipped with it,
+28 components for one person. Lowering the gate is the wrong lever: it is
+measured against the streetlight at 0.568, and the distance between them is the
+whole safety margin.
+
+What a fragmented subject cannot fake is the *risk of the removal itself*, so
+below the gate the rule now caps that instead of guessing: components under a
+quarter of `islandCells`, removed only while they add up to under 0.5 % of the
+mask, all-or-nothing. The person drops 26 specks worth 0.25 % and keeps the leg
+(28 components → 2). The streetlight's speckle is percent-of-mask, an order of
+magnitude over the budget, so it is refused whole — which is the behaviour the
+gate was built to give.
+
+Three findings in the same table were **not** leaks, and saying so is the point
+of measuring: the 13 535 px beside the seated person is her leg, the 9 281 px
+under the black shirt is its hem, and the 172 px near the white chair is more
+chair. The probe's first cut called all three catastrophic because it took only
+the *first* clicked component as the anchor — so a deliberate two-object
+selection read as a 4.6 % anchor. Every clicked component is an anchor now, and
+a click outside the live mask commits a new object, so the row reports that too
+(`+2obj`). A measurement that cannot tell a second object from a leak will
+happily prove a leak that is not there.
+
+### 10f. The union of several objects is regularised, not the objects **[MEASURED]**
+
+Per-click hygiene works inside one decode. Selecting six adjacent cubes one
+after the other produces a defect neither pass can see, because it exists only
+*between* two decodes: each object stops about a cell short of the edge it
+shares with its neighbour, so the union keeps a hairline slit along every
+internal boundary. The outline is a dilation of the hard core, so a slit two
+pixels wide is painted as a **border through the middle of what the user
+selected as one thing** — that is the internal seams and the notches along the
+floor line in the reported screenshots. Measured on that union: one component,
+but 26 enclosed holes worth 461 px, plus open slits; the gap histogram is
+201 px of 1-px runs, 238 of 2-px and 141 of 3-px before the tail of genuine
+background at ≥16 px.
+
+So `recomposeMask` regularises the *composed* mask on every recompose
+(`bridgeGaps` + `smoothBoundary`, js/sam-core.js). It is re-derived, never
+baked into an op, so undo and subtract stay exact.
+
+- **`bridgeGaps`** — a morphological closing of the ≥128 core, add-only by
+  construction, so no object can be lost to it. Radius is `max(1, long/512)` =
+  **half a decoder cell**: a gap that narrow is two decodes disagreeing about
+  one cell, not background anyone chose to keep. Measured on the sweep: r=1
+  leaves 2 holes, **r=2 leaves 3 (+0.78 % area)**, r=3 leaves 0 but starts
+  closing real pockets between objects, r=4 adds nothing further. Outside the
+  frame reads as foreground, so a slit that runs off the frame edge closes to
+  the edge instead of leaving a notch there.
+- **`smoothBoundary`** — the mean of each (2r+1)² neighbourhood. The mask is a
+  soft band around the decoder's level set and that band is near-linear across
+  a straight edge, and a box mean of a ramp is the same ramp: straight and
+  diagonal edges come back unmoved and only pixel-scale wobble averages out.
+  That is curvature smoothing of the level set; a hard 0/255 median would
+  instead re-quantise the edge it is meant to soften. Radius is
+  `max(1, long/1024)` = 1: r=1 costs −2.3 % perimeter at IoU 0.9991, r=2
+  −4.2 % at 0.9979, and on a 153-px object r=2 already costs 2.6 % of the area.
+  Manual geometry skips it — a drawn rectangle keeps its corners by contract.
+
+The one thing a mean cannot be trusted with is a thin structure: a 1-px wire
+averages below the decision level along its whole length. A core cell is
+therefore never cleared unless its 8 neighbours form a single arc (crossing
+number 1). The guard has to be evaluated against the **running** core, not a
+snapshot — the first version used a snapshot, and two adjacent cells that were
+each simple on their own severed the streetlight into two components. Union
+hole *filling* is deliberately absent: a brush erase leaves an enclosed hole,
+and refilling it would undo the user's own action. Bridging at r=2 cannot
+reach one, because brush strokes are ≥20 px wide.
+
+End to end on the reported case: holes **26 → 3** (461 → 121 px), perimeter
+**2090 → 1397** (−33 %), roughness 1.919 → 1.278, still one component, +0.79 %
+area. The three survivors are genuine background pockets.
+
+Both passes are linear and bounded by the selection, not the frame. Chebyshev
+dilation is separable and each axis is two sweeps carrying the distance since
+the last set cell, so **cost does not depend on the radius**: `dilateChannel`
+went from 17.1 / 52.8 / 91.3 ms at r=2/6/12 to **4.2 / 5.8 / 4.9**, identical
+output over 40 random fields × 5 radii. The mean uses sliding windows for the
+same reason. Working inside the bbox grown by the kernel cuts a full-frame
+close from 12.4 to 7.4 ms; the whole regulariser is **8.7 ms** on a 900×675
+composed mask.
 
 ### 10d. Showing the three, instead of hiding them behind a key
 
@@ -925,10 +1097,9 @@ discovers.
 The three candidates are already parked in memory, ordered small→large, and
 picking one costs a repaint (upsample + guided filter over a plane that is
 already decoded), not a decode. So the cost of *showing* them is a row of pills:
-`#scope`, one button per candidate, labelled with its coverage of the frame and
-titled with its confidence, `aria-pressed` on the active one. Measured on the
-demo scene: `3% / 6% / 34%`, default 6%, and clicking the 3% pill takes the
-mask from 0.0638 to 0.0304 coverage with no decode.
+`#scope`, one button per candidate, `aria-pressed` on the active one. Measured
+on the demo scene: default 6%, and clicking the smallest pill takes the mask
+from 0.0638 to 0.0304 coverage with no decode.
 
 Two details are what make it usable rather than merely present:
 
@@ -942,8 +1113,88 @@ Two details are what make it usable rather than merely present:
   control is placed below that extent, not below the click. A bar parked on the
   subject hides the evidence the user opened it to look at.
 
-`C` still works, and the pill row shows it as a hint — the control teaches the
-shortcut rather than replacing it.
+`C` still works — the control does not replace the shortcut, it makes it
+unnecessary.
+
+### 10e. Showing the readings themselves
+
+Showing the three was not enough, and every attempt at *naming* them was worse
+than the numbers. `1.9% · 6.3% · 13.2%` names a measurement rather than a
+choice. `Part · Object · Whole` — SAM's own hierarchy — names a **meaning the
+model does not give**: what comes back is three sizes, and when the biggest
+reading is a pole plus a wire plus a patch of sky, calling it "Whole" makes the
+control less trustworthy, not more. A `− Less ○ ● ○ More +` row named a
+direction but never a destination — the dots counted the readings without
+showing one, so the only way to learn what "more" meant was to spend a repaint
+and look.
+
+What survives is the choice itself: one swatch per reading, painted from that
+candidate's own mask — the lamp head, the lamp with its arm, the pole with the
+wire. Same bargain as Photoshop's object finder: show the shape, take it on
+click, with the ranking left to the eye because no ranking rule works here
+(§10a). Hovering ghosts the shape on the canvas (`sam21CandidateShape`, a 256²
+threshold — no upsample, no guided filter), so the answer to "what is this
+button?" is the shape itself. Exact percentages stay in the tooltip, the
+`aria-label` and the status line, where a number belongs.
+
+Two things about the drawing were found by measuring, and both are the whole
+reason it reads:
+
+- **Own crop, not a shared one.** The first cut drew all three inside one union
+  crop so the areas were literally comparable. On a real click — readings of
+  0.2 / 0.7 / 17 % of the frame — that gives two invisible specks beside one
+  filled blob, and the swatch that matters most is the one you are about to
+  reject as too small. A ghost layer behind each swatch did not rescue it. Each
+  shape now gets its own crop and **size carries only the order**: areas spread
+  on a log ladder between the smallest and largest reading of *that* click,
+  floored at 42 % of the cell (`fills`). Measured ink per swatch: 0.045 /
+  0.174 / 0.626 — monotone and distinct.
+- **The field is a square resize, so the silhouette has to be un-squashed.**
+  The decoder returns `MASK_SIDE²`, a square resize of the frame, not
+  longest-side-plus-pad. Drawn straight, a tram measuring 0.735:1 in mask space
+  is 1.26:1 on the canvas — a different shape. `paint()` multiplies the width by
+  the displayed **frame's** aspect (`geometry().aspect`, fed from the overlay
+  rect — the stage box only matches it while the stage hugs the photo).
+
+At an end nothing greys out, because there is no direction button left to grey:
+every swatch is a destination, and the stepping paths simply clamp.
+
+Two gestures step the same thing for people who never look at a bar:
+
+| gesture | why it was free to take |
+| --- | --- |
+| **drag up and down over the selection** | in click mode a moved tap is already discarded, so a vertical scrub was dead input. 34 px per step, live ghost preview, commits on release. |
+| **scroll over the selection** | the canvas has no zoom, so the wheel was unbound. 40 delta per step. |
+
+The scrub starts only on ≥ 14 px of *vertical* travel that beats the horizontal
+travel — above both tap slops (5 px pointer, 12 px touch) — so a shaky hand
+never steps by accident and no other tool's drag is taken over. One mental
+model across the drag, the wheel and `C`: **up is more**.
+
+Two things were tried and cut. A third gesture, *tap the same spot again*, was
+free in the same sense — a second prompt on the same pixel is a no-op SAM
+already has — but it collides with the one rule every user has already learned,
+that **clicks add points**, and it was the only stepper that wrapped. Wrapping
+went with it. Every path now steps by one through the same clamped `stepScope`:
+buttons, dots, wheel, drag, and the keyboard alike.
+
+Driven through a real browser against `streetlight.jpg` (`.scope-probe.mjs`,
+Playwright, real mouse — synthetic events would skip pointer capture and the
+tap/scrub arbitration, which is the part worth proving):
+
+```
+first click:    {count:3, index:1, shapes:3, drawn:3, pressed:1}
+last swatch:    index 1 → 2   "Selected 17.1% of frame (3 of 3)"
+wheel down:     2 → 1         ×3 more: 0, and it stays 0 (clamped, not wrapped)
+drag up 80px:   0 → 2         (34 px per step)
+tap same spot:  clicks 1 → 2  (still a prompt, never a step)
+ink per swatch: 0.045 / 0.174 / 0.626        pill 110×36, inside the stage
+```
+
+The whole control is `js/scope-control.js`: a mount element, a surface to
+listen on, and callbacks. No app state, no imports, no framework — Mask Studio
+and Phosmith take the file as-is, and `verify.mjs` asserts that it stays that
+way.
 
 ---
 
@@ -1087,12 +1338,26 @@ drive on its own. Run them through the dev-browser harness against
 `scripts/dev-server.mjs` on :8788 — COI headers and model caching both depend on
 that server, so a plain static server will not reproduce the conditions.
 
-`verify.mjs` now carries 203 `check()` assertions across 3143 lines, including
-both RAW fixture phases. `--fast` runs the three that need no browser (pure
-logic, heavy-job queue, static source scans — 119 assertions) and stops before
-the browser phases; those need Playwright's Chromium and the dev server on
-:8788. The profile-related assertions phase 0 was meant to rewrite are gone with
-the presets — what is left refers to the single config.
+`verify.mjs` now carries 227 `check()` calls across 3574 lines (231 assertions
+in a full run), including both RAW fixture phases. `--fast` runs the three that
+need no browser (pure logic, heavy-job queue, static source scans — 134
+assertions) and stops before the browser phases; those need Playwright and the
+dev server on :8788. The profile-related assertions phase 0 was meant to rewrite
+are gone with the presets — what is left refers to the single config.
+
+The browser phases drive the **installed Google Chrome**, not Playwright's
+bundled Chrome-for-Testing: `scripts/harness/browser.mjs` resolves the channel
+for verify and both probes, `--cft` opts back out, and the profile path carries
+the channel because stable Chrome refuses a profile Chrome-for-Testing wrote.
+
+Phase **G** is the only one that drives a real pointer. Every other phase clicks
+through `clickAt`, which takes canvas coordinates and so never exercises the
+pointer→canvas mapping — and that mapping is measured against a `#frame` the
+zoom transforms, where a stale rect selects a different object without ever
+throwing. G proves the mapping under zoom and pan, the pan clamp, the 1×–8×
+range, the keys, and a CDP pinch (touch emulation on the same page, so it costs
+no second browser). `.zoom-probe.mjs` is its exploratory sibling and adds a real
+touch context plus the wheel-vs-scope arbitration.
 
 ---
 

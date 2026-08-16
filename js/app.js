@@ -11,12 +11,14 @@
  * frame — display scaling is pure CSS, undone at the pointer.
  */
 
-import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
+import { countMaskComponents, maskRegions, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel, bridgeGaps, smoothBoundary } from './sam-core.js'
 import {
-    cancelBefore, candidateShape, clientState, cycleCandidate, detectorResidentMB, disposeDetectorIfIdle,
+    cancelBefore, candidateShape, clientState, detectorResidentMB, disposeDetectorIfIdle,
     encodeImage, encoderReady, engineState, forgetEncoder, pickCandidate, releaseDocument,
     releaseEmbeddings, segment, subscribe, warmEncoder, warmUp, relievePressure,
 } from './sam-client.js'
+import { createScopeControl, stepScope } from './scope-control.js'
+import { createGestures } from './gestures.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import {
     observePost, observeBandFraction, savePostFit, explainFit,
@@ -114,14 +116,15 @@ const ensureWarm = (opts) => {
     return warmUp(opts)
 }
 
-const ACCENT = '#35e0c2'
-const POS_COLOR = '#35e08a'
-const NEG_COLOR = '#ff5d6c'
+const ACCENT = '#53d8ff'
+const POS_COLOR = '#9bf95b'
+const NEG_COLOR = '#f43f5e'
 
 const $ = (id) => document.getElementById(id)
 const els = {
-    main: $('main'), dropzone: $('dropzone'), stage: $('stage'),
+    main: $('main'), dropzone: $('dropzone'), stage: $('stage'), frame: $('frame'),
     photo: $('photo'), view: $('view'), overlay: $('overlay'), file: $('file'),
+    context: $('context'), hint: $('hint'), zoomreset: $('zoomreset'),
     pick: $('pick'), newimg: $('newimg'),
     status: $('status'), loadbar: $('loadbar'),
     prep: $('prep'), prepText: $('prep-text'),
@@ -554,6 +557,7 @@ const showImage = async (source, {
     clearPrompts()
     els.dropzone.style.display = 'none'
     els.stage.classList.add('visible')
+    gestures.reset() // a new photo starts at 1× — inherited pan is disorienting
     const frameMode = transform.proxyActive
         ? `adaptive ${transform.proxyW}×${transform.proxyH} proxy`
         : 'native interaction frame (proxy disabled)'
@@ -730,10 +734,13 @@ const shedMemory = (level, { announce = true } = {}) => {
         }
         refreshChips()
     }
-    // L1 already sheds the encoder session. Forget it here or encoderReady()
-    // keeps claiming a session that is gone, and the eager path would skip the
-    // settle gate for a build it now has to pay under pressure.
-    if (level >= 1) forgetEncoder()
+    // L1 does not touch the lane: releaseEncoder returns 37 MB (§LEDGER_MB) and
+    // costs a full rebuild on the next click — 0.9-19.9 s of Metal shader
+    // compile on WebKit. The detector above is the real L1 win. L2 releases the
+    // 976 MB device pool, which is worth a rebuild. forgetEncoder moves with it,
+    // or encoderReady() keeps claiming a session that is gone.
+    if (level < 2) return Promise.resolve([])
+    forgetEncoder()
     return relievePressure(level).catch(() => [])
 }
 
@@ -810,6 +817,14 @@ const estimateFootprintMB = () => {
     if (tf?.workingActive) mb += px(tf.workingW, tf.workingH)
     // Overlay layer cache: tinted fill + border ring, both frame-sized.
     if (layerCache?.fill) mb += 2 * px(els.overlay?.width, els.overlay?.height)
+    // The selection. Everything above is a step function, so without this the
+    // estimate cannot respond to the user WORKING at all — the shape of the
+    // reported WebKit reap. An op is 1 byte/px; the composed frames are RGBA.
+    const chanMB = ((els.view?.width || 0) * (els.view?.height || 0)) / (1024 * 1024)
+    mb += chanMB * (state.baseOps.length + (state.baseFloor ? 1 : 0))
+    for (const m of [state.baseMask, state.mask, state.maskRaw, state.liveMask, state.liveRaw]) {
+        if (m) mb += px(m.width, m.height)
+    }
     return mb
 }
 
@@ -885,6 +900,7 @@ const setMode = (mode) => {
     els.toleranceWrap.hidden = mode !== 'magic' && mode !== 'color'
     els.textwrap.hidden = mode !== 'text'
     els.selectall.hidden = mode !== 'text' || state.textCandidates.length === 0
+    syncContextRow()
     if (mode !== 'text') { hideAutocomplete(); clearRefine() }
     if (mode === 'text') {
         els.textinput.focus()
@@ -893,6 +909,7 @@ const setMode = (mode) => {
         // rather than at boot (a session that never searches must not pay).
         prefetchTextLane()
     }
+    renderOverlay() // each tool shows only its own marks (ownTool)
 }
 els.modes.click.addEventListener('click', () => setMode('click'))
 els.modes.box.addEventListener('click', () => setMode('box'))
@@ -1037,11 +1054,9 @@ window.addEventListener('keydown', (e) => {
  * over a parked plane. Hovering costs even less — a 256² threshold, no
  * upsample and no guided filter (sam21-adapter §sam21CandidateShape). */
 
-const hideScope = () => {
-    state.scope = null
-    state.scopeAt = null
-    if (state.ghost) { state.ghost = null; renderOverlay() }
-    if (els.scope) { els.scope.hidden = true; els.scope.replaceChildren() }
+const previewCandidate = (index) => {
+    state.ghost = index === null ? null : candidateShape(index)
+    renderOverlay()
 }
 
 /** Anchor the control at the prompt the user actually made. */
@@ -1052,64 +1067,105 @@ const scopeAnchor = () => {
     return null
 }
 
-const placeScope = () => {
-    if (!state.scopeAt) return
+/** Canvas pixels per CSS pixel — the overlay is the image's own size, so a
+ *  gesture threshold in CSS px has to be converted before it means anything. */
+const overlayScale = () => {
     const rect = els.overlay.getBoundingClientRect()
-    if (!rect.width) return
-    const k = rect.width / els.overlay.width
-    const x = state.scopeAt[0] * k
-    const y = state.scopeAt[1] * (rect.height / els.overlay.height)
-    const w = els.scope.offsetWidth || 160
-    const h = els.scope.offsetHeight || 28
-    // Clear of the selection, not on it: the control exists to compare shapes,
-    // and a bar parked over the subject hides the evidence. Falls back to the
-    // click when the mask has not been rasterised yet (first paint).
-    const b = layerCache.bounds && layerCache.mask
-        ? [layerCache.bounds[1] * (rect.height / layerCache.mask.height),
-            layerCache.bounds[3] * (rect.height / layerCache.mask.height)]
-        : [y, y]
-    const top = (b[1] + 14 + h < rect.height) ? b[1] + 14
-        : (b[0] - 14 - h > 6 ? b[0] - 14 - h : Math.max(6, Math.min(rect.height - h - 6, y + 18)))
-    els.scope.style.left = `${Math.min(rect.width - w / 2 - 6, Math.max(w / 2 + 6, x))}px`
-    els.scope.style.top = `${top}px`
+    return rect.width ? [els.overlay.width / rect.width, els.overlay.height / rect.height] : [1, 1]
 }
 
-const previewCandidate = (index) => {
-    state.ghost = index === null ? null : candidateShape(index)
-    renderOverlay()
+const scopeControl = els.scope ? createScopeControl({
+    mount: els.scope,
+    surface: els.overlay,
+    // Click mode only: every other tool owns the drag and the wheel.
+    enabled: () => !state.running && !!state.liveMask && state.mode === 'click',
+    inside: (x, y) => {
+        if (!state.liveMask) return false
+        const [kx, ky] = overlayScale()
+        return pointInMask(state.liveMask, x * kx, y * ky)
+    },
+    geometry: () => {
+        // Stage space, not overlay space: the overlay rides inside the zoom
+        // frame, so under any zoom or pan its box is offset from the control's
+        // positioning context. getBoundingClientRect already reports the
+        // transformed box, so the scale factors need no zoom term of their own.
+        const rect = els.overlay.getBoundingClientRect()
+        const host = els.stage.getBoundingClientRect()
+        if (!rect.width || !state.scopeAt) return null
+        const ox = rect.left - host.left
+        const oy = rect.top - host.top
+        // Fall back to the click when the mask has not been rasterised yet.
+        const bounds = layerCache.bounds && layerCache.mask
+            ? [oy + layerCache.bounds[1] * (rect.height / layerCache.mask.height),
+                oy + layerCache.bounds[3] * (rect.height / layerCache.mask.height)]
+            : null
+        return {
+            anchor: [ox + state.scopeAt[0] * (rect.width / els.overlay.width),
+                oy + state.scopeAt[1] * (rect.height / els.overlay.height)],
+            bounds,
+            width: host.width,
+            height: host.height,
+            // The swatches are painted from a square resize of the FRAME, so
+            // the un-squash factor is the photo's box — the stage only happens
+            // to match it while it hugs the photo.
+            aspect: rect.width / rect.height,
+        }
+    },
+    onPick: (i) => selectScope(i),
+    onPreview: (i) => previewCandidate(i),
+    // The swatches are drawn from the same parked fields the hover preview
+    // uses — a 256² threshold each, no upsample and no guided filter.
+    shape: (i) => candidateShape(i),
+}) : null
+
+/* ─── View gestures ───────────────────────────────────────────────────────
+ * Zoom and pan live outside this module because the bindings are a property of
+ * the DEVICE, not of the tool: the same two-finger movement is a scope step
+ * over the selection, a pan on a trackpad, and a pinch on glass. */
+const gestures = createGestures({
+    stage: els.stage,
+    frame: els.frame,
+    surface: els.overlay,
+    hint: els.hint,
+    readout: els.zoomreset,
+    active: () => state.hasImage,
+    // A second finger is a view gesture, never a stroke: drop whatever the
+    // first one started, before it commits a mask nobody asked for.
+    onGestureStart: () => {
+        if (!state.drag && !state.brush) return
+        clearLongPress()
+        state.drag = null
+        state.brush = null
+        renderOverlay()
+    },
+    onZoom: () => { if (state.scope) scopeControl?.place() },
+})
+
+/** The sign toggle is the touch stand-in for a second mouse button. On a
+ *  pointer device right/⌥-click already says it, so it is one control fewer. */
+const wantsSign = () => SIGN_MODES.has(state.mode) && document.body.dataset.input === 'touch'
+const syncContextRow = () => {
+    els.context.classList.toggle(
+        'on',
+        wantsSign() || state.mode === 'magic' || state.mode === 'color' || state.mode === 'text',
+    )
+}
+syncContextRow()
+
+const hideScope = () => {
+    state.scope = null
+    state.scopeAt = null
+    if (state.ghost) { state.ghost = null; renderOverlay() }
+    scopeControl?.hide()
 }
 
 const renderScope = () => {
-    const info = state.scope
-    if (!els.scope) return
     // One reading is not a choice, and a committed-only selection has no live
     // object to re-read. Both mean there is nothing to offer.
-    if (!info || info.count < 2 || !state.liveMask || !state.scopeAt) { hideScope(); return }
-    const frag = document.createDocumentFragment()
-    info.items.forEach((item, i) => {
-        const b = document.createElement('button')
-        b.type = 'button'
-        const pct = item.coverage * 100
-        b.textContent = `${pct < 1 ? pct.toFixed(1) : Math.round(pct)}%`
-        b.title = `${(item.coverage * 100).toFixed(1)}% of the frame · confidence ${item.score.toFixed(2)}`
-        b.setAttribute('aria-pressed', String(i === info.index))
-        b.addEventListener('click', () => selectScope(i))
-        // Hover shows the shape without taking it — the point is to compare.
-        b.addEventListener('pointerenter', () => { if (i !== state.scope?.index) previewCandidate(i) })
-        b.addEventListener('pointerleave', () => previewCandidate(null))
-        b.addEventListener('focus', () => { if (i !== state.scope?.index) previewCandidate(i) })
-        b.addEventListener('blur', () => previewCandidate(null))
-        frag.append(b)
-    })
-    const key = document.createElement('span')
-    key.className = 'scope-key'
-    key.textContent = 'C'
-    key.title = 'C grows the selection, shift+C shrinks it'
-    frag.append(key)
-    els.scope.replaceChildren(frag)
-    els.scope.hidden = false
-    placeScope()
+    if (!state.scope || state.scope.count < 2 || !state.liveMask || !state.scopeAt) { hideScope(); return }
+    scopeControl?.update(state.scope)
 }
+
 
 /** Adopt a repainted candidate — shared by the pointer and the C key. */
 const adoptCandidate = (res) => {
@@ -1125,7 +1181,8 @@ const adoptCandidate = (res) => {
     renderScope()
     const c = res.candidates
     const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
-    setStatus(`Candidate ${(c?.index ?? 0) + 1}/${c?.count ?? 1} — ${(coverage * 100).toFixed(1)}% of frame · C for the next, shift+C for the previous`)
+    const at = c ? ` (${c.index + 1} of ${c.count})` : ''
+    setStatus(`Selected ${(coverage * 100).toFixed(1)}% of frame${at} · pick a shape, or scroll over the selection`)
 }
 
 function selectScope(index) {
@@ -1134,14 +1191,20 @@ function selectScope(index) {
     if (res) adoptCandidate(res)
 }
 
+/** The keyboard path into the scope control. Clamps like every other one — a
+ *  selection that jumps from the whole subject back to a speck reads as a bug. */
 function cycleSelection(delta) {
-    if (state.running || !state.liveMask) return
-    const res = cycleCandidate(delta)
-    if (!res) { setStatus('No other candidate for this click'); return }
-    adoptCandidate(res)
+    if (state.running || !state.liveMask || !state.scope) return
+    const want = stepScope(state.scope.index, delta, state.scope.count)
+    if (want === state.scope.index) {
+        setStatus(delta > 0 ? 'Nothing larger for this click' : 'Nothing smaller for this click')
+        return
+    }
+    const res = pickCandidate(want)
+    if (res) adoptCandidate(res)
 }
 
-addEventListener('resize', () => { if (state.scope) placeScope() })
+addEventListener('resize', () => { if (state.scope) scopeControl?.place() })
 
 /* ─── Pointer handling ───────────────────────────────────────────────────── */
 
@@ -1283,6 +1346,33 @@ const restoreSession = async () => {
     }
 }
 
+/**
+ * Regularise the composed selection, in place.
+ *
+ * Two objects selected one after the other each stop a pixel short of the edge
+ * they share, so their union keeps a hairline of background along it — and the
+ * outline, being a dilation of the mask, then draws a border THROUGH the middle
+ * of what the user selected as one thing. Measured on six adjacent cubes: 26
+ * enclosed slivers, and a boundary a third longer than the shape needs.
+ *
+ * Both are properties of the UNION, not of any one object, so they are
+ * re-derived here on every recompose and never baked into an op — undo and
+ * subtract keep working on exactly what the tools committed.
+ */
+const regularizeMask = (mask, bbox) => {
+    const long = Math.max(mask.width, mask.height)
+    // Half a decoder cell (the grid is 256²): a gap that narrow is two decodes
+    // disagreeing about one cell, not background the user wants kept. A full
+    // cell (r=3 at this frame) starts closing real pockets between objects.
+    const filled = bridgeGaps(mask.data, mask.width, mask.height,
+        { radius: Math.max(1, Math.round(long / 512)), rect: bbox })
+    // Manual geometry is exact by contract — a drawn rectangle keeps its
+    // corners. Only a decoded boundary carries the wobble worth averaging out.
+    const changed = state.manual ? 0 : smoothBoundary(mask.data, mask.width, mask.height,
+        { radius: Math.max(1, Math.round(long / 1024)), rect: bbox })
+    return filled || changed
+}
+
 /** Rebuild the composed truth (state.mask/maskSummary) from base ∪ live. */
 const recomposeMask = () => {
     if (state.liveMask) {
@@ -1293,7 +1383,11 @@ const recomposeMask = () => {
         state.mask = null
     }
     state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw) : null
-    state.maskSummary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height) : null
+    let summary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height) : null
+    if (summary?.bbox && regularizeMask(state.mask, summary.bbox)) {
+        summary = summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height)
+    }
+    state.maskSummary = summary
     persistSession() // debounced + snapshot-at-write: a drag costs one save
 }
 
@@ -1304,20 +1398,34 @@ const clearLive = () => {
     hideScope()
 }
 
+/**
+ * Start a NEW live object. Every tool that opens a fresh SAM prompt set goes
+ * through here, because two things have to happen together and used to happen
+ * in only some of the places:
+ *
+ *   the finished object COMMITS — it is part of the visible selection, so a
+ *   box drawn after a click must not unselect what the click selected
+ *   its prompts GO WITH IT — carried over, the old box/clicks keep shipping the
+ *   old object's extent, so the decode is asked for two objects at once
+ */
+const beginNewObject = () => {
+    if (state.liveMask) pushBaseOp('add', state.liveMask, 'click')
+    clearLive()
+    state.clicks = []
+    state.box = null
+    state.boxDrawn = false
+    state.lasso = null
+}
+
 const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
     // A region that landed on nothing (miss / empty geometry) is a no-op — it
     // must never wipe an existing selection.
     if (!summarizeMaskRGBA(imageData.data, imageData.width, imageData.height).bbox) return
     const hadMask = !!(state.maskSummary && state.maskSummary.bbox)
-    // A live SAM object is part of the visible selection — keep it.
-    if (state.liveMask) pushBaseOp('add', state.liveMask, 'click')
+    beginNewObject()                       // the live SAM object commits with it
     pushBaseOp(negative ? 'sub' : 'add', imageData, kind)
-    state.clicks = []
-    state.box = null
-    state.lasso = null
     state.textCandidates = []
     clearRefine()
-    clearLive()
     state.manual = state.baseMask ? { kind, ...geometry } : null
     recomposeMask()
     state.score = 0
@@ -1497,6 +1605,27 @@ const eventNegative = (e) => e.button === 2 || e.altKey || state.sign === 0
 
 els.overlay.addEventListener('contextmenu', (e) => e.preventDefault())
 
+/* Touch has no second button and no modifier key. A press that stays put turns
+ * the tap into an exclude — the same thing right/⌥-click does for a pointer,
+ * and the only exclude gesture that needs no visible control. Click mode only:
+ * every other tool commits on the press or owns the drag. */
+const LONG_PRESS_MS = 480
+let longPressTimer = null
+const clearLongPress = () => {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null }
+}
+const armLongPress = () => {
+    clearLongPress()
+    longPressTimer = setTimeout(() => {
+        longPressTimer = null
+        const d = state.drag
+        if (!d || d.kind !== 'tap' || d.moved || d.negative) return
+        d.negative = true
+        navigator.vibrate?.(12)
+        setStatus('Exclude — lift your finger to remove this from the selection')
+    }, LONG_PRESS_MS)
+}
+
 els.overlay.addEventListener('pointerdown', (e) => {
     if (!state.hasImage) return
     e.preventDefault()
@@ -1507,6 +1636,7 @@ els.overlay.addEventListener('pointerdown', (e) => {
     state.textDriven = false
     if (state.mode === 'click') {
         state.drag = { kind: 'tap', start: [x, y], moved: false, negative: e.button === 2 || e.altKey, pointerType: e.pointerType }
+        if (e.pointerType === 'touch' && !state.drag.negative) armLongPress()
     } else if (state.mode === 'box') {
         state.drag = { kind: 'box', start: [x, y], now: [x, y] }
     } else if (state.mode === 'lasso') {
@@ -1538,7 +1668,10 @@ els.overlay.addEventListener('pointermove', (e) => {
     const [x, y] = toCanvas(e)
     if (state.drag.kind === 'tap') {
         const moveThreshold = state.drag.pointerType === 'touch' ? 12 : 5
-        if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > moveThreshold) state.drag.moved = true
+        if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > moveThreshold) {
+            state.drag.moved = true
+            clearLongPress()
+        }
         return
     }
     if (state.drag.kind === 'box' || state.drag.kind === 'rect' || state.drag.kind === 'ellipse') {
@@ -1563,6 +1696,7 @@ els.overlay.addEventListener('pointermove', (e) => {
 els.overlay.addEventListener('pointerup', (e) => {
     const drag = state.drag
     state.drag = null
+    clearLongPress()
     if (!drag || !state.hasImage) return
     const [x, y] = toCanvas(e)
 
@@ -1572,28 +1706,12 @@ els.overlay.addEventListener('pointerup', (e) => {
         const [sx, sy] = drag.start
         // Discard degenerate boxes (a stray click instead of a drag).
         if (Math.abs(x - sx) > 8 && Math.abs(y - sy) > 8) {
-            state.manual = null
-            state.box = [Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)]
-            state.boxDrawn = true
-            state.lasso = null // a box replaces a lasso region
-            bumpRevision()
-            scheduleRun()
+            applyBoxPrompt([Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)])
         }
         renderOverlay()
         refreshButtons()
     } else if (drag.kind === 'lasso') {
-        const prompts = lassoToPrompts(drag.points)
-        if (prompts) {
-            // A fresh lasso is a fresh selection: it replaces earlier
-            // prompts (the reference interaction), and later clicks refine
-            // INSIDE it (the clamp keeps everything within lasso ∪ margin).
-            state.lasso = { poly: drag.points, ...prompts }
-            state.manual = null
-            state.clicks = []
-            state.box = null
-            bumpRevision()
-            scheduleRun()
-        }
+        applyLassoPrompt(drag.points)
         renderOverlay()
         refreshButtons()
     } else if (drag.kind === 'region' && drag.points.length >= 3) {
@@ -1623,10 +1741,8 @@ function applyClickPrompt(x, y, label) {
     state.manual = null
     if (label === 1) {
         if (state.liveMask && !pointInMask(state.liveMask, x, y)) {
-            // A click OUTSIDE the live object selects a NEW object: commit the
-            // finished one so it can never be unselected by later clicks.
-            pushBaseOp('add', state.liveMask, 'click')
-            clearLive()
+            // A click OUTSIDE the live object selects a NEW object.
+            beginNewObject()
             state.clicks = [[x, y, 1]]
         } else {
             state.clicks.push([x, y, 1])
@@ -1653,6 +1769,30 @@ function applyClickPrompt(x, y, label) {
         return
     }
     setStatus('Nothing to exclude here — click an object first')
+}
+
+/** A box prompt, from a drag or from a text candidate. `drawn` is false when
+ *  the user typed a phrase instead of dragging: still a prompt, never a mark. */
+function applyBoxPrompt(box, { drawn = true } = {}) {
+    state.manual = null
+    beginNewObject()
+    state.box = box
+    state.boxDrawn = drawn
+    bumpRevision()
+    scheduleRun()
+}
+
+/** A lasso prompt. Returns false for a polygon too degenerate to prompt with,
+ *  which must leave the current selection untouched. */
+function applyLassoPrompt(poly) {
+    const prompts = lassoToPrompts(poly)
+    if (!prompts) return false
+    state.manual = null
+    beginNewObject()
+    state.lasso = { poly, ...prompts }
+    bumpRevision()
+    scheduleRun()
+    return true
 }
 
 let debounceTimer = null
@@ -1715,7 +1855,7 @@ async function runNow() {
             renderScope()
             const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
             // The hint is only honest when there is something to cycle TO.
-            const more = (res.candidates?.count ?? 1) > 1 ? ' · C for another interpretation' : ''
+            const more = (res.candidates?.count ?? 1) > 1 ? ' · too much or too little? the shapes below it are the other readings' : ''
             setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}${more}`)
         }
         renderOverlay()
@@ -2019,19 +2159,13 @@ async function runDetect(phrase) {
 const selectCandidate = (i) => {
     const c = state.textCandidates[i]
     if (!c) return
-    state.box = c.box.slice()
     // Kept as a prompt so a later click refines INSIDE the detected object, but
     // never drawn: the user typed a phrase, they did not drag a box.
-    state.boxDrawn = false
-    state.clicks = []
-    state.lasso = null
-    state.manual = null
+    applyBoxPrompt(c.box.slice(), { drawn: false })
     state.textDriven = true // earns the native-crop sharpen (shouldEscalate)
     state.textCandidates = []
     clearRefine()
     els.selectall.hidden = true
-    bumpRevision()
-    scheduleRun()
 }
 
 /** Union every candidate into one mask (multi-instance: "all bottles").
@@ -2039,6 +2173,7 @@ const selectCandidate = (i) => {
 async function selectAll(noun = 'objects') {
     const boxes = state.textCandidates.map((c) => c.box.slice())
     if (boxes.length === 0 || state.running) return
+    beginNewObject()   // whatever was live stays selected; these boxes are new
     bumpRevision()
     const revision = state.revision
     state.running = true
@@ -2064,9 +2199,7 @@ async function selectAll(noun = 'objects') {
         if (!union) { setStatus('No objects selected'); return }
         // The multi-instance union commits as one op; Z removes it whole.
         pushBaseOp('add', union, 'text')
-        clearLive()
         recomposeMask()
-        state.box = null
         setStatus(`Selected ${boxes.length} ${noun}`)
         renderOverlay()
         refreshButtons()
@@ -2313,6 +2446,12 @@ const getMaskLayers = (mask) => {
     return layerCache
 }
 
+// Prompt geometry belongs to the tool that drew it. Switching tools hides the
+// other tools' marks — a dashed box left over from Box mode reads as part of
+// what the current tool is doing — and switching back shows them again, since
+// the state itself is kept.
+const ownTool = (owner) => !!owner && state.mode === owner
+
 // Coalesce paint bursts (pointermove) into one paint per frame.
 let overlayScheduled = false
 function renderOverlay() {
@@ -2379,8 +2518,8 @@ function paintOverlay() {
 
     const markerR = Math.max(4, Math.min(width, height) * 0.009)
 
-    // Persisted box (dashed) — only the one the user dragged.
-    if (state.box && state.boxDrawn) {
+    // Persisted box (dashed) — only the one the user dragged, in Box mode.
+    if (state.box && state.boxDrawn && ownTool('box')) {
         ctx.setLineDash([7, 5])
         ctx.strokeStyle = ACCENT
         ctx.lineWidth = 1.75
@@ -2389,7 +2528,7 @@ function paintOverlay() {
     }
 
     // Text candidates: numbered boxes to tap.
-    for (let i = 0; i < state.textCandidates.length; i += 1) {
+    for (let i = 0; ownTool('text') && i < state.textCandidates.length; i += 1) {
         const [x0, y0, x1, y1] = state.textCandidates[i].box
         ctx.setLineDash([6, 4])
         ctx.strokeStyle = 'rgba(90,160,255,0.95)'
@@ -2406,18 +2545,20 @@ function paintOverlay() {
     }
 
     // Lasso region (kept faint once the mask lands, so the clamp is visible).
-    if (state.lasso) {
+    if (state.lasso && ownTool('lasso')) {
         ctx.beginPath()
         ctx.moveTo(state.lasso.poly[0][0], state.lasso.poly[0][1])
         for (const [px, py] of state.lasso.poly.slice(1)) ctx.lineTo(px, py)
         ctx.closePath()
-        ctx.strokeStyle = state.mask ? 'rgba(53,224,194,0.25)' : 'rgba(90,160,255,0.9)'
+        ctx.strokeStyle = state.mask ? 'rgba(83,216,255,0.25)' : 'rgba(90,160,255,0.9)'
         ctx.lineWidth = 2.5
         ctx.stroke()
     }
 
-    if (state.manual?.poly?.length >= 3) {
-        const { poly, kind } = state.manual
+    // Manual geometry names its own tool, so it is its own owner.
+    const manual = ownTool(state.manual?.kind) ? state.manual : null
+    if (manual?.poly?.length >= 3) {
+        const { poly, kind } = manual
         ctx.beginPath()
         ctx.moveTo(poly[0][0], poly[0][1])
         for (const [px, py] of poly.slice(1)) ctx.lineTo(px, py)
@@ -2426,19 +2567,19 @@ function paintOverlay() {
         ctx.lineWidth = 2
         ctx.stroke()
     }
-    if (state.manual?.box) {
-        const [x0, y0, x1, y1] = state.manual.box
+    if (manual?.box) {
+        const [x0, y0, x1, y1] = manual.box
         ctx.strokeStyle = 'rgba(255,194,94,0.9)'
         ctx.lineWidth = 2
-        if (state.manual.kind === 'ellipse') {
+        if (manual.kind === 'ellipse') {
             ctx.beginPath()
             ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, 0, Math.PI * 2)
             ctx.stroke()
         } else ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
     }
-    if (state.manual?.seed) {
+    if (manual?.seed) {
         ctx.beginPath()
-        ctx.arc(state.manual.seed[0], state.manual.seed[1], markerR * 1.7, 0, Math.PI * 2)
+        ctx.arc(manual.seed[0], manual.seed[1], markerR * 1.7, 0, Math.PI * 2)
         ctx.strokeStyle = 'rgba(255,194,94,0.95)'
         ctx.lineWidth = 2
         ctx.stroke()
@@ -2492,7 +2633,7 @@ function paintOverlay() {
     }
 
     // Click markers.
-    for (const [x, y, label] of state.clicks) {
+    for (const [x, y, label] of (ownTool('click') ? state.clicks : [])) {
         ctx.beginPath()
         ctx.arc(x, y, markerR, 0, Math.PI * 2)
         ctx.fillStyle = label ? POS_COLOR : NEG_COLOR
@@ -2504,7 +2645,7 @@ function paintOverlay() {
 
     // The scope control is placed off the mask's extent, which only exists once
     // the layers are rasterised — so re-place it here, after that has happened.
-    if (state.scope && els.scope && !els.scope.hidden) placeScope()
+    if (state.scope && els.scope && !els.scope.hidden) scopeControl?.place()
 }
 
 /* ─── Cutout export ──────────────────────────────────────────────────────── */
@@ -2547,9 +2688,11 @@ els.cutout.addEventListener('click', async () => {
     // in the app, and the user is waiting on a file, not the canvas.
     const epoch = showPrep(wasNative ? 'Rebuilding the cutout at full resolution…' : 'Building the cutout…')
     try {
-        // Detector and wasm-refine workers are unrelated to a cutout export
-        // and hold memory. Release both before the bounded export canvases.
+        // Detector, encoder and wasm-refine all hold memory an export does not
+        // need. relievePressure covers only the mask lane, so the detect worker
+        // (up to 1030 MB) needs its own call.
         await relievePressure(1)
+        disposeDetectorIfIdle()
         disposeCvRefine()
         let out = null
         if (wasNative) {
@@ -2698,6 +2841,12 @@ window.__seglab = {
         hasImage: state.hasImage,
         maskSummary: state.maskSummary,
         score: state.score,
+        // The live prompt set, so a check can see WHAT was asked for and not
+        // just what came back. `tool` is the active mode (`mode` is the lane's).
+        tool: state.mode,
+        box: state.box ? state.box.slice() : null,
+        boxDrawn: state.boxDrawn,
+        lasso: !!state.lasso,
         clicks: state.clicks.length,
         baseOps: state.baseOps.length,
         revision: state.revision,
@@ -2705,6 +2854,19 @@ window.__seglab = {
         manual: state.manual?.kind || null,
         escalated: !!getHdPatch(state.revision),
     }),
+    // What the scope control is offering right now — the swatches as rendered,
+    // so a scripted check sees the same choices the user does.
+    scope: () => (state.scope ? {
+        count: state.scope.count,
+        index: state.scope.index,
+        hidden: !!els.scope?.hidden,
+        shapes: (els.scope?.querySelectorAll('.scope-shape') || []).length,
+        // A swatch with no canvas means the mask behind it was gone at paint
+        // time — the fallback block, which is worth seeing in a check.
+        drawn: [...(els.scope?.querySelectorAll('.scope-shape') || [])].filter((n) => n.querySelector('canvas')).length,
+        pressed: [...(els.scope?.querySelectorAll('.scope-shape') || [])]
+            .findIndex((n) => n.getAttribute('aria-pressed') === 'true'),
+    } : null),
     // llmfit ships the inputs behind every estimate; so does this. Reports the
     // judgement for the loaded image, or for w×h if one is given.
     hardwareFit: (w, h) => explainFit(
@@ -2719,7 +2881,26 @@ window.__seglab = {
         for (let i = 0; i < data.length; i += 4) {
             if (data[i] > 16 && data[i] < 240) soft += 1
         }
-        return { components: countMaskComponents(data, width, height), softPixels: soft }
+        return {
+            components: countMaskComponents(data, width, height),
+            softPixels: soft,
+            maskW: width,
+            maskH: height,
+            clickPoints: state.clicks.map(([x, y, l]) => [Math.round(x), Math.round(y), l]),
+            regions: maskRegions(data, width, height, state.clicks),
+        }
+    },
+    // The composed mask's value channel, base64. Aggregate stats cannot answer
+    // boundary questions — how wide the gap between two selections is, what a
+    // radius would join — so a check gets the pixels and runs sam-core itself.
+    maskPixels: () => {
+        if (!state.mask) return null
+        const { data, width, height } = state.mask
+        const chan = new Uint8Array(width * height)
+        for (let i = 0; i < chan.length; i += 1) chan[i] = data[i * 4]
+        let s = ''
+        for (let i = 0; i < chan.length; i += 0x8000) s += String.fromCharCode.apply(null, chan.subarray(i, i + 0x8000))
+        return { w: width, h: height, b64: btoa(s) }
     },
     // Crop re-decode with shouldEscalate() bypassed, reporting the gate's own
     // IoU against the proxy mask — the only hook that surfaces that number, so
@@ -2869,19 +3050,21 @@ window.__seglab = {
         await waitForRun()
         return window.__seglab.state()
     },
+    // Box mode's drag, without the pointer stream — the same state a finished
+    // drag leaves (pointerup above), so a scripted check exercises the box
+    // prompt and its interaction with later clicks.
+    boxAt: async (x0, y0, x1, y1) => {
+        applyBoxPrompt([Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)])
+        await waitForRun()
+        return window.__seglab.state()
+    },
     lassoCircle: async (cx, cy, r, n = 28) => {
         const poly = []
         for (let i = 0; i < n; i += 1) {
             const a = (i / n) * Math.PI * 2
             poly.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r])
         }
-        const prompts = lassoToPrompts(poly)
-        if (!prompts) throw new Error('degenerate test lasso')
-        state.lasso = { poly, ...prompts }
-        state.clicks = []
-        state.box = null
-        bumpRevision()
-        scheduleRun()
+        if (!applyLassoPrompt(poly)) throw new Error('degenerate test lasso')
         await waitForRun()
         return window.__seglab.state()
     },

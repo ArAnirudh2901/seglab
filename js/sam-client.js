@@ -16,6 +16,7 @@
  *   {type:'state'}         device/lane/timing chips should re-render
  */
 
+import { IS_WEBKIT } from './engine.js'
 import { summarizeMaskRGBA, validateClickMask } from './sam-core.js'
 import { enqueueHeavy, cancelHeavyBefore, onHeavyActivity, STALE } from './heavy-job-queue.js'
 import {
@@ -251,6 +252,10 @@ function finishSegment(result, revision, startedAt) {
         encoded: result.encoded,
         score: result.score,
         lane: result.lane,
+        // Why this candidate won and what region hygiene removed. Nothing in the
+        // UI reads it; it is the only way a check can tell "the mask is wrong"
+        // from "which of the six mechanisms produced it".
+        pick: result.pick,
         ms: Date.now() - startedAt,
     }
     emit({ type: 'state' })
@@ -267,7 +272,6 @@ function finishSegment(result, revision, startedAt) {
         lane: result.lane,
         revision: result.revision,
         encoded: result.encoded,
-        hygiene: result.hygiene,
         bandPixels: result.bandPixels,
         candidates: result.candidates,
         pick: result.pick,
@@ -508,12 +512,6 @@ export const disposeDetector = () => disposeDetectWorker()
  * keyed on the worker, not on the session. Safari runs the same lane heavier
  * (~1.03 GB observed before a process reap), so it gets the pessimistic figure.
  */
-// Same WebKit signal the lane uses (sam21-lane.js §IS_WEBKIT): vendor is
-// 'Apple Computer, Inc.' on every WebKit browser including iOS Chrome, and ''
-// on Gecko — a UA sniff for 'safari' would miss the first and catch neither.
-const IS_WEBKIT = typeof navigator !== 'undefined'
-    && !navigator.userAgentData
-    && /apple/i.test(navigator.vendor || '')
 const DETECT_RESIDENT_MB = IS_WEBKIT ? 1030 : 700
 
 /** MB the live detect worker is holding (0 when it is not up). Ledger input. */

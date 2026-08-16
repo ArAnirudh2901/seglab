@@ -38,17 +38,19 @@
  *   hanging on a cold encode that never returns.
  *
  * Usage: bun verify.mjs [--fast] [--wait=10m] [--isolated] [--strict]
- *                       [--list] [--force] [--no-reap]
+ *                       [--cft] [--list] [--force] [--no-reap]
  *   --fast      node-only phases (T/Q/S); no browser, no lease, safe in parallel
  *   --wait=10m  queue behind a running suite instead of failing (bounded)
  *   --isolated  throwaway profile: a genuinely parallel run, cold cache
  *   --strict    a phase skipped for lack of headroom fails the run
+ *   --cft       Playwright's bundled Chrome-for-Testing instead of the
+ *               installed Google Chrome (--channel=beta|dev|canary for others)
  *   --list      print the plan and exit
  */
 
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import {
   classifyPixelColor, clusterObjects, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, filterToSubject, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
@@ -61,6 +63,7 @@ import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy
 import { decidePressure } from './js/memory-governor.js'
 import { boxFraction, chooseCandidate, cleanRegions, fieldArea, promptFit, stabilityScore } from './js/mask-select.js'
 import { refineField } from './js/mask-refine.js'
+import { stepScope, scrubIndex } from './js/scope-control.js'
 import { getBoundedProxySize, displayPlan, decodeBudgetMP, interactionPlan } from './js/proxy-plan.js'
 import {
   SHORT_EDGE_LADDER, affordableShortEdge, estimatePostMsPerMP, explainFit, fitLevel, observePost,
@@ -69,10 +72,12 @@ import {
   affordableCells, observeDetect, saveDetectMsPerCell, loadDetectMsPerCell,
 } from './js/hardware-fit.js'
 import {
-  composeChannels, maskChannelCoverages, maskToChannel, pickBestMask, pointInMask, RUNAWAY_COVERAGE,
+  bridgeGaps, composeChannels, maskChannelCoverages, maskToChannel, pickBestMask, pointInMask,
+  RUNAWAY_COVERAGE, smoothBoundary,
 } from './js/sam-core.js'
 import { enqueueHeavy, cancelHeavyBefore, STALE, getHeavyQueueState } from './js/heavy-job-queue.js'
 import { extractRawPreview } from './js/image-raw.js'
+import { channelLabel, onChannel as withChannel, profileDir, resolveChannel } from './scripts/harness/browser.mjs'
 import { acquireLease, humanMs } from './scripts/harness/lease.mjs'
 import { formatMem, memorySnapshot } from './scripts/harness/machine.mjs'
 import { createRunner, definePlan, guardContext, withDeadline } from './scripts/harness/phases.mjs'
@@ -102,11 +107,13 @@ const OPTS = {
   strict: flag('strict'),       // an unproven (skipped) phase fails the run
   reap: !flag('no-reap'),
   waitMs: flag('wait') ? parseMs(value('wait', '10m'), 10 * 60_000) : 0,
+  channel: resolveChannel(argv),  // the installed Google Chrome unless --cft
 }
 const RUN_TAG = `${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`
 const PROFILE_DIR = OPTS.isolated
   ? path.join(CACHE_DIR, 'profiles', RUN_TAG)
-  : path.join(CACHE_DIR, 'profile')
+  : profileDir(path.join(CACHE_DIR, 'profile'), OPTS.channel)
+const onChannel = (opts) => withChannel(opts, OPTS.channel)
 const LOCK_PATH = path.join(CACHE_DIR, 'verify.lock')
 
 const log = (msg) => console.log(`[verify] ${msg}`)
@@ -139,6 +146,7 @@ const PLAN = definePlan([
   { id: 'O', title: 'offline proof', budgetMs: mins(10) },
   { id: 'V', title: 'vendored cold start', budgetMs: mins(12), coldStart: true, reclaimFirst: true, needsMB: MIN_FREE_MB },
   { id: 'P', title: 'power-cut persistence', budgetMs: mins(10) },
+  { id: 'G', title: 'pointer gestures', budgetMs: mins(8) },
   { id: 'A11', title: 'hardening', budgetMs: mins(25), exhausts: true, after: ['V', 'P'] },
   { id: 'A12', title: 'no-WebGPU browser', budgetMs: mins(10), coldStart: true, reclaimFirst: true, needsMB: MIN_FREE_MB, after: ['A11'] },
 ])
@@ -279,6 +287,18 @@ const DISC_FRAC = (Math.PI * DISC.r * DISC.r) / FRAME
 try {
   /* ─── Phase T: pure logic (no browser) ──────────────────────────────── */
   await run.enter('T')
+  // Which browser the phases below run in, and on whose profile. Stable Chrome
+  // refuses a profile Chrome-for-Testing wrote, so the channel has to reach the
+  // profile path too — a silent fallback would prove the wrong browser.
+  check(
+    'harness: --cft opts out of the installed Chrome, --channel= overrides, and the profile follows',
+    resolveChannel(['--cft']) === '' && resolveChannel(['--channel=beta']) === 'beta'
+      && resolveChannel(['--cft', '--channel=beta']) === 'beta'
+      && profileDir('/p', 'chrome') === '/p-chrome' && profileDir('/p', '') === '/p'
+      && withChannel({ headless: true }, 'chrome').channel === 'chrome'
+      && !('channel' in withChannel({ headless: true }, '')),
+    `this run: ${channelLabel(OPTS.channel)}`,
+  )
   const np = normalizePhrase('all red cars')
   check(
     'text-core: phrase → bare cores + multi intent',
@@ -933,8 +953,8 @@ try {
     // actually clicked stays, and so does one large enough to be real.
     const speckled = mk((x, y) => rect(22, 22, 41, 41)(x, y) || rect(2, 2, 3, 3)(x, y) || rect(58, 58, 59, 59)(x, y))
     const kept = new Float32Array(speckled)
-    const r1 = cleanRegions(speckled, S, { clicks: [{ x: 32, y: 32, label: 1 }], scale: 1 })
-    const r2 = cleanRegions(kept, S, { clicks: [{ x: 32, y: 32, label: 1 }, { x: 3, y: 3, label: 1 }], scale: 1 })
+    const r1 = cleanRegions(speckled, S, S, { clicks: [{ x: 32, y: 32, label: 1 }], scale: 1 })
+    const r2 = cleanRegions(kept, S, S, { clicks: [{ x: 32, y: 32, label: 1 }, { x: 3, y: 3, label: 1 }], scale: 1 })
     check(
       'hygiene: islands with no click are speckle; an island the user clicked is the object',
       r1.islands === 2 && fieldArea(speckled) === 400
@@ -953,7 +973,7 @@ try {
       || rect(10, 34, 24, 35)(x, y)                            // wire, detached
       || rect(2, 2, 4, 4)(x, y))                               // real speckle
     const wiresArea = fieldArea(wires)
-    const rw = cleanRegions(wires, S, { clicks: [{ x: 32, y: 30, label: 1 }], scale: 1 })
+    const rw = cleanRegions(wires, S, S, { clicks: [{ x: 32, y: 30, label: 1 }], scale: 1 })
     check(
       'hygiene: a fragmented subject (wires, thin arms) is never pruned, speckle or not',
       rw.islands === 0 && fieldArea(wires) === wiresArea,
@@ -965,14 +985,159 @@ try {
     // however the mask is shaped.
     const holed = mk((x, y) => rect(20, 20, 43, 43)(x, y) && !rect(28, 28, 32, 32)(x, y))
     const before2 = fieldArea(holed)
-    const h1 = cleanRegions(holed, S, { clicks: [{ x: 22, y: 22, label: 1 }], scale: 1 })
+    const h1 = cleanRegions(holed, S, S, { clicks: [{ x: 22, y: 22, label: 1 }], scale: 1 })
     const spared = mk((x, y) => rect(20, 20, 43, 43)(x, y) && !rect(28, 28, 32, 32)(x, y))
-    const h2 = cleanRegions(spared, S, { clicks: [{ x: 30, y: 30, label: 0 }], scale: 1 })
+    const h2 = cleanRegions(spared, S, S, { clicks: [{ x: 30, y: 30, label: 0 }], scale: 1 })
     check(
       'hygiene: an enclosed gap is filled, an excluded one is left alone, the background is never a hole',
       h1.holes === 1 && fieldArea(holed) === 24 * 24
         && h2.holes === 0 && fieldArea(spared) === before2,
       JSON.stringify({ filled: h1.holes, area: fieldArea(holed), solid: 24 * 24, spared: h2.holes }),
+    )
+
+    // The mask is thresholded at PROXY resolution, so hygiene has to run there
+    // too. Cleaning only SAM's 256² leaves the last two stages unpoliced, and
+    // both were measured manufacturing speckle out of a field that reached them
+    // as a single component: the bicubic upsample rings beside the -FILL it is
+    // handed and severs a one-cell neck, and the guided filter flips a near-zero
+    // plateau wherever a strong colour edge runs just outside the boundary.
+    const PW = 1024
+    const PH = 683
+    const plantOn = (buf, x0, y0, bw, bh, v) => {
+      for (let y = y0; y < y0 + bh; y += 1) for (let x = x0; x < x0 + bw; x += 1) buf[y * PW + x] = v
+    }
+    const proxy = new Float32Array(PW * PH).fill(-8)
+    plantOn(proxy, 300, 150, 400, 350, 5)   // subject, 140 000 px
+    plantOn(proxy, 150, 90, 5, 5, 3)        // speckle
+    plantOn(proxy, 120, 120, 1, 4, 3)       // a dash of speckle
+    plantOn(proxy, 200, 60, 2, 300, 3)      // a detached thin structure — must survive
+    plantOn(proxy, 400, 200, 6, 6, -8)      // pinhole
+    const rp = cleanRegions(proxy, PW, PH, { clicks: [{ x: 500, y: 300, label: 1 }], fill: 2.5 })
+    check(
+      'hygiene: at proxy resolution speckle goes and a detached thin structure survives',
+      rp.islands === 2 && rp.holes === 1
+        && proxy[92 * PW + 152] < 0 && proxy[121 * PW + 120] < 0
+        && proxy[200 * PW + 200] > 0 && fieldArea(proxy) === 400 * 350 + 600,
+      JSON.stringify({ ...rp, area: fieldArea(proxy), want: 400 * 350 + 600 }),
+    )
+
+    // 16 cells is tuned on the 256² grid; the same speckle covers the same
+    // FRACTION of a finer field, so the threshold scales by area (171 px here)
+    // rather than being re-tuned per resolution.
+    // Both sit just outside the subject, inside the separation threshold, so the
+    // size rule alone decides them — put them across the frame and the outlier
+    // rule below would take the large one too, and the threshold would no longer
+    // be what the check measures.
+    const scaled = new Float32Array(PW * PH).fill(-8)
+    plantOn(scaled, 300, 150, 400, 350, 5)
+    plantOn(scaled, 280, 100, 10, 15, 3)    // 150 px — under the scaled threshold
+    plantOn(scaled, 280, 300, 10, 20, 3)    // 200 px — over it
+    const rs = cleanRegions(scaled, PW, PH, { clicks: [{ x: 500, y: 300, label: 1 }], fill: 2.5 })
+    check(
+      'hygiene: the island threshold scales with the grid, not the 256² count',
+      rs.islands === 1 && scaled[105 * PW + 285] < 0 && scaled[305 * PW + 285] > 0,
+      JSON.stringify({ dropped: rs.islands, small: scaled[105 * PW + 285], large: scaled[305 * PW + 285] }),
+    )
+
+    // Outliers: SAM answers a click on one of a repeated subject with the
+    // neighbours attached. They are far too large for the size rule and they
+    // drag dominance under its gate, so separation and shape are what decide
+    // them — and a thin detached structure at the same distance still survives,
+    // because that is the streetlight failure this must not repeat.
+    const repeated = new Float32Array(PW * PH).fill(-8)
+    plantOn(repeated, 400, 250, 200, 200, 5)   // the rivet under the click
+    plantOn(repeated, 150, 250, 120, 130, 3)   // a neighbouring rivet, 40 000 px
+    plantOn(repeated, 700, 120, 3, 260, 3)     // a thin detached structure
+    const ro = cleanRegions(repeated, PW, PH, { clicks: [{ x: 500, y: 350, label: 1 }], fill: 2.5 })
+    check(
+      'hygiene: a separated second object goes, a separated thin structure stays',
+      ro.islands === 1 && repeated[300 * PW + 200] < 0 && repeated[200 * PW + 701] > 0
+        && fieldArea(repeated) === 200 * 200 + 3 * 260,
+      JSON.stringify({ dropped: ro.islands, neighbour: repeated[300 * PW + 200], thin: repeated[200 * PW + 701] }),
+    )
+
+    // The same neighbour, clicked: an explicit include is the subject by
+    // definition, whatever its distance.
+    const bothClicked = new Float32Array(PW * PH).fill(-8)
+    plantOn(bothClicked, 400, 250, 200, 200, 5)
+    plantOn(bothClicked, 150, 250, 120, 130, 3)
+    const rb = cleanRegions(bothClicked, PW, PH, {
+      clicks: [{ x: 500, y: 350, label: 1 }, { x: 200, y: 300, label: 1 }], fill: 2.5,
+    })
+    check(
+      'hygiene: an outlier the user clicked is not an outlier',
+      rb.islands === 0 && fieldArea(bothClicked) === 200 * 200 + 120 * 130,
+      JSON.stringify({ dropped: rb.islands, area: fieldArea(bothClicked) }),
+    )
+
+    // `rect` is what keeps the proxy pass off the whole frame — the caller hands
+    // over the mask's own bounding box. Nothing outside it is read or written.
+    const windowed = new Float32Array(PW * PH).fill(-8)
+    plantOn(windowed, 300, 150, 400, 350, 5)
+    plantOn(windowed, 150, 90, 5, 5, 3)
+    const rwin = cleanRegions(windowed, PW, PH, {
+      clicks: [{ x: 500, y: 300, label: 1 }], rect: [300, 150, 700, 500], fill: 2.5,
+    })
+    check(
+      'hygiene: the scan window is the contract — speckle outside `rect` is never touched',
+      rwin.islands === 0 && rwin.dirty === null && windowed[92 * PW + 152] > 0,
+      JSON.stringify({ dropped: rwin.islands, dirty: rwin.dirty, outside: windowed[92 * PW + 152] }),
+    )
+
+    // Dominance is a proxy for "the subject is legitimately fragmented", and
+    // ONE honest second part fakes it: a seated person whose leg is cut off by
+    // a chair scored 0.838 and shipped 26 specks of 40-80 px with it
+    // (DSC_0139.NEF). Below the gate, only the vanishingly small go, and only
+    // while they add up to a rounding error.
+    const twoPart = new Float32Array(PW * PH).fill(-8)
+    plantOn(twoPart, 300, 150, 400, 350, 5)    // the subject, 140 000 px
+    plantOn(twoPart, 320, 520, 180, 120, 3)    // its own second part, 21 600 px → dominance 0.84
+    for (let k = 0; k < 20; k += 1) plantOn(twoPart, 260 + k * 3, 110, 2, 2, 3) // 80 px of speckle
+    const rt = cleanRegions(twoPart, PW, PH, { clicks: [{ x: 500, y: 300, label: 1 }], fill: 2.5 })
+    check(
+      'hygiene: one honest second part must not buy 26 specks a free pass',
+      rt.islands === 20 && twoPart[560 * PW + 400] > 0
+        && fieldArea(twoPart) === 400 * 350 + 180 * 120,
+      JSON.stringify({ dropped: rt.islands, part: twoPart[560 * PW + 400], area: fieldArea(twoPart) }),
+    )
+
+    // ...and the streetlight, which the gate exists for, stays untouched: its
+    // speckle is percent-of-mask, not a rounding error, so the budget refuses
+    // the whole removal rather than taking half of it.
+    const fragmented = new Float32Array(PW * PH).fill(-8)
+    plantOn(fragmented, 300, 150, 60, 350, 5)  // the pole, 21 000 px
+    plantOn(fragmented, 360, 200, 300, 3, 3)   // a wire
+    // 120 fragments of 36 px. Each one is under the tiny threshold, so the
+    // budget — not the per-island size — is the only thing that can refuse
+    // them, and at 16% of the mask it does. The wire touches the pole, so the
+    // largest component is 21 900 and dominance lands at 0.835: below the gate,
+    // which is the branch under test.
+    for (let k = 0; k < 120; k += 1) plantOn(fragmented, 30 + k * 8, 520, 6, 6, 3)
+    const rf = cleanRegions(fragmented, PW, PH, { clicks: [{ x: 330, y: 300, label: 1 }], fill: 2.5 })
+    check(
+      'hygiene: below the gate, a fragmented subject still loses nothing',
+      rf.islands === 0 && fieldArea(fragmented) === 60 * 350 + 300 * 3 + 120 * 36,
+      JSON.stringify({ dropped: rf.islands, area: fieldArea(fragmented) }),
+    )
+
+    /* ── Scope control: the words and the steps behind the gestures ────── */
+
+    check(
+      // Every way of stepping — buttons, dots, wheel, drag, keyboard — goes
+      // through this and stops at the ends. A selection that jumps from the
+      // whole subject back to a speck reads as a bug, so nothing wraps.
+      'scope: one step at a time, clamped at both ends, and a lone reading cannot move',
+      stepScope(1, 1, 3) === 2 && stepScope(1, -1, 3) === 0
+        && stepScope(2, 1, 3) === 2 && stepScope(0, -1, 3) === 0
+        && stepScope(0, 1, 1) === 0,
+      `${stepScope(1, 1, 3)} ${stepScope(2, 1, 3)} ${stepScope(0, -1, 3)}`,
+    )
+    check(
+      // One mental model for the drag, the wheel and the key: up is more.
+      'scope: dragging up selects more, down selects less, one step per 34 px',
+      scrubIndex(0, -40, 3) === 1 && scrubIndex(0, -80, 3) === 2 && scrubIndex(0, -400, 3) === 2
+        && scrubIndex(2, 40, 3) === 1 && scrubIndex(1, -20, 3) === 1,
+      `${scrubIndex(0, -40, 3)} ${scrubIndex(0, -400, 3)} ${scrubIndex(2, 40, 3)}`,
     )
   }
 
@@ -1357,6 +1522,86 @@ try {
     'channel + hit tests agree',
   )
 
+  // Boundary regularisation of the composed selection. Fields are written as
+  // ASCII so the geometry under test is readable: '#' selected, '.' background.
+  const pad = (n) => '.'.repeat(n)
+  const bitmap = (rows) => {
+    const width = rows[0].length
+    const data = new Uint8ClampedArray(width * rows.length * 4)
+    rows.forEach((row, y) => [...row].forEach((ch, x) => {
+      const v = ch === '#' ? 255 : 0
+      const o = (y * width + x) * 4
+      data[o] = v; data[o + 1] = v; data[o + 2] = v; data[o + 3] = 255
+    }))
+    return { data, width, height: rows.length }
+  }
+  const cellAt = (m, x, y) => m.data[(y * m.width + x) * 4]
+
+  // Two objects decoded one after the other each stop a cell short of the edge
+  // they share, leaving a slit; a wider run of background between them is the
+  // user's own framing and has to survive.
+  const seamRow = `${pad(3)}${'#'.repeat(8)}..${'#'.repeat(8)}${pad(6)}${'#'.repeat(4)}${pad(3)}`
+  const seamRows = [...Array(3).fill(pad(34)), ...Array(5).fill(seamRow), ...Array(6).fill(pad(34))]
+  const seam = bitmap(seamRows)
+  const seamBefore = Uint8ClampedArray.from(seam.data)
+  const bridged = bridgeGaps(seam.data, seam.width, seam.height, { radius: 2 })
+  const addOnly = seamBefore.every((v, i) => i % 4 !== 0 || v < 128 || seam.data[i] >= 128)
+  check(
+    'bridgeGaps: a 2 px seam between two selections closes, 6 px of real background stays open, nothing is removed',
+    bridged === 10 && cellAt(seam, 11, 5) === 255 && cellAt(seam, 12, 5) === 255
+      && cellAt(seam, 23, 5) === 0 && addOnly,
+    `filled ${bridged} px · gap ${cellAt(seam, 23, 5)} · add-only ${addOnly}`,
+  )
+
+  const scoped = bitmap(seamRows)
+  const rect = [3, 3, 30, 7]
+  bridgeGaps(scoped.data, scoped.width, scoped.height, { radius: 2, rect })
+  const scopeMatches = scoped.data.every((v, i) => v === seam.data[i])
+  const bridgedAgain = bridgeGaps(scoped.data, scoped.width, scoped.height, { radius: 2, rect })
+  check(
+    'bridgeGaps: bbox-limited work matches the whole frame and a second closing changes nothing',
+    scopeMatches && bridgedAgain === 0,
+    `rect-limited ${scopeMatches ? 'identical' : 'differs'} · second pass ${bridgedAgain} px`,
+  )
+
+  // A one-cell tooth and a one-cell notch on an otherwise straight edge: the
+  // pixel-scale wobble a decoded boundary carries.
+  const straight = `${pad(4)}${'#'.repeat(8)}${pad(8)}`
+  const edge = bitmap([
+    ...Array(4).fill(pad(20)), ...Array(4).fill(straight),
+    `${pad(4)}${'#'.repeat(9)}${pad(7)}`, ...Array(3).fill(straight),
+    `${pad(4)}${'#'.repeat(7)}${pad(9)}`, ...Array(3).fill(straight),
+    ...Array(4).fill(pad(20)),
+  ])
+  smoothBoundary(edge.data, edge.width, edge.height, { radius: 1, rect: [4, 4, 12, 15] })
+  check(
+    'smoothBoundary: a tooth and a notch go, the straight edge stays where it was, the interior is untouched',
+    cellAt(edge, 12, 8) < 128 && cellAt(edge, 11, 12) >= 128
+      && cellAt(edge, 11, 5) >= 128 && cellAt(edge, 12, 5) < 128 && cellAt(edge, 7, 9) === 255,
+    `tooth ${cellAt(edge, 12, 8)} · notch ${cellAt(edge, 11, 12)} · edge ${cellAt(edge, 11, 5)}/${cellAt(edge, 12, 5)}`,
+  )
+
+  // A mean alone drives a 1 px wire below the decision level along its whole
+  // length; the connectivity guard is the only thing that keeps it.
+  const wireBlocks = `${pad(4)}${'#'.repeat(5)}${pad(7)}${'#'.repeat(5)}${pad(3)}`
+  const wireRows = [
+    ...Array(3).fill(pad(24)), ...Array(3).fill(wireBlocks),
+    `${pad(4)}${'#'.repeat(17)}${pad(3)}`,
+    ...Array(3).fill(wireBlocks), ...Array(3).fill(pad(24)),
+  ]
+  const wireHeld = [1, 2].map((radius) => {
+    const wire = bitmap(wireRows)
+    smoothBoundary(wire.data, wire.width, wire.height, { radius })
+    let held = 0
+    for (let x = 9; x <= 15; x += 1) if (cellAt(wire, x, 6) >= 128) held += 1
+    return held
+  })
+  check(
+    'smoothBoundary: a 1 px wire between two blocks survives smoothing at r=1 and r=2',
+    wireHeld[0] === 7 && wireHeld[1] === 7,
+    `wire cells held ${wireHeld.join('/')} of 7`,
+  )
+
   // The optional fixture exercises the bounded RAW-container parser directly.
   // It deliberately avoids Playwright's slow multi-megabyte file-upload bridge;
   // after extraction, the JPEG preview follows the already-covered Blob decode
@@ -1448,15 +1693,11 @@ try {
   /* ─── Phase S: memory-contract static scans ─────────────────────────── */
   await run.enter('S')
   {
-    const jsFiles = ['app.js', 'asset-store.js', 'image-io.js', 'capability.js', 'policy.js',
-      'sam-client.js', 'sam-core.js',
-      'sam21-lane.js', 'sam21-host.js', 'sam21-client.js', 'sam21-adapter.js',
-      'export-hd.js', 'yoloe-detect.js', 'detect-worker.js', 'embed-store.js', 'text-core.js',
-      'ort-loader.js', 'gpu-adapter.js', 'search-taxonomy.js', 'mask-refine.js', 'sam21-store.js',
-      'text-encode.js', 'clip-tokenizer.js', 'text-embed-store.js',
-      'text-ui.js', 'image-raw.js', 'heavy-job-queue.js', 'decode-worker.js', 'decode-client.js',
-      'decode-core.js', 'proxy-plan.js', 'cv-refine-client.js', 'cv-refine-worker.js',
-      'raw-develop-client.js', 'raw-develop-worker.js']
+    // Read the directory rather than keep a list: what the sweeps below prove
+    // is a property of everything that ships, and a hand-maintained list only
+    // records which modules someone remembered. Seven had already slipped past
+    // it — gestures, mask-select, memory-governor, session-store among them.
+    const jsFiles = readdirSync(path.join(ROOT, 'js')).filter((f) => f.endsWith('.js')).sort()
     const sources = Object.fromEntries(jsFiles.map((f) => [f, readFileSync(path.join(ROOT, 'js', f), 'utf8')]))
     sources['index.html'] = readFileSync(path.join(ROOT, 'index.html'), 'utf8')
     const all = Object.values(sources).join('\n') + readFileSync(path.join(ROOT, 'sw.js'), 'utf8')
@@ -1483,6 +1724,40 @@ try {
       /mb \+= detectorResidentMB\(\)/.test(sources['app.js'])
         && /export const detectorResidentMB/.test(sources['sam-client.js']),
       'detect worker residency is in estimateFootprintMB',
+    )
+    check(
+      // The rest of the ledger is a step function, so without these terms the
+      // estimate cannot move while the user works — the shape of the reported
+      // WebKit reap (one box, then clicks, until the tab was killed).
+      'static: the ledger counts the selection, not just the sessions',
+      /state\.baseOps\.length \+ \(state\.baseFloor \? 1 : 0\)/.test(sources['app.js'])
+        && /state\.baseMask, state\.mask, state\.maskRaw, state\.liveMask, state\.liveRaw/.test(sources['app.js']),
+      'op stack + composed frames are in estimateFootprintMB',
+    )
+    check(
+      // releaseEncoder returns 37 MB (app.js §LEDGER_MB) and costs a rebuild —
+      // 0.9-19.9 s of Metal shader compile on WebKit. Only L2, which returns the
+      // 976 MB device pool, is worth that.
+      'static: an L1 shed keeps the encoder — only L2 pays a rebuild',
+      /if \(level < 2\) return Promise\.resolve\(\[\]\)\s*\n\s*forgetEncoder\(\)/.test(sources['app.js'])
+        && !/if \(level >= 1\) forgetEncoder\(\)/.test(sources['app.js']),
+      'shedMemory releases the lane at level 2',
+    )
+    check(
+      // A drifted copy is silent — the branch never fires on the engine it
+      // exists for. `!userAgentData` alone also matches Gecko.
+      'static: the WebKit sniff is defined once, and nowhere else',
+      /export const IS_WEBKIT/.test(sources['engine.js'])
+        && Object.entries(sources).filter(([f, s]) => f !== 'engine.js' && /const IS_WEBKIT =/.test(s)).length === 0,
+      'engine.js owns IS_WEBKIT',
+    )
+    check(
+      // Runs on every commit; the old concatenated buffer held up to
+      // 2 x MAX_BYTES transient in the process a reap decides against.
+      'static: a session save streams the original, never materialises it',
+      !/entry\.blob\.arrayBuffer\(\)/.test(sources['session-store.js'])
+        && /await w\.write\(entry\.blob\)/.test(sources['session-store.js']),
+      'writeEntry writes the blob straight to the writable',
     )
     check(
       // Terminating mid-detection rejects the in-flight call, which the user
@@ -1518,8 +1793,57 @@ try {
       /id="scope"/.test(sources['index.html'])
         && /export const sam21CandidateShape/.test(sources['sam21-adapter.js'])
         && /const renderScope = \(\)/.test(sources['app.js'])
-        && /aria-pressed/.test(sources['app.js']),
+        && /aria-pressed/.test(sources['scope-control.js']),
       'the scope control renders one pressable pill per candidate',
+    )
+    check(
+      // A percentage names a measurement, and `Part/Object/Whole` names a
+      // MEANING the model never gave — what comes back is three sizes. So the
+      // control shows the readings: one swatch per candidate, painted from its
+      // own mask. A shared crop was tried and measured — a 20x spread drew two
+      // invisible specks — so each shape gets its own crop and the log ladder
+      // in `fills` carries the order.
+      'static: the scope control shows the readings themselves, not numbers or invented names',
+      /scope-shape/.test(sources['scope-control.js'])
+        && /const fills = /.test(sources['scope-control.js'])
+        && /Math\.log/.test(sources['scope-control.js'])
+        && /shape\(i\)/.test(sources['scope-control.js'])
+        && /shape: \(i\) => candidateShape\(i\)/.test(sources['app.js'])
+        && !/Part|Whole/.test(sources['scope-control.js'].replace(/\/\*[\s\S]*?\*\//g, ''))
+        && !/C for another interpretation/.test(sources['app.js']),
+      'one silhouette per reading, sized on a log ladder',
+    )
+    check(
+      // The decoder's field is a SQUARE resize of the frame (sam21-adapter
+      // MASK_SIDE), so a swatch drawn straight from it shows a different shape.
+      // The un-squash factor is the PHOTO's box; the control's placement box is
+      // the stage, which only matches while it hugs the photo.
+      'static: the swatch is un-squashed by the frame, not by the placement box',
+      /g\.aspect > 0 \? g\.aspect : 1/.test(sources['scope-control.js'])
+        && !/g\.width \/ g\.height/.test(sources['scope-control.js'])
+        && /aspect: rect\.width \/ rect\.height/.test(sources['app.js']),
+      'paint() reads geometry().aspect, fed from the overlay rect',
+    )
+    check(
+      // Buttons, dots, wheel, drag and the key all step by one and stop at the
+      // ends. A second tap on the same spot is NOT a step — that collides with
+      // the one rule every user already learned, that clicks add points.
+      'static: every way of stepping shares one clamped rule, and clicks stay clicks',
+      /Math\.min\(count - 1, Math\.max\(0, index \+ delta\)\)/.test(sources['scope-control.js'])
+        && !/%/.test((sources['scope-control.js'].match(/export const stepScope[\s\S]*?\n\}/) || [''])[0])
+        && /addEventListener\('wheel'/.test(sources['scope-control.js'])
+        && /SCRUB_ENTER_PX/.test(sources['scope-control.js'])
+        && /stepScope\(state\.scope\.index, delta/.test(sources['app.js'])
+        && !/tapIsRepeat/.test(sources['app.js']),
+      'wheel + drag + keyboard all clamp through stepScope',
+    )
+    check(
+      // The whole point of extracting it: Mask Studio and Phosmith import the
+      // control, so it may not reach for anything that only exists in seglab.
+      'static: the scope control is portable — DOM and callbacks, no app state',
+      !/\bstate\./.test(sources['scope-control.js'])
+        && !/^import /m.test(sources['scope-control.js']),
+      'no imports, no shared state',
     )
     check(
       // Picking a parked plane re-runs post only. A decode here would make the
@@ -1711,6 +2035,24 @@ try {
         && !/scheduleEncoderRelease/.test(sources['sam21-lane.js']),
       'releaseAll at idle, guarded by encode + decode refs',
     )
+    check(
+      // The guided filter works on the BAND box plus its own pad (radius·2 +
+      // scale·2, up to 80 px on the native path), which reaches OUTSIDE the
+      // mask box hygiene was being handed. A pixel it lifts over zero out there
+      // is a component nothing can see: one rivet click on a D750 frame shipped
+      // exactly one detached pixel, 3 px past the box. Every hygiene call takes
+      // the union, so the window is the filter's reach, not the mask's.
+      'static: region hygiene scans the guided filter\'s reach, not just the mask box',
+      (() => {
+        const src = sources['sam21-adapter.js']
+        const count = (re) => (src.match(re) || []).length
+        return /const unionRect = \(a, b\) =>/.test(src)
+          && count(/cleanRegions\(/g) === 3
+          && count(/rect: scan\b/g) === 3
+          && count(/const scan = unionRect\(/g) === 3
+      })(),
+      'all three call sites scan box ∪ refineField rect',
+    )
   }
 
   /* ─── The browser boundary ─────────────────────────────────────────────
@@ -1724,6 +2066,9 @@ try {
     console.log(run.summary())
     process.exit(results.some((r) => !r.ok) ? 1 : 0)
   }
+  // Which build proved the browser phases belongs in the transcript: the same
+  // phase can pass on one Chrome and fail on the next.
+  log(`browser phases on ${channelLabel(OPTS.channel)}`)
   if (OPTS.isolated) {
     const snap = memorySnapshot(true)
     log(`--isolated — throwaway profile ${RUN_TAG}, no lease taken. ${formatMem(snap)}`)
@@ -1745,11 +2090,11 @@ try {
   await run.enter('A')
   context = guardContext(
     await withDeadline(
-      chromium.launchPersistentContext(PROFILE_DIR, {
+      chromium.launchPersistentContext(PROFILE_DIR, onChannel({
         headless: true,
         args: ['--enable-unsafe-webgpu', '--enable-gpu'],
         timeout: LAUNCH_MS,
-      }),
+      })),
       LAUNCH_MS + 15_000,
       'chromium launch on the shared profile',
     ),
@@ -1969,6 +2314,96 @@ try {
     z1.clicks === 0 && (z1.maskSummary?.coverage || 0) < covU1 * 0.15 && z1.baseOps === 2
       && z2.baseOps === 1 && Math.abs((z2.maskSummary?.coverage || 0) - covU1) < covU1 * 0.2,
     JSON.stringify({ z1: { clicks: z1.clicks, baseOps: z1.baseOps, coverage: z1.maskSummary?.coverage || 0 }, z2: { baseOps: z2.baseOps, coverage: z2.maskSummary?.coverage } }),
+  )
+
+  // Coexistence across tools. Every tool that opens a NEW live object has to
+  // commit the finished one first, and four of the six paths used to just drop
+  // it — draw a box after a click and the click's object silently went away.
+  // The rule is one function now (beginNewObject); this is the matrix that says
+  // so, because the failure is invisible in any single-tool test.
+  const covOf = (s) => s?.maskSummary?.coverage || 0
+  const W0 = geo.originalW
+  const H0 = geo.originalH
+  const target = (shape) => (shape === 'disc'
+    ? {
+      pt: [geo.disc.x * p, geo.disc.y * p],
+      r: geo.disc.r * p * 1.15,
+      box: [(geo.disc.x - geo.disc.r) * p, (geo.disc.y - geo.disc.r) * p,
+        (geo.disc.x + geo.disc.r) * p, (geo.disc.y + geo.disc.r) * p],
+      stroke: [[(geo.disc.x - geo.disc.r * 0.5) * p, geo.disc.y * p], [(geo.disc.x + geo.disc.r * 0.5) * p, geo.disc.y * p]],
+    }
+    : shape === 'square'
+      ? {
+        pt: [(geo.square.x + geo.square.w / 2) * p, (geo.square.y + geo.square.h / 2) * p],
+        r: geo.square.w * p * 0.8,
+        box: [geo.square.x * p, geo.square.y * p, (geo.square.x + geo.square.w) * p, (geo.square.y + geo.square.h) * p],
+        stroke: [[(geo.square.x + 20) * p, (geo.square.y + geo.square.h / 2) * p],
+          [(geo.square.x + geo.square.w - 20) * p, (geo.square.y + geo.square.h / 2) * p]],
+      }
+      : { // empty background, so a manual shape there always adds area
+        pt: [0.08 * W0 * p, 0.15 * H0 * p],
+        r: 0.05 * W0 * p,
+        box: [0.02 * W0 * p, 0.06 * H0 * p, 0.14 * W0 * p, 0.24 * H0 * p],
+        stroke: [[geo.dot.x * p - 4, geo.dot.y * p], [geo.dot.x * p + 4, geo.dot.y * p]],
+      })
+  const applyTool = (tool, arg) => page.evaluate(async ({ tool: t, arg: a }) => {
+    const S = window.__seglab
+    if (t === 'click') return S.clickAt(a.pt[0], a.pt[1])
+    if (t === 'box') return S.boxAt(a.box[0], a.box[1], a.box[2], a.box[3])
+    if (t === 'lasso') return S.lassoCircle(a.pt[0], a.pt[1], a.r)
+    if (t === 'rect') return S.manualRect(a.box[0], a.box[1], a.box[2], a.box[3])
+    if (t === 'ellipse') return S.manualEllipse(a.box[0], a.box[1], a.box[2], a.box[3])
+    if (t === 'region') return S.manualRegionCircle(a.pt[0], a.pt[1], a.r)
+    if (t === 'brush') return S.brushStroke(a.stroke)
+    if (t === 'text') return S.selectBoxes([a.box])
+    throw new Error(`unknown tool ${t}`)
+  }, { tool, arg })
+
+  const FOLLOWERS = ['box', 'lasso', 'rect', 'ellipse', 'region', 'brush', 'text']
+  const coexist = []
+  for (const tool of FOLLOWERS) {
+    await page.evaluate(() => window.__seglab.reset())
+    const first = await applyTool('click', target('disc'))
+    const after = await applyTool(tool, target('square'))
+    coexist.push({ tool, before: +covOf(first).toFixed(4), after: +covOf(after).toFixed(4), baseOps: after.baseOps })
+  }
+  const lost = coexist.filter((r) => !(r.before > 0 && r.after > r.before && r.baseOps >= 1))
+  check(
+    'coexistence: a clicked object survives every tool used after it',
+    lost.length === 0,
+    lost.length ? JSON.stringify(lost) : coexist.map((r) => `${r.tool} ${r.before}→${r.after}`).join(', '),
+  )
+
+  // …and the mirror: a live object opened by box / lasso / text survives a
+  // click on something else. The commit has to be on the way IN, not on the way
+  // out, or it depends on which tool happens to run next.
+  const producers = []
+  for (const tool of ['box', 'lasso', 'text']) {
+    await page.evaluate(() => window.__seglab.reset())
+    const first = await applyTool(tool, target('disc'))
+    const after = await applyTool('click', target('square'))
+    producers.push({ tool, before: +covOf(first).toFixed(4), after: +covOf(after).toFixed(4), baseOps: after.baseOps })
+  }
+  const dropped = producers.filter((r) => !(r.before > 0 && r.after > r.before && r.baseOps >= 1))
+  check(
+    'coexistence: a box / lasso / text object survives a later click',
+    dropped.length === 0,
+    dropped.length ? JSON.stringify(dropped) : producers.map((r) => `${r.tool} ${r.before}→${r.after}`).join(', '),
+  )
+
+  // Four tools in one selection, which is what a real session looks like.
+  await page.evaluate(() => window.__seglab.reset())
+  const chain = []
+  chain.push(await applyTool('click', target('disc')))
+  chain.push(await applyTool('box', target('square')))
+  chain.push(await applyTool('brush', target('free')))
+  chain.push(await applyTool('rect', target('free')))
+  const chainCov = chain.map(covOf)
+  const chainStats = await page.evaluate(() => window.__seglab.maskStats())
+  check(
+    'coexistence: a four-tool chain only ever grows the selection',
+    chainCov.every((c, i) => c > 0 && (i === 0 || c > chainCov[i - 1])) && chainStats?.components >= 3,
+    `coverage ${chainCov.map((c) => (c * 100).toFixed(2)).join('% → ')}%, components=${chainStats?.components}`,
   )
 
   // Minute object.
@@ -2789,7 +3224,7 @@ try {
     run.skip('V', 'nothing vendored — run `bun run models` for the offline gate')
   } else if (await run.enter('V')) {
     const browserV = await withDeadline(
-      chromium.launch({ headless: true, args: ['--enable-unsafe-webgpu', '--enable-gpu'], timeout: LAUNCH_MS }),
+      chromium.launch(onChannel({ headless: true, args: ['--enable-unsafe-webgpu', '--enable-gpu'], timeout: LAUNCH_MS })),
       LAUNCH_MS + 15_000,
       'cold browser launch',
     )
@@ -2881,6 +3316,207 @@ try {
     )
     await pageQ.evaluate(() => window.__seglab.clearSession())
     await pageQ.close()
+  }
+
+  /* ── Phase G: pointer gestures ─────────────────────────────────────────
+     Every other phase clicks through `clickAt`, which takes canvas coordinates
+     and never touches the pointer→canvas mapping. That mapping is measured
+     against a #frame the zoom transforms, so a stale rect or a wrong sign does
+     not throw — it selects a different object. This phase is the only one
+     driving the real mouse, wheel, keys and touch points. */
+  if (await run.enter('G')) {
+    const pageG = await newAppPage(context, '', 1200)
+    await pageG.waitForFunction(() => window.__seglab.state()?.hasImage === true, null, { timeout: 60_000 })
+
+    const geomOf = () => pageG.evaluate(() => {
+      const c = document.getElementById('overlay')
+      const v = document.getElementById('view')
+      const o = c.getBoundingClientRect()
+      const s = document.getElementById('stage').getBoundingClientRect()
+      const f = document.getElementById('frame')
+      const m = new DOMMatrixReadOnly(getComputedStyle(f).transform)
+      return {
+        o: { x: o.left, y: o.top, w: o.width, h: o.height },
+        s: { x: s.left, y: s.top, w: s.width, h: s.height },
+        zoom: m.a, tx: m.e, ty: m.f, inline: f.getAttribute('style') || '',
+        cw: c.width, ch: c.height, vw: v.width, vh: v.height,
+        input: document.body.dataset.input,
+      }
+    })
+    // The display canvas is swapped mid-import, and for a beat the box keeps
+    // its old aspect while carrying the new grid — stable enough to look
+    // settled, and every coordinate taken off it lands somewhere else.
+    const settleG = async () => {
+      let last = null
+      for (let i = 0; i < 100; i += 1) {
+        const g = await geomOf()
+        const key = `${g.o.x.toFixed(1)},${g.o.y.toFixed(1)},${g.o.w.toFixed(1)},${g.o.h.toFixed(1)},${g.cw}`
+        if (key === last && Math.abs((g.o.w / g.o.h) / (g.cw / g.ch) - 1) < 0.01) return g
+        last = key
+        await pageG.waitForTimeout(100)
+      }
+      throw new Error(`gesture phase: layout never settled (${last})`)
+    }
+    const baseG = await settleG()
+    const stateG = () => pageG.evaluate(() => ({ ...window.__seglab.state(), ...(window.__seglab.maskStats() || {}) }))
+    const screenOf = async (cx, cy) => {
+      const g = await geomOf()
+      return [g.o.x + (cx + 0.5) * (g.o.w / g.cw), g.o.y + (cy + 0.5) * (g.o.h / g.ch)]
+    }
+    // The prompt count is the only honest signal that the CLICK produced the
+    // mask: revision also ticks for an encode, so a wait on it lets a mask that
+    // was already on screen pass for a fresh selection.
+    const clickReal = async (cx, cy) => {
+      const before = (await stateG()).clicks
+      const [sx, sy] = await screenOf(cx, cy)
+      await pageG.mouse.click(sx, sy)
+      await pageG.waitForFunction(
+        (n) => window.__seglab.state().clicks > n && window.__seglab.state().maskSummary,
+        before, { timeout: 60_000 },
+      )
+      await pageG.waitForTimeout(350) // the refined mask lands after the result
+      return stateG()
+    }
+    const wheelAt = async (sx, sy, dy, n = 1) => {
+      await pageG.mouse.move(sx, sy)
+      for (let i = 0; i < n; i += 1) { await pageG.mouse.wheel(0, dy); await pageG.waitForTimeout(40) }
+      await pageG.waitForTimeout(150)
+    }
+
+    // #view alone is in flow, so it is the only thing sizing the box #photo and
+    // #overlay are stretched across. Let the grids drift apart, or the box drift
+    // from its aspect, and the photo draws distorted while clicks are still
+    // measured against the box.
+    check(
+      'gestures: the overlay grid is the interaction frame, undistorted',
+      baseG.cw === baseG.vw && baseG.ch === baseG.vh
+      && Math.abs((baseG.o.w / baseG.o.h) / (baseG.vw / baseG.vh) - 1) < 0.01,
+      `overlay ${baseG.cw}×${baseG.ch}, view ${baseG.vw}×${baseG.vh},`
+      + ` box ${baseG.o.w.toFixed(0)}×${baseG.o.h.toFixed(0)}`,
+    )
+    check('gestures: a mouse is not mistaken for a finger', baseG.input === 'mouse', `input=${baseG.input}`)
+
+    const g0 = await pageG.evaluate(() => window.__seglab.demoGeometry())
+    const DGX = Math.round(g0.disc.x * g0.proxyScale)
+    const DGY = Math.round(g0.disc.y * g0.proxyScale)
+    const flatG = await clickReal(DGX, DGY)
+    checkDisc('gestures 1×', flatG, DGX, DGY, DISC_FRAC)
+    await pageG.evaluate(() => window.__seglab.reset())
+
+    // Zoom about the disc: whatever sits under the cursor must stay under it.
+    // The anchor is mid-frame, where the pan clamp cannot bind and move it.
+    const anchor = await screenOf(DGX, DGY)
+    await wheelAt(anchor[0], anchor[1], -240, 3)
+    const zoomedG = await geomOf()
+    const held = await screenOf(DGX, DGY)
+    const slip = Math.hypot(held[0] - anchor[0], held[1] - anchor[1])
+    check(
+      'gestures: the pixel under the cursor stays under the cursor while zooming',
+      zoomedG.zoom > 2 && slip <= 2,
+      `${zoomedG.zoom.toFixed(2)}× — (${anchor.map((v) => v.toFixed(0))}) → (${held.map((v) => v.toFixed(0))}),`
+      + ` slip ${slip.toFixed(2)} px`,
+    )
+
+    // Then move the photo under the cursor: an offset the mapping forgot to
+    // re-read shows up as a click on the wrong pixel, never as an error.
+    await pageG.mouse.move(anchor[0], anchor[1])
+    await pageG.mouse.down({ button: 'middle' })
+    await pageG.mouse.move(anchor[0] - 120, anchor[1] - 90, { steps: 8 })
+    await pageG.mouse.up({ button: 'middle' })
+    await pageG.waitForTimeout(150)
+    check('gestures: a middle-drag pans and is not a selection', (await stateG()).clicks === 0,
+      `clicks ${(await stateG()).clicks}`)
+    const deepG = await clickReal(DGX, DGY)
+    checkDisc(`gestures ${zoomedG.zoom.toFixed(1)}×+pan`, deepG, DGX, DGY, DISC_FRAC)
+    const flatPt = flatG.clickPoints?.[0] || []
+    const deepPt = deepG.clickPoints?.[0] || []
+    check(
+      'gestures: zoomed and panned, a click still lands on the pixel it is aimed at',
+      Math.hypot((deepPt[0] ?? 1e6) - flatPt[0], (deepPt[1] ?? 1e6) - flatPt[1]) <= 2,
+      `[${flatPt}] → [${deepPt}]`,
+    )
+    await pageG.evaluate(() => window.__seglab.reset())
+
+    // Pan is slack, never a way to lose the photo off the edge of the stage.
+    const midG = [baseG.s.x + baseG.s.w / 2, baseG.s.y + baseG.s.h / 2]
+    await pageG.mouse.move(midG[0], midG[1])
+    await pageG.mouse.down({ button: 'middle' })
+    await pageG.mouse.move(midG[0] + 2000, midG[1] + 2000, { steps: 8 })
+    await pageG.mouse.up({ button: 'middle' })
+    await pageG.waitForTimeout(150)
+    const pannedG = await geomOf()
+    check(
+      'gestures: pan cannot open a gap at the edge of the stage',
+      pannedG.o.x <= pannedG.s.x + 1 && pannedG.o.y <= pannedG.s.y + 1
+      && pannedG.o.x + pannedG.o.w >= pannedG.s.x + pannedG.s.w - 1
+      && pannedG.o.y + pannedG.o.h >= pannedG.s.y + pannedG.s.h - 1,
+      `photo at (${(pannedG.o.x - pannedG.s.x).toFixed(0)}, ${(pannedG.o.y - pannedG.s.y).toFixed(0)})`
+      + ` size ${pannedG.o.w.toFixed(0)}×${pannedG.o.h.toFixed(0)} in ${pannedG.s.w.toFixed(0)}×${pannedG.s.h.toFixed(0)}`,
+    )
+
+    // The range is closed at both ends, and 1× leaves no transform behind.
+    await wheelAt(midG[0], midG[1], -240, 10)
+    const topG = await geomOf()
+    await wheelAt(midG[0], midG[1], 240, 18)
+    const homeG = await geomOf()
+    check(
+      'gestures: zoom is clamped at 8×, winds back to 1×, and drops the transform',
+      topG.zoom <= 8.001 && topG.zoom > 7.9 && homeG.zoom === 1 && !/transform/.test(homeG.inline),
+      `${topG.zoom.toFixed(3)}× → ${homeG.zoom}×, inline "${homeG.inline}"`,
+    )
+
+    await pageG.keyboard.press('=')
+    await pageG.waitForTimeout(80)
+    const keyedG = await geomOf()
+    const clicksBeforeSpace = (await stateG()).clicks
+    await pageG.keyboard.down(' ')
+    await pageG.mouse.move(midG[0], midG[1])
+    await pageG.mouse.down()
+    await pageG.mouse.move(midG[0] - 120, midG[1] - 90, { steps: 6 })
+    await pageG.mouse.up()
+    await pageG.keyboard.up(' ')
+    await pageG.waitForTimeout(150)
+    const spacedG = await geomOf()
+    await pageG.keyboard.press('0')
+    await pageG.waitForTimeout(100)
+    const zeroedG = await geomOf()
+    check(
+      'gestures: = zooms, space-drag pans instead of drawing, 0 resets the view',
+      keyedG.zoom > 1.3 && (spacedG.tx !== keyedG.tx || spacedG.ty !== keyedG.ty)
+      && (await stateG()).clicks === clicksBeforeSpace && zeroedG.zoom === 1,
+      `= ${keyedG.zoom.toFixed(2)}×, Δtx ${(spacedG.tx - keyedG.tx).toFixed(0)},`
+      + ` clicks ${clicksBeforeSpace} → ${(await stateG()).clicks}, 0 → ${zeroedG.zoom}×`,
+    )
+
+    // Touch is a different vocabulary on the same surface, and the page decides
+    // which it is from live events — so emulating the touch points here is
+    // enough, without a second browser and a cold profile.
+    const cdpG = await context.newCDPSession(pageG)
+    await cdpG.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 })
+    const touchG = (type, pts) => cdpG.send('Input.dispatchTouchEvent', {
+      type, touchPoints: pts.map(([x, y], i) => ({ x, y, id: i })),
+    })
+    await touchG('touchStart', [[midG[0] - 40, midG[1]], [midG[0] + 40, midG[1]]])
+    for (let k = 1; k <= 6; k += 1) {
+      await touchG('touchMove', [[midG[0] - 40 - k * 25, midG[1]], [midG[0] + 40 + k * 25, midG[1]]])
+      await pageG.waitForTimeout(30)
+    }
+    await touchG('touchEnd', [])
+    await pageG.waitForTimeout(250)
+    const pinchedG = await geomOf()
+    const afterPinch = await stateG()
+    check(
+      'gestures: a pinch zooms the view and commits nothing',
+      pinchedG.zoom > 1.4 && pinchedG.input === 'touch' && afterPinch.clicks === 0 && !afterPinch.maskSummary,
+      `${pinchedG.zoom.toFixed(2)}×, input=${pinchedG.input}, clicks ${afterPinch.clicks},`
+      + ` mask ${afterPinch.maskSummary ? 'yes' : 'none'}`,
+    )
+    // A finger lifting out of a pinch must not leave the surface swallowing taps.
+    await pageG.keyboard.press('0')
+    await pageG.waitForTimeout(120)
+    const tapG = await clickReal(DGX, DGY)
+    checkDisc('gestures after pinch', tapG, DGX, DGY, DISC_FRAC)
+    await pageG.close()
   }
 
   /* Runs last by contract, not by convention: PLAN declares A11 after:['V','P'].
@@ -3090,11 +3726,11 @@ try {
     // GPU adapter. You may need to enable fla…").
     const noGpuCtx = guardContext(
       await withDeadline(
-        chromium.launchPersistentContext(`${PROFILE_DIR}-nogpu`, {
+        chromium.launchPersistentContext(`${PROFILE_DIR}-nogpu`, onChannel({
           headless: true,
           args: ['--disable-features=WebGPU,WebGPUService', '--disable-gpu'],
           timeout: LAUNCH_MS,
-        }),
+        })),
         LAUNCH_MS + 15_000,
         'no-WebGPU browser launch',
       ),

@@ -15,7 +15,7 @@ import { SIDE, MASK_SIDE, LANE } from './sam21-lane.js'
 import { decodeMask, encodeImage, hello, hostMode } from './sam21-client.js'
 import { noteModel } from './model-registry.js'
 import { bandAlpha, bandAlphaRect, refineField } from './mask-refine.js'
-import { fieldArea } from './mask-select.js'
+import { cleanRegions, fieldArea } from './mask-select.js'
 
 let greeted = false
 
@@ -44,6 +44,13 @@ const clampIdx = (i) => (i < 0 ? 0 : (i > MASK_SIDE - 1 ? MASK_SIDE - 1 : i))
  * the cost is 4 taps per axis rather than 16 per pixel. Row weights repeat for
  * every output row, so they are computed once up front.
  */
+/** Smallest rect covering both, either of which may be absent. Ends exclusive. */
+const unionRect = (a, b) => {
+    if (!a) return b || null
+    if (!b) return a
+    return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]
+}
+
 const upsampleLogits = (logits, w, h) => {
     const out = new Float32Array(w * h)
     const sx = MASK_SIDE / w
@@ -81,6 +88,7 @@ const upsampleLogits = (logits, w, h) => {
     // refineField would otherwise need its own full-frame scan to find it.
     const BAND = 6
     let minX = w; let minY = h; let maxX = -1; let maxY = -1
+    let bx0 = w; let by0 = h; let bx1 = -1; let by1 = -1
     for (let y = 0; y < h; y += 1) {
         const fy = (y + 0.5) * sy - 0.5
         const y0 = Math.floor(fy)
@@ -90,19 +98,46 @@ const upsampleLogits = (logits, w, h) => {
         const r2 = clampIdx(y0 + 1) * w
         const r3 = clampIdx(y0 + 2) * w
         const row = y * w
+        // Row-local extents: x only ever increases, so the running max is a
+        // store rather than a compare, and the y bounds move twice per row
+        // instead of once per pixel.
+        let mLo = -1; let mHi = -1
+        let bLo = -1; let bHi = -1
         for (let x = 0; x < w; x += 1) {
             const v = tmp[r0 + x] * k[0] + tmp[r1 + x] * k[1]
                 + tmp[r2 + x] * k[2] + tmp[r3 + x] * k[3]
             out[row + x] = v
-            if (v > -BAND && v < BAND) {
-                if (x < minX) minX = x
-                if (x > maxX) maxX = x
-                if (y < minY) minY = y
-                if (y > maxY) maxY = y
+            // Two boxes out of one test. The band box (|v| < BAND) is what the
+            // guided filter needs. The mask box (v > -BAND) is its superset and
+            // is the window region hygiene scans: it has to contain the mask's
+            // INTERIOR, because a subject running off-frame has foreground with
+            // no zero crossing beside it, and a band-only window would read that
+            // as a component of its own.
+            if (v > -BAND) {
+                if (mLo < 0) mLo = x
+                mHi = x
+                if (v < BAND) { if (bLo < 0) bLo = x; bHi = x }
             }
         }
+        if (mHi >= 0) {
+            if (mLo < bx0) bx0 = mLo
+            if (mHi > bx1) bx1 = mHi
+            if (by1 < 0) by0 = y
+            by1 = y
+        }
+        if (bHi >= 0) {
+            if (bLo < minX) minX = bLo
+            if (bHi > maxX) maxX = bHi
+            if (maxY < 0) minY = y
+            maxY = y
+        }
     }
-    return { field: out, bbox: maxX < 0 ? null : [minX, minY, maxX, maxY] }
+    return {
+        field: out,
+        bbox: maxX < 0 ? null : [minX, minY, maxX, maxY],
+        // Ends exclusive — a scan window, not an inclusive bbox.
+        box: bx1 < 0 ? null : [bx0, by0, bx1 + 1, by1 + 1],
+    }
 }
 
 // The guide image is the SAME for every click on a photo, but getImageData
@@ -170,6 +205,10 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const kx = SIDE / canvas.width
     const ky = SIDE / canvas.height
     const pts = (clicks || []).map(([x, y, label]) => ({ x: x * kx, y: y * ky, label: label ?? 1 }))
+    // The same prompts in PROXY space, for the hygiene pass that runs after the
+    // post pipeline: an include click protects the component it landed on, and
+    // that component only exists once the field has been upsampled.
+    const proxyPts = (clicks || []).map(([x, y, label]) => ({ x, y, label: label ?? 1 }))
     // A box IS expressible: SAM 2.1 encodes it as its two corners with labels
     // 2 (top-left) and 3 (bottom-right). The decoder carries
     // prompt_encoder.point_embeddings.2/.3 and branches on those label values —
@@ -239,13 +278,13 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const t2 = performance.now()
     const w = canvas.width
     const h = canvas.height
-    const { rgba, rawRgba, bandPixels } = postProcess(canvas, imageKey, dec.logits, w, h)
+    const { rgba, rawRgba, bandPixels, regions } = postProcess(canvas, imageKey, dec.logits, w, h, proxyPts)
 
     // Park every candidate SAM already computed, ordered small → large, so the
     // app can answer "you took the wrong part of it" with a repaint. The
     // inference is already paid for; the only cost is 256 KB per plane.
     candidates = orderCandidates({
-        imageKey, canvas, w, h,
+        imageKey, canvas, w, h, clicks: proxyPts,
         planes: [dec.logits, ...(dec.alternates || [])],
         scores: [dec.iou, ...(dec.altScores || [])],
     })
@@ -267,7 +306,12 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
         // Why this candidate won, and what region hygiene removed. Debug-only,
         // but it is the difference between "the mask is wrong" and knowing which
         // of six mechanisms produced it.
-        pick: { reason: dec.reason, stability: dec.stability, refined: dec.refined, regions: dec.regions },
+        // `regions` is what the 256² grid needed; `cleaned` is what the proxy
+        // field still needed after the upsample and the guided filter ran.
+        pick: {
+            reason: dec.reason, stability: dec.stability, refined: dec.refined,
+            regions: dec.regions, cleaned: { islands: regions.islands, holes: regions.holes },
+        },
     }
 }
 
@@ -277,8 +321,8 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
  * cycling has to produce a mask indistinguishable from a decoded one — same
  * band, same guided filter, same parked field.
  */
-const postProcess = (canvas, imageKey, logits, w, h) => {
-    const { field, bbox } = upsampleLogits(logits, w, h)
+const postProcess = (canvas, imageKey, logits, w, h, clicks = []) => {
+    const { field, bbox, box } = upsampleLogits(logits, w, h)
     // Raw first: the refinement rewrites `field` in place, and the app's
     // raw/refined toggle needs both.
     const BAND = bandWidth(field, w, bbox)
@@ -292,23 +336,42 @@ const postProcess = (canvas, imageKey, logits, w, h) => {
     // measured over a 12-point click grid, ONE 1.376 MP proxy cost 12.2 ms for
     // a 9.7 kpx band and 52.6 ms for a frame-spanning one.
     let bandPixels = 0
+    // Refinement only rewrites its own rect and hygiene only its own runs, so
+    // the mask is re-thresholded over the union of the two instead of paying a
+    // second full-frame pass.
+    let paint = null
     try {
         const px = guidePixels(canvas, imageKey, w, h)
         const rect = px && refineField(field, px, w, h, bbox, { radius: 8, eps: 1e-4, scale: 4 })
         if (rect) {
             bandPixels = (rect[2] - rect[0]) * (rect[3] - rect[1])
-            // Refinement only rewrote `rect`; the rest of the field is
-            // untouched, so copy the raw mask and re-threshold just that band
-            // instead of paying a second full-frame pass.
-            rgba = bandAlphaRect(field, w, rect, BAND, new Uint8ClampedArray(rawRgba))
+            paint = rect
         }
     } catch { /* guide unavailable (tainted canvas) — the raw mask still ships */ }
+
+    // Region hygiene at PROXY resolution — after the upsample and the guided
+    // filter, which are the two stages that manufacture speckle out of a field
+    // that reached them clean (mask-select). The fill is 2·BAND, not the 256²
+    // default: this field is matted in BAND units, and on a steep field a fixed
+    // 2.5 lands inside the ramp and leaves a half-transparent patch behind.
+    //
+    // Scanned over the union of the mask box and the rect the filter rewrote,
+    // not the mask box alone. The filter works on the BAND box plus its own pad
+    // (radius·2 + scale·2 = 24 px), which reaches OUTSIDE the mask box, and a
+    // pixel it lifts over zero out there is a component no pass can see: a
+    // rivet click on d750-lossless.nef left exactly one, 3 px beyond the box.
+    const scan = unionRect(box, paint)
+    const regions = scan
+        ? cleanRegions(field, w, h, { clicks, rect: scan, fill: Math.max(2.5, 2 * BAND) })
+        : { islands: 0, holes: 0, dirty: null }
+    if (regions.dirty) paint = unionRect(paint, regions.dirty)
+    if (paint) rgba = bandAlphaRect(field, w, paint, BAND, new Uint8ClampedArray(rawRgba))
 
     // Keep the continuous field for export: upscaling a THRESHOLDED mask to
     // 8256×5504 is what makes edges stair-step, and no amount of export-time
     // filtering recovers from it (§10).
     lastField = { imageKey, w, h, field }
-    return { rgba, rawRgba, bandPixels }
+    return { rgba, rawRgba, bandPixels, regions }
 }
 
 /* ─── Candidate cycling ───────────────────────────────────────────────────────
@@ -325,14 +388,14 @@ const postProcess = (canvas, imageKey, logits, w, h) => {
  */
 let candidates = null
 
-const orderCandidates = ({ imageKey, canvas, w, h, planes, scores }) => {
+const orderCandidates = ({ imageKey, canvas, w, h, clicks, planes, scores }) => {
     const rows = planes
         .map((p, i) => ({ p, score: scores[i] ?? 0, area: fieldArea(p), first: i === 0 }))
         .filter((r) => r.area > 0)
         .sort((a, b) => a.area - b.area)
     if (!rows.length) return null
     const index = Math.max(0, rows.findIndex((r) => r.first))
-    return { imageKey, canvas, w, h, rows, index }
+    return { imageKey, canvas, w, h, clicks, rows, index }
 }
 
 // `items` is what lets the UI show the choice instead of hiding it behind a
@@ -373,8 +436,8 @@ export const sam21PickCandidate = (index, imageKey = null) => {
     const t0 = performance.now()
     candidates.index = index
     const row = candidates.rows[candidates.index]
-    const { canvas, w, h } = candidates
-    const { rgba, rawRgba, bandPixels } = postProcess(canvas, candidates.imageKey, row.p, w, h)
+    const { canvas, w, h, clicks } = candidates
+    const { rgba, rawRgba, bandPixels } = postProcess(canvas, candidates.imageKey, row.p, w, h, clicks)
     return {
         rgba,
         rawRgba,
@@ -454,6 +517,7 @@ export const sam21HdAlpha = ({ bitmap, imageKey, subrect, cropW, cropH }) => {
     }
     const out = new Float32Array(cropW * cropH)
     let minX = cropW; let minY = cropH; let maxX = -1; let maxY = -1
+    let bx0 = cropW; let by0 = cropH; let bx1 = -1; let by1 = -1
     const row4 = new Float32Array(cropW * 4)
     for (let y = 0; y < cropH; y += 1) {
         const fy = sy + (y + 0.5) * (sh / cropH) - 0.5
@@ -470,16 +534,29 @@ export const sam21HdAlpha = ({ bitmap, imageKey, subrect, cropW, cropH }) => {
             }
         }
         const dst = y * cropW
+        let mLo = -1; let mHi = -1
+        let bLo = -1; let bHi = -1
         for (let x = 0; x < cropW; x += 1) {
             const v = row4[x] * ky[0] + row4[cropW + x] * ky[1]
                 + row4[2 * cropW + x] * ky[2] + row4[3 * cropW + x] * ky[3]
             out[dst + x] = v
-            if (v > -6 && v < 6) {
-                if (x < minX) minX = x
-                if (x > maxX) maxX = x
-                if (y < minY) minY = y
-                if (y > maxY) maxY = y
+            if (v > -6) {                       // see upsampleLogits: two boxes, one test
+                if (mLo < 0) mLo = x
+                mHi = x
+                if (v < 6) { if (bLo < 0) bLo = x; bHi = x }
             }
+        }
+        if (mHi >= 0) {
+            if (mLo < bx0) bx0 = mLo
+            if (mHi > bx1) bx1 = mHi
+            if (by1 < 0) by0 = y
+            by1 = y
+        }
+        if (bHi >= 0) {
+            if (bLo < minX) minX = bLo
+            if (bHi > maxX) maxX = bHi
+            if (maxY < 0) minY = y
+            maxY = y
         }
     }
 
@@ -499,11 +576,23 @@ export const sam21HdAlpha = ({ bitmap, imageKey, subrect, cropW, cropH }) => {
     // derived from that gradient — explodes to a third of the frame (measured).
     const up = Math.max(1, cropW / Math.max(1, sw))
     const radius = Math.round(Math.min(32, Math.max(4, up * 1.5)))
+    let refined = null
     if (px && bbox) {
-        refineField(out, px, cropW, cropH, bbox,
+        refined = refineField(out, px, cropW, cropH, bbox,
             { radius, eps: 1e-4, scale: Math.max(1, Math.min(8, Math.round(radius / 4))) })
     }
-    return { rgba: bandAlpha(out, cropW, cropH, bandWidth(out, cropW, bbox)), width: cropW, height: cropH }
+    const BAND = bandWidth(out, cropW, bbox)
+    // The proxy field this came from was cleaned, but the native refinement is a
+    // fresh guided filter at ~32x the detail and makes its own speckle. No
+    // clicks here: at export scale the prompt is history, and the dominance gate
+    // is what keeps a legitimately fragmented subject intact. The window is the
+    // union with the filter's own rect: here the pad is radius·2 + scale·2 with
+    // radius up to 32, so the filter reaches up to 80 px past the mask box.
+    const scan = unionRect(bx1 >= 0 ? [bx0, by0, bx1 + 1, by1 + 1] : null, refined)
+    if (scan) {
+        cleanRegions(out, cropW, cropH, { rect: scan, fill: Math.max(2.5, 2 * BAND) })
+    }
+    return { rgba: bandAlpha(out, cropW, cropH, BAND), width: cropW, height: cropH }
 }
 
 /**
@@ -534,16 +623,27 @@ const cropDecode = async ({ bitmap, cropKey, cropW, cropH, prompts }) => {
     await encodeImage(copy, key, { warmDecoder: false, persist: false })
     const dec = await decodeMask(pts, { key })
 
-    const { field, bbox } = upsampleLogits(dec.logits, cropW, cropH)
+    const { field, bbox, box } = upsampleLogits(dec.logits, cropW, cropH)
+    let refined = null
     try {
         const c = new OffscreenCanvas(cropW, cropH)
         const ctx = c.getContext('2d', { willReadFrequently: true })
         ctx.drawImage(bitmap, 0, 0, cropW, cropH)
         const px = ctx.getImageData(0, 0, cropW, cropH).data
-        refineField(field, px, cropW, cropH, bbox, { radius: 8, eps: 1e-4, scale: 4 })
+        refined = refineField(field, px, cropW, cropH, bbox, { radius: 8, eps: 1e-4, scale: 4 })
         c.width = c.height = 0
     } catch { /* tainted — matte the unrefined field */ }
-    return { rgba: bandAlpha(field, cropW, cropH, bandWidth(field, cropW, bbox)), width: cropW, height: cropH, iou: dec.iou }
+    const BAND = bandWidth(field, cropW, bbox)
+    // This path never went through the lane's arbitration, so these logits have
+    // had NO hygiene at all — not even the 256² pass every document click gets.
+    const scan = unionRect(box, refined)
+    if (scan) {
+        cleanRegions(field, cropW, cropH, {
+            clicks: (prompts.clicks || []).map(([x, y, label]) => ({ x, y, label: label ?? 1 })),
+            rect: scan, fill: Math.max(2.5, 2 * BAND),
+        })
+    }
+    return { rgba: bandAlpha(field, cropW, cropH, BAND), width: cropW, height: cropH, iou: dec.iou }
 }
 
 /**

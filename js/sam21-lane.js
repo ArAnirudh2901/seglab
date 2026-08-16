@@ -14,6 +14,7 @@
  * single-instance guarantee; this file is agnostic about where it runs.
  */
 
+import { IS_WEBKIT } from './engine.js'
 import { loadOrt as loadOrtShared, webgpuEP } from './ort-loader.js'
 import { chooseCandidate, cleanRegions } from './mask-select.js'
 import {
@@ -171,14 +172,7 @@ const GRAPH_OPT = 'all'
 // the encoder at L1 and everything at L2 regardless of this timer, and the host
 // still exits on its own idle rung.
 //
-// WebKit specifically. `!navigator.userAgentData` — what this used to test —
-// also matches Gecko, which has neither the Metal compile cost nor the
-// inference-count crash, so Firefox was holding ~1 GB for 20 s to dodge a bug it
-// does not have. navigator.vendor is 'Apple Computer, Inc.' on every WebKit
-// browser (including iOS Chrome, correctly) and '' on Gecko.
-const IS_WEBKIT = typeof navigator !== 'undefined'
-    && !navigator.userAgentData
-    && /apple/i.test(navigator.vendor || '')
+// WebKit specifically — see engine.js for why the test is what it is.
 const ENCODER_IDLE_MS = IS_WEBKIT ? 20_000 : 5000
 
 let onDeviceLost = null
@@ -1086,8 +1080,8 @@ const runDecode = async (embed, clicks, key, sid) => {
     // part → whole) is preserved; the app sorts by area for cycling.
     const alternates = first.planes.filter((_, i) => i !== sel.index)
     // Hygiene on every plane, so cycling never lands on an uncleaned mask.
-    const regions = cleanRegions(chosen, MASK_SIDE, { clicks: pts, scale: GRID })
-    for (const a of alternates) cleanRegions(a, MASK_SIDE, { clicks: pts, scale: GRID })
+    const regions = cleanRegions(chosen, MASK_SIDE, MASK_SIDE, { clicks: pts, scale: GRID })
+    for (const a of alternates) cleanRegions(a, MASK_SIDE, MASK_SIDE, { clicks: pts, scale: GRID })
 
     lastPick = { key, sid, n, plane: Float32Array.from(chosen) }
 
