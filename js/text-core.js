@@ -173,19 +173,32 @@ const sameObject = (a, b, gap) => {
 export const clusterObjects = (dets, { gap = 1.5 } = {}) => {
     if (dets.length <= 1) return dets
     const order = [...dets].sort((p, q) => q.score - p.score)
-    const used = new Array(order.length).fill(false)
+    const n = order.length
+    // Still-unclaimed detections as a linked list in score order. A growing box
+    // has to be re-tested against what is left, but not against what it already
+    // absorbed: the flag array made every sweep walk the full list and re-read
+    // members it had taken on the previous one. Unlinking is O(1) and keeps the
+    // order, so the head is always the best-scoring survivor — the seed rule.
+    const next = new Int32Array(n)
+    for (let i = 0; i < n - 1; i += 1) next[i] = i + 1
+    next[n - 1] = -1
+    let head = 0
     const out = []
-    for (let seed = 0; seed < order.length; seed += 1) {
-        if (used[seed]) continue
-        used[seed] = true
+    while (head >= 0) {
+        const seed = head
+        head = next[seed]
         let box = order[seed].box.slice()
         for (let grew = true; grew;) {
             grew = false
-            for (let i = seed + 1; i < order.length; i += 1) {
-                if (used[i] || !sameObject(box, order[i].box, gap)) continue
+            let prev = -1
+            for (let i = head; i >= 0;) {
+                if (!sameObject(box, order[i].box, gap)) { prev = i; i = next[i]; continue }
                 box = boxUnion(box, order[i].box)
-                used[i] = true
+                const skip = next[i]
+                if (prev < 0) head = skip
+                else next[prev] = skip
                 grew = true
+                i = skip
             }
         }
         out.push({ ...order[seed], box })
@@ -431,8 +444,35 @@ export const dropClippedDuplicates = (dets, { cover = 0.7 } = {}) => {
  *  around the whole cluster; it survives NMS (low IoU against each member) but
  *  selects far more than the phrase asked for. A box that mostly contains 2+
  *  other kept detections is the cluster, not an instance — keep the members. */
-export const pruneContainers = (dets, { cover = 0.7 } = {}) => dets.filter((d) =>
-    dets.filter((m) => m !== d && containment(d.box, m.box) >= cover).length < 2)
+export const pruneContainers = (dets, { cover = 0.7 } = {}) => {
+    const n = dets.length
+    if (n < 3) return dets            // a cluster box needs 2 members to be one
+    // Areas up front, then stop at 2: the old form built a whole array of
+    // matches per detection just to read its length, so it did every pairwise
+    // containment even after the answer was settled. `cover` also bounds the
+    // pair geometrically — an inner box bigger than outer/cover cannot be
+    // covered — which rejects most pairs on a subtraction.
+    const area = new Float64Array(n)
+    for (let i = 0; i < n; i += 1) {
+        const b = dets[i].box
+        area[i] = (b[2] - b[0]) * (b[3] - b[1])
+    }
+    return dets.filter((d, i) => {
+        const cap = area[i] / cover     // no member bigger than this can be covered
+        const o = d.box
+        let held = 0
+        for (let j = 0; j < n; j += 1) {
+            if (area[j] > cap || j === i) continue
+            const m = dets[j].box
+            const ix = Math.min(o[2], m[2]) - Math.max(o[0], m[0])
+            if (ix <= 0) continue
+            const iy = Math.min(o[3], m[3]) - Math.max(o[1], m[1])
+            if (iy <= 0) continue
+            if (ix * iy >= cover * area[j] && (held += 1) === 2) return false
+        }
+        return true
+    })
+}
 
 /**
  * Keep only what the phrase's SUBJECT matched; null when it matched nothing.

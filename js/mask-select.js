@@ -129,21 +129,65 @@ export const boxFromClicks = (clicks) => {
 }
 
 /** Fraction of the candidate's area that falls inside the prompt box. */
-export const boxFraction = (field, side, box, scale) => {
-    const x0 = clampi(Math.round(box[0] * scale), side - 1)
-    const y0 = clampi(Math.round(box[1] * scale), side - 1)
-    const x1 = clampi(Math.round(box[2] * scale), side - 1)
-    const y1 = clampi(Math.round(box[3] * scale), side - 1)
+export const boxFraction = (field, side, box, scale) =>
+    planeStats(field, side, boxCells(box, side, scale), null).inBox
+
+/** The prompt box in grid cells, inclusive — the form every per-cell test wants.
+ *  Null box means "no box", which reads as full agreement. */
+const boxCells = (box, side, scale) => (box ? [
+    clampi(Math.round(box[0] * scale), side - 1),
+    clampi(Math.round(box[1] * scale), side - 1),
+    clampi(Math.round(box[2] * scale), side - 1),
+    clampi(Math.round(box[3] * scale), side - 1),
+] : null)
+
+/**
+ * Every per-plane statistic arbitration needs, in ONE traversal.
+ *
+ * stabilityScore, fieldArea, boxFraction and fieldIoU each walked the same 65536
+ * cells — four passes per candidate, three candidates, up to twice per click, so
+ * ~1.6 M reads where 200 k suffice. The exported single-purpose versions above
+ * stay as they are: verify.mjs tests them one number at a time, and one of them
+ * (stabilityScore) takes an offset this loop fixes at 1.
+ *
+ * Row-major, so the box test is a range check per row instead of a modulo and a
+ * divide per cell.
+ */
+const planeStats = (field, side, cells, previous) => {
+    const bx0 = cells ? cells[0] : 0
+    const by0 = cells ? cells[1] : 0
+    const bx1 = cells ? cells[2] : side - 1
+    const by1 = cells ? cells[3] : side - 1
+    let hi = 0
+    let lo = 0
+    let area = 0
     let inside = 0
-    let total = 0
-    for (let i = 0; i < field.length; i += 1) {
-        if (field[i] <= T) continue
-        total += 1
-        const x = i % side
-        const y = (i - x) / side
-        if (x >= x0 && x <= x1 && y >= y0 && y <= y1) inside += 1
+    let inter = 0
+    let union = 0
+    for (let y = 0; y < side; y += 1) {
+        const row = y * side
+        const inRow = y >= by0 && y <= by1
+        for (let x = 0; x < side; x += 1) {
+            const v = field[row + x]
+            if (v > T + 1) hi += 1
+            if (v > T - 1) lo += 1
+            const on = v > T
+            if (on) {
+                area += 1
+                if (inRow && x >= bx0 && x <= bx1) inside += 1
+            }
+            if (previous) {
+                const was = previous[row + x] > T
+                if (on) { union += 1; if (was) inter += 1 } else if (was) union += 1
+            }
+        }
     }
-    return total ? inside / total : 1
+    return {
+        stability: lo ? hi / lo : 0,
+        area,
+        inBox: cells ? (area ? inside / area : 1) : 1,
+        agree: previous ? (union ? inter / union : 0) : 0,
+    }
 }
 
 /**
@@ -179,19 +223,20 @@ const rank = (s) => s.score * (0.5 + 0.5 * s.stability) * (0.3 + 0.7 * s.inBox)
 export const chooseCandidate = ({
     planes, scores = [], clicks = [], side, scale, previous = null, minAgree = 0.5,
 }) => {
-    const box = boxFromClicks(clicks)
+    const cells = boxCells(boxFromClicks(clicks), side, scale)
     const stats = planes.map((p, i) => {
         const fit = promptFit(p, side, clicks, scale)
+        const s = planeStats(p, side, cells, previous)
         return {
             i,
             violations: fit.miss + fit.leak,
             miss: fit.miss,
             leak: fit.leak,
-            stability: stabilityScore(p),
-            inBox: box ? boxFraction(p, side, box, scale) : 1,
-            area: fieldArea(p),
+            stability: s.stability,
+            inBox: s.inBox,
+            area: s.area,
             score: scores[i] ?? 0,
-            agree: previous ? fieldIoU(previous, p) : 0,
+            agree: s.agree,
         }
     })
 

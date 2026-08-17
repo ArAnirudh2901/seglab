@@ -239,7 +239,10 @@ function finishSegment(result, revision, startedAt) {
     )
     const imageData = toImageData(result.rgba)
     const rawImageData = toImageData(result.rawRgba)
-    const summary = summarizeMaskRGBA(imageData.data, result.width, result.height)
+    // The lane knows where it painted, so the summary scans that rect instead of
+    // the frame. A lane that reports no rect (or an older one) still gets the
+    // whole-frame scan.
+    const summary = summarizeMaskRGBA(imageData.data, result.width, result.height, result.maskRect || null)
     const verdict = validateClickMask(summary)
 
     clientState.lastRun = {

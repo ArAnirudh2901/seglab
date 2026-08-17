@@ -21,16 +21,20 @@ let greeted = false
 
 // Catmull-Rom (a = -0.5) cubic kernel, evaluated directly. Four taps per axis,
 // no matrices, no library — the whole upsample is ~16 multiply-adds per pixel.
+// Weights land in a shared 4-slot buffer: an export row loop calls this once per
+// output row and once per output column (~16 k times on a native crop), and a
+// fresh 4-element array each time is pure collector pressure. Every caller
+// consumes the taps before the next call.
+const taps = new Float32Array(4)
 const cubic = (t) => {
     const t2 = t * t
     const t3 = t2 * t
-    // Returns the four tap weights for offsets -1, 0, +1, +2.
-    return [
-        -0.5 * t3 + t2 - 0.5 * t,
-        1.5 * t3 - 2.5 * t2 + 1,
-        -1.5 * t3 + 2 * t2 + 0.5 * t,
-        0.5 * t3 - 0.5 * t2,
-    ]
+    // The four tap weights for offsets -1, 0, +1, +2.
+    taps[0] = -0.5 * t3 + t2 - 0.5 * t
+    taps[1] = 1.5 * t3 - 2.5 * t2 + 1
+    taps[2] = -1.5 * t3 + 2 * t2 + 0.5 * t
+    taps[3] = 0.5 * t3 - 0.5 * t2
+    return taps
 }
 const clampIdx = (i) => (i < 0 ? 0 : (i > MASK_SIDE - 1 ? MASK_SIDE - 1 : i))
 
@@ -51,7 +55,7 @@ const unionRect = (a, b) => {
     return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]
 }
 
-const upsampleLogits = (logits, w, h) => {
+export const upsampleLogits = (logits, w, h) => {
     const out = new Float32Array(w * h)
     const sx = MASK_SIDE / w
     const sy = MASK_SIDE / h
@@ -171,14 +175,21 @@ const bandWidth = (field, w, bbox) => {
     const [x0, y0, x1, y1] = bbox
     let acc = 0
     let n = 0
-    for (let y = Math.max(1, y0); y < Math.min(y1 + 1, (field.length / w) - 1); y += 1) {
+    // Bounds out of the loop conditions: the y limit divides field.length by w on
+    // every row, and the x limit re-derives itself on every cell of the band.
+    const yEnd = Math.min(y1 + 1, (field.length / w) - 1)
+    const xStart = Math.max(1, x0)
+    const xEnd = Math.min(x1 + 1, w - 1)
+    for (let y = Math.max(1, y0); y < yEnd; y += 1) {
         const row = y * w
-        for (let x = Math.max(1, x0); x < Math.min(x1 + 1, w - 1); x += 1) {
+        for (let x = xStart; x < xEnd; x += 1) {
             const v = field[row + x]
             if (v < -1 || v > 1) continue          // only right at the crossing
             const gx = field[row + x + 1] - field[row + x - 1]
             const gy = field[row + w + x] - field[row - w + x]
-            acc += Math.hypot(gx, gy) * 0.5
+            // sqrt, not hypot: hypot's overflow guard is several times slower and
+            // buys nothing on logit differences, which are single digits.
+            acc += Math.sqrt(gx * gx + gy * gy) * 0.5
             n += 1
         }
     }
@@ -278,7 +289,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const t2 = performance.now()
     const w = canvas.width
     const h = canvas.height
-    const { rgba, rawRgba, bandPixels, regions } = postProcess(canvas, imageKey, dec.logits, w, h, proxyPts)
+    const { rgba, rawRgba, bandPixels, regions, maskRect } = postProcess(canvas, imageKey, dec.logits, w, h, proxyPts)
 
     // Park every candidate SAM already computed, ordered small → large, so the
     // app can answer "you took the wrong part of it" with a repaint. The
@@ -300,6 +311,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
         decodeMs: +decodeMs.toFixed(1),
         postMs: +(performance.now() - t2).toFixed(1),
         bandPixels,
+        maskRect,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),
@@ -371,7 +383,11 @@ const postProcess = (canvas, imageKey, logits, w, h, clicks = []) => {
     // 8256×5504 is what makes edges stair-step, and no amount of export-time
     // filtering recovers from it (§10).
     lastField = { imageKey, w, h, field }
-    return { rgba, rawRgba, bandPixels, regions }
+    // Every non-zero alpha is inside this: `box` is where the field clears -BAND
+    // (which is what bandAlpha paints), and `paint` is the only place anything
+    // was rewritten afterwards. The app summarises the mask, and this saves it a
+    // full-frame scan for what is usually a few percent of the frame.
+    return { rgba, rawRgba, bandPixels, regions, maskRect: unionRect(box, paint) }
 }
 
 /* ─── Candidate cycling ───────────────────────────────────────────────────────
@@ -437,7 +453,7 @@ export const sam21PickCandidate = (index, imageKey = null) => {
     candidates.index = index
     const row = candidates.rows[candidates.index]
     const { canvas, w, h, clicks } = candidates
-    const { rgba, rawRgba, bandPixels } = postProcess(canvas, candidates.imageKey, row.p, w, h, clicks)
+    const { rgba, rawRgba, bandPixels, maskRect } = postProcess(canvas, candidates.imageKey, row.p, w, h, clicks)
     return {
         rgba,
         rawRgba,
@@ -449,6 +465,7 @@ export const sam21PickCandidate = (index, imageKey = null) => {
         decodeMs: 0,
         postMs: +(performance.now() - t0).toFixed(1),
         bandPixels,
+        maskRect,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),

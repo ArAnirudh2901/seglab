@@ -11,7 +11,7 @@
  * frame — display scaling is pure CSS, undone at the pointer.
  */
 
-import { countMaskComponents, maskRegions, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel, bridgeGaps, smoothBoundary } from './sam-core.js'
+import { countMaskComponents, maskRegions, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, channelBounds, pointInMask, dilateChannel, bridgeGaps, smoothBoundary } from './sam-core.js'
 import {
     cancelBefore, candidateShape, clientState, detectorResidentMB, disposeDetectorIfIdle,
     encodeImage, encoderReady, engineState, forgetEncoder, pickCandidate, releaseDocument,
@@ -172,6 +172,8 @@ const state = {
     baseMask: null,           // ImageData replay of baseFloor+baseOps
     baseOps: [],              // [{op:'add'|'sub', chan:Uint8Array, kind}]
     baseFloor: null,          // flattened overflow of the op stack (Uint8Array)
+    baseFloorBounds: null,    // its extent, so a recompose never rescans the frame
+    baseBounds: null,         // extent of baseMask (union of the ops' extents)
     liveMask: null,           // the object the current clicks/box/lasso describe
     liveRaw: null,
     liveSummary: null,
@@ -960,6 +962,8 @@ function clearPrompts() {
     state.baseMask = null
     state.baseOps = []
     state.baseFloor = null
+    state.baseFloorBounds = null
+    state.baseBounds = null
     clearLive()
     state.score = 0
     state.drag = null
@@ -1061,7 +1065,10 @@ const previewCandidate = (index) => {
 
 /** Anchor the control at the prompt the user actually made. */
 const scopeAnchor = () => {
-    const last = [...state.clicks].reverse().find((c) => c[2] === 1) || state.clicks[state.clicks.length - 1]
+    let last = state.clicks[state.clicks.length - 1]
+    for (let i = state.clicks.length - 1; i >= 0; i -= 1) {
+        if (state.clicks[i][2] === 1) { last = state.clicks[i]; break }
+    }
     if (last) return [last[0], last[1]]
     if (state.box) return [(state.box[0] + state.box[2]) / 2, state.box[3]]
     return null
@@ -1238,17 +1245,41 @@ const ellipseMask = ([x0, y0, x1, y1]) => manualMask((ctx) => {
 
 // Union two white-on-black masks per-pixel max, so the refined soft boundary
 // band survives composition (a hard 0/255 write would harden every edge).
-const softUnion = (base, patch) => {
+/** Smallest rect covering both, either of which may be absent. Ends exclusive. */
+const unionBounds = (a, b) => {
+    if (!a) return b || null
+    if (!b) return a
+    return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]
+}
+
+// Opaque black as one RGBA word, packed through a byte view so the fill does
+// not assume a little-endian platform.
+const OPAQUE_BLACK = (() => {
+    const b = new Uint8Array(4)
+    b[3] = 255
+    return new Uint32Array(b.buffer)[0]
+})()
+
+const softUnion = (base, patch, patchBounds = null) => {
     const w = patch.width
     const h = patch.height
-    const out = base && base.width === w && base.height === h
-        ? new ImageData(new Uint8ClampedArray(base.data), w, h)
-        : new ImageData(w, h)
+    const hasBase = base && base.width === w && base.height === h
+    const out = hasBase ? new ImageData(new Uint8ClampedArray(base.data), w, h) : new ImageData(w, h)
     const o = out.data
     const p = patch.data
-    for (let i = 0; i < p.length; i += 4) {
-        if (p[i] > o[i]) { o[i] = p[i]; o[i + 1] = p[i + 1]; o[i + 2] = p[i + 2] }
-        o[i + 3] = 255
+    // Alpha is 255 everywhere in this convention, so a fresh buffer still needs
+    // one pass — but a copied base already carries it, and then only the patch's
+    // own extent has anything to say.
+    if (!hasBase) { const words = new Uint32Array(o.buffer); words.fill(OPAQUE_BLACK) }
+    const [x0, y0, x1, y1] = hasBase && patchBounds
+        ? [Math.max(0, patchBounds[0]), Math.max(0, patchBounds[1]), Math.min(w, patchBounds[2]), Math.min(h, patchBounds[3])]
+        : [0, 0, w, h]
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * w
+        for (let x = x0; x < x1; x += 1) {
+            const i = (row + x) * 4
+            if (p[i] > o[i]) { o[i] = p[i]; o[i + 1] = p[i + 1]; o[i + 2] = p[i + 2] }
+        }
     }
     return out
 }
@@ -1261,8 +1292,9 @@ const recomposeBase = () => {
     const W = els.view.width
     const H = els.view.height
     if (!state.baseOps.length && !state.baseFloor) { state.baseMask = null; return }
-    const res = composeChannels(state.baseOps, W, H, state.baseFloor)
+    const res = composeChannels(state.baseOps, W, H, state.baseFloor, state.baseFloorBounds)
     state.baseMask = res ? new ImageData(res.rgba, W, H) : null
+    state.baseBounds = res ? res.bounds : null
 }
 
 const pushBaseOp = (op, imageData, kind, { dilate = 0 } = {}) => {
@@ -1272,13 +1304,23 @@ const pushBaseOp = (op, imageData, kind, { dilate = 0 } = {}) => {
     const chan = dilate
         ? dilateChannel(maskToChannel(imageData), imageData.width, imageData.height, dilate)
         : maskToChannel(imageData)
-    state.baseOps.push({ op, chan, kind })
+    // Measured once, here — every later recompose reads it instead of scanning
+    // the frame again, and there is one recompose per click, undo and restore.
+    const bounds = channelBounds(chan, imageData.width, imageData.height)
+    state.baseOps.push({ op, chan, kind, bounds })
     if (state.baseOps.length > MAX_BASE_OPS) {
         const oldest = state.baseOps.shift()
         const floor = state.baseFloor || new Uint8Array(els.view.width * els.view.height)
-        if (oldest.op === 'sub') { for (let i = 0; i < floor.length; i += 1) if (oldest.chan[i] >= 128) floor[i] = 0 }
-        else { for (let i = 0; i < floor.length; i += 1) if (oldest.chan[i] > floor[i]) floor[i] = oldest.chan[i] }
+        const [x0, y0, x1, y1] = oldest.bounds || [0, 0, els.view.width, els.view.height]
+        const W = els.view.width
+        for (let y = y0; y < y1; y += 1) {
+            const row = y * W
+            if (oldest.op === 'sub') { for (let x = x0; x < x1; x += 1) if (oldest.chan[row + x] >= 128) floor[row + x] = 0 }
+            else for (let x = x0; x < x1; x += 1) if (oldest.chan[row + x] > floor[row + x]) floor[row + x] = oldest.chan[row + x]
+        }
         state.baseFloor = floor
+        // A subtract can only clear, so the floor's extent never grows on one.
+        if (oldest.op !== 'sub') state.baseFloorBounds = unionBounds(state.baseFloorBounds, oldest.bounds)
     }
     recomposeBase()
 }
@@ -1327,6 +1369,7 @@ const restoreSession = async () => {
         if (sameFrame && saved.mask) {
             state.baseOps = []
             state.baseFloor = saved.mask
+            state.baseFloorBounds = channelBounds(saved.mask, saved.w, saved.h)
             recomposeBase()
             recomposeMask()
             renderOverlay()
@@ -1375,17 +1418,28 @@ const regularizeMask = (mask, bbox) => {
 
 /** Rebuild the composed truth (state.mask/maskSummary) from base ∪ live. */
 const recomposeMask = () => {
+    // Where the union can possibly be: the committed ops' extent plus the live
+    // object's. Both are already known, so neither the union nor the summary
+    // has to look at the rest of the frame. Ends exclusive; a null means "not
+    // known", which falls back to the whole frame.
+    const liveBounds = state.liveSummary?.softBox || null
     if (state.liveMask) {
-        state.mask = softUnion(state.baseMask, state.liveMask)
+        state.mask = softUnion(state.baseMask, state.liveMask, liveBounds)
     } else if (state.baseMask) {
         state.mask = new ImageData(new Uint8ClampedArray(state.baseMask.data), state.baseMask.width, state.baseMask.height)
     } else {
         state.mask = null
     }
-    state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw) : null
-    let summary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height) : null
+    state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw, liveBounds) : null
+    // unionBounds keeps a null (unknown) side null, so an untracked piece still
+    // widens the scan back to the whole frame.
+    const scan = state.liveMask ? unionBounds(state.baseBounds, liveBounds) : state.baseBounds
+    let summary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height, scan) : null
     if (summary?.bbox && regularizeMask(state.mask, summary.bbox)) {
-        summary = summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height)
+        // Regularisation only rewrites inside the bbox it was handed, so the
+        // second summary needs no more than that same window.
+        const rect = [summary.bbox[0], summary.bbox[1], summary.bbox[2] + 1, summary.bbox[3] + 1]
+        summary = summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height, rect)
     }
     state.maskSummary = summary
     persistSession() // debounced + snapshot-at-write: a drag costs one save
@@ -1523,6 +1577,8 @@ const commitBrushMask = () => {
     // the final whole-selection result: flatten the stack to this one op.
     state.baseOps = []
     state.baseFloor = null
+    state.baseFloorBounds = null
+    state.baseBounds = null
     state.baseMask = null
     clearLive()
     if (summary.bbox) pushBaseOp('add', imageData, 'brush')
@@ -1795,12 +1851,30 @@ function applyLassoPrompt(poly) {
     return true
 }
 
+const DEBOUNCE_MS = 80
 let debounceTimer = null
 let debounceArmed = false // a run is scheduled but not yet started (waitForRun must see this)
+let lastScheduleAt = -Infinity
+/** Leading edge, then a trailing coalesce. Every call site is one discrete
+ *  gesture (tap, exclude, box/lasso pointerup, undo, a queued re-run) — none is
+ *  a pointermove stream — so an isolated prompt has nothing to wait for and used
+ *  to pay the full window anyway. A second prompt inside the window still
+ *  collapses onto the trailing edge, and one that lands mid-run is absorbed by
+ *  runNow's own runQueued path. */
 const scheduleRun = () => {
+    const now = performance.now()
+    if (!debounceArmed && now - lastScheduleAt >= DEBOUNCE_MS) {
+        lastScheduleAt = now
+        void runNow()
+        return
+    }
     clearTimeout(debounceTimer)
     debounceArmed = true
-    debounceTimer = setTimeout(() => { debounceArmed = false; runNow() }, 80)
+    debounceTimer = setTimeout(() => {
+        debounceArmed = false
+        lastScheduleAt = performance.now()
+        void runNow()
+    }, DEBOUNCE_MS)
 }
 
 async function runNow() {
@@ -1834,6 +1908,7 @@ async function runNow() {
             return
         }
 
+        const tApply = performance.now()
         logCommit(revision, res.usable ? 'committed' : 'unusable')
         console.log('[seglab][ui] selection-result', { revision, usable: res.usable, lane: res.lane, score: res.score, encoded: res.encoded })
         noteClickCost(res)
@@ -1858,13 +1933,25 @@ async function runNow() {
             const more = (res.candidates?.count ?? 1) > 1 ? ' · too much or too little? the shapes below it are the other readings' : ''
             setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}${more}`)
         }
+        const tCompose = performance.now()
         renderOverlay()
         refreshButtons()
+        const tPaint = performance.now()
         // Optional wasm cleanup on the committed one-channel mask (lazy-loads
         // on first use; skipped under pressure ≥ 2; failure keeps this mask).
         if (res.usable) await maybeCvRefine(revision, clicks)
+        const tCv = performance.now()
         // Show the coarse mask first, then sharpen a tiny object at native res.
         if (res.usable) await maybeEscalate(revision)
+        // The half no lane timer can see. `lastRun` covers encode/decode/post;
+        // this covers what the app does with the mask afterwards, which on a
+        // small frame is the larger half.
+        state.lastPaint = {
+            composeMs: +(tCompose - tApply).toFixed(1),
+            paintMs: +(tPaint - tCompose).toFixed(1),
+            cvMs: +(tCv - tPaint).toFixed(1),
+            escalateMs: +(performance.now() - tCv).toFixed(1),
+        }
     } catch (err) {
         logCommit(revision, 'error')
         if (revision !== state.revision) return
@@ -1937,27 +2024,50 @@ async function maybeCvRefine(revision, clicks) {
     const { width, height } = state.liveMask
     if (Math.max(width, height) > 1024) return
     const src = state.liveMask.data
+    const options = { minArea: 16, openRadius: 0, closeRadius: 0 }
+    // Nothing here can put alpha outside the mask's own soft extent: minArea
+    // removal clears, hole filling only fills enclosed cells, and a close is the
+    // one op that can grow — by its radius, which is what the pad covers. So the
+    // full-frame channel the worker's contract wants is a rect copy into an
+    // already-zeroed buffer, and everything derived from the answer scans the
+    // same rect.
+    const pad = Math.max(options.openRadius, options.closeRadius)
+    const soft = state.liveSummary?.softBox
+    const ax0 = soft ? Math.max(0, soft[0] - pad) : 0
+    const ay0 = soft ? Math.max(0, soft[1] - pad) : 0
+    const ax1 = soft ? Math.min(width, soft[2] + pad) : width
+    const ay1 = soft ? Math.min(height, soft[3] + pad) : height
     const alpha = new Uint8Array(width * height)
-    for (let p = 0; p < alpha.length; p += 1) alpha[p] = src[p * 4]
+    for (let y = ay0; y < ay1; y += 1) {
+        const row = y * width
+        for (let x = ax0; x < ax1; x += 1) alpha[row + x] = src[(row + x) * 4]
+    }
     const seeds = (clicks || []).filter((c) => c[2]).map((c) => [Math.round(c[0]), Math.round(c[1])])
     const refined = await refineAlpha({
         alpha, // transferred — detached after this call
         width,
         height,
         seeds,
-        options: { minArea: 16, openRadius: 0, closeRadius: 0 },
+        options,
         revision,
         budget: BUDGET,
     })
     if (!refined || revision !== state.revision || !state.liveMask) return
     const out = new ImageData(width, height)
     const d = out.data
-    for (let p = 0, i = 0; p < refined.length; p += 1, i += 4) {
-        const v = refined[p]
-        d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255
+    // Alpha is 255 frame-wide: one 32-bit fill, then colour only inside the rect.
+    new Uint32Array(d.buffer).fill(OPAQUE_BLACK)
+    for (let y = ay0; y < ay1; y += 1) {
+        const row = y * width
+        for (let x = ax0; x < ax1; x += 1) {
+            const v = refined[row + x]
+            if (!v) continue
+            const i = (row + x) * 4
+            d[i] = v; d[i + 1] = v; d[i + 2] = v
+        }
     }
     state.liveMask = out
-    state.liveSummary = summarizeMaskRGBA(d, width, height)
+    state.liveSummary = summarizeMaskRGBA(d, width, height, [ax0, ay0, ax1, ay1])
     recomposeMask()
     renderOverlay()
 }
@@ -2411,36 +2521,57 @@ const getMaskLayers = (mask) => {
     // The core's extent, free in this pass — the scope control uses it to sit
     // clear of the selection instead of on top of the thing being judged.
     let minX = width; let minY = height; let maxX = -1; let maxY = -1
-    for (let i = 0; i < d.length; i += 4) {
-        d[i] = 53; d[i + 1] = 224; d[i + 2] = 194
-        d[i + 3] = src[i]
-        if (src[i] >= 128) {
-            c[i] = 255; c[i + 1] = 255; c[i + 2] = 255; c[i + 3] = 255
-            const p = i >> 2; const x = p % width; const y = (p - x) / width
-            if (x < minX) minX = x
-            if (x > maxX) maxX = x
-            if (y < minY) minY = y
-            if (y > maxY) maxY = y
+    // The tinted layer's own extent, which reaches past the core by the width of
+    // the matted edge. Both buffers start transparent, so a pixel the mask does
+    // not touch needs no write at all — on a typical selection that is most of
+    // the frame, and this pass runs on every mask change including brush frames.
+    let sMinX = width; let sMinY = height; let sMaxX = -1; let sMaxY = -1
+    for (let y = 0; y < height; y += 1) {
+        const row = y * width
+        for (let x = 0; x < width; x += 1) {
+            const i = (row + x) * 4
+            const v = src[i]
+            if (!v) continue
+            d[i] = 53; d[i + 1] = 224; d[i + 2] = 194; d[i + 3] = v
+            if (x < sMinX) sMinX = x
+            if (x > sMaxX) sMaxX = x
+            if (y < sMinY) sMinY = y
+            sMaxY = y
+            if (v >= 128) {
+                c[i] = 255; c[i + 1] = 255; c[i + 2] = 255; c[i + 3] = 255
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                maxY = y
+            }
         }
     }
     const fill = new OffscreenCanvas(width, height)
-    fill.getContext('2d').putImageData(img, 0, 0)
+    // Dirty-rect upload: outside the extent the ImageData is the transparent the
+    // canvas already is.
+    if (sMaxX >= 0) fill.getContext('2d').putImageData(img, 0, 0, sMinX, sMinY, sMaxX - sMinX + 1, sMaxY - sMinY + 1)
 
     // Dilate the core and subtract it: what is left is a band that hugs the
     // outside of the selection, at mask resolution, so it stays exact under any
     // display scale. Width is relative to the frame, not fixed px, so it reads
     // the same on a 900 px proxy and a 4000 px native frame.
     const solid = new OffscreenCanvas(width, height)
-    solid.getContext('2d').putImageData(core, 0, 0)
     const r = Math.max(2, Math.round(Math.min(width, height) * 0.003))
     const ring = new OffscreenCanvas(width, height)
     const rc = ring.getContext('2d')
-    for (const [dx, dy] of RING_DIRS) rc.drawImage(solid, dx * r, dy * r)
-    rc.globalCompositeOperation = 'destination-out'
-    rc.drawImage(solid, 0, 0)
-    rc.globalCompositeOperation = 'source-in'
-    rc.fillStyle = ACCENT
-    rc.fillRect(0, 0, width, height)
+    if (maxX >= 0) {
+        const cw = maxX - minX + 1
+        const ch = maxY - minY + 1
+        solid.getContext('2d').putImageData(core, 0, 0, minX, minY, cw, ch)
+        // Every draw is the core's rect, not the frame: eight shifted copies of a
+        // 200 px object on a 4000 px frame is a hundredth of the fill rate.
+        for (const [dx, dy] of RING_DIRS) rc.drawImage(solid, minX, minY, cw, ch, minX + dx * r, minY + dy * r, cw, ch)
+        rc.globalCompositeOperation = 'destination-out'
+        rc.drawImage(solid, minX, minY, cw, ch, minX, minY, cw, ch)
+        rc.globalCompositeOperation = 'source-in'
+        rc.fillStyle = ACCENT
+        rc.fillRect(minX - r, minY - r, cw + 2 * r, ch + 2 * r)
+    }
 
     layerCache = { mask, fill, ring, bounds: maxX < 0 ? null : [minX, minY, maxX, maxY] }
     return layerCache
@@ -2461,6 +2592,7 @@ function renderOverlay() {
 }
 
 function paintOverlay() {
+    const tPaint = performance.now()
     const ctx = overlayCtx
     const { width, height } = els.overlay
     ctx.clearRect(0, 0, width, height)
@@ -2646,6 +2778,7 @@ function paintOverlay() {
     // The scope control is placed off the mask's extent, which only exists once
     // the layers are rasterised — so re-place it here, after that has happened.
     if (state.scope && els.scope && !els.scope.hidden) scopeControl?.place()
+    if (state.lastPaint) state.lastPaint.paintMs = +(performance.now() - tPaint).toFixed(1)
 }
 
 /* ─── Cutout export ──────────────────────────────────────────────────────── */
@@ -2838,6 +2971,7 @@ window.__seglab = {
         mode: clientState.mode,
         lane: clientState.lane,
         lastRun: clientState.lastRun,
+        lastPaint: state.lastPaint || null,
         hasImage: state.hasImage,
         maskSummary: state.maskSummary,
         score: state.score,

@@ -57,17 +57,38 @@ export const maskChannelCoverages = (maskData, width, height, channels) => {
     return out
 }
 
-/** Coverage + bbox of a white-on-black RGBA mask (reads the R channel). */
-export const summarizeMaskRGBA = (rgba, width, height) => {
+/**
+ * Coverage + bbox of a white-on-black RGBA mask (reads the R channel).
+ *
+ * `rect` (ends exclusive) restricts the scan. It is a promise, not a crop: the
+ * caller is asserting no selected pixel lies outside it, so the coverage and
+ * bbox that come back are the WHOLE mask's. Pass a rect only when something
+ * already known bounds the mask — its own previous bbox, or the union of the
+ * pieces it was composed from.
+ */
+export const summarizeMaskRGBA = (rgba, width, height, rect = null) => {
     let count = 0
     let minX = width
     let minY = height
     let maxX = -1
     let maxY = -1
-    for (let y = 0; y < height; y += 1) {
+    const [rx0, ry0, rx1, ry1] = rect
+        ? [Math.max(0, rect[0]), Math.max(0, rect[1]), Math.min(width, rect[2]), Math.min(height, rect[3])]
+        : [0, 0, width, height]
+    // The soft extent is every non-zero pixel, which reaches past the >=128 core
+    // by the width of the matted edge. Anything that COMPOSITES the mask needs
+    // this one; anything that measures selected area needs the core.
+    let sx0 = width; let sy0 = height; let sx1 = -1; let sy1 = -1
+    for (let y = ry0; y < ry1; y += 1) {
         const row = y * width
-        for (let x = 0; x < width; x += 1) {
-            if (rgba[(row + x) * 4] >= 128) {
+        for (let x = rx0; x < rx1; x += 1) {
+            const v = rgba[(row + x) * 4]
+            if (!v) continue
+            if (x < sx0) sx0 = x
+            if (x > sx1) sx1 = x
+            if (y < sy0) sy0 = y
+            sy1 = y
+            if (v >= 128) {
                 count += 1
                 if (x < minX) minX = x
                 if (x > maxX) maxX = x
@@ -79,6 +100,8 @@ export const summarizeMaskRGBA = (rgba, width, height) => {
     return {
         coverage: count / (width * height),
         bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null,
+        // Ends exclusive — a scan window, not an inclusive bbox.
+        softBox: sx1 < 0 ? null : [sx0, sy0, sx1 + 1, sy1 + 1],
     }
 }
 
@@ -94,29 +117,94 @@ export const maskToChannel = (imageData) => {
     return chan
 }
 
+// Grey level as one opaque RGBA word, built through a byte view so the packing
+// follows the platform's endianness instead of assuming little-endian.
+const packScratch = new Uint8Array(4)
+const packWord = new Uint32Array(packScratch.buffer)
+const opaque = (v) => {
+    packScratch[0] = v; packScratch[1] = v; packScratch[2] = v; packScratch[3] = 255
+    return packWord[0]
+}
+
 /**
- * Replay an ordered op stack ({op:'add'|'sub', chan}) into a white-on-black
- * RGBA mask. Adds union per-pixel max (soft edges survive); subs zero where
- * the sub channel is selected. `floor` is an optional pre-flattened starting
- * channel. Returns null when nothing selected (callers keep the fast path).
+ * Replay an ordered op stack ({op:'add'|'sub', chan, bounds}) into a
+ * white-on-black RGBA mask. Adds union per-pixel max (soft edges survive); subs
+ * zero where the sub channel is selected. `floor` is an optional pre-flattened
+ * starting channel and `floorBounds` its extent. Returns null when nothing is
+ * selected (callers keep the fast path).
+ *
+ * `bounds`/`floorBounds` are ends-exclusive rects from channelBounds. They are
+ * an optimisation only: an op without one is replayed over the whole frame, so
+ * a stack restored from an older session still composes correctly.
  */
-export const composeChannels = (ops, width, height, floor = null) => {
+export const composeChannels = (ops, width, height, floor = null, floorBounds = null) => {
     const size = width * height
-    const acc = floor ? Uint8Array.from(floor) : new Uint8Array(size)
-    for (const { op, chan } of ops) {
+    // slice(), not Uint8Array.from(): from() walks the iterator protocol a byte
+    // at a time where slice() is a memcpy of the whole buffer.
+    const acc = floor ? floor.slice() : new Uint8Array(size)
+    // Every op knows where it lives, so replaying the stack costs the sum of the
+    // objects' areas rather than (stack depth x frame). A missing bound means an
+    // op from before this was tracked (a restored session) — scan it whole.
+    let ux0 = width; let uy0 = height; let ux1 = 0; let uy1 = 0
+    const widen = (b) => {
+        if (!b) { ux0 = 0; uy0 = 0; ux1 = width; uy1 = height; return }
+        if (b[0] < ux0) ux0 = b[0]
+        if (b[1] < uy0) uy0 = b[1]
+        if (b[2] > ux1) ux1 = b[2]
+        if (b[3] > uy1) uy1 = b[3]
+    }
+    if (floor) widen(floorBounds)
+    for (const { op, chan, bounds } of ops) {
         if (!chan || chan.length !== size) continue
-        if (op === 'sub') { for (let i = 0; i < size; i += 1) if (chan[i] >= 128) acc[i] = 0 }
-        else { for (let i = 0; i < size; i += 1) if (chan[i] > acc[i]) acc[i] = chan[i] }
+        const [x0, y0, x1, y1] = bounds && bounds[2] <= width && bounds[3] <= height
+            ? bounds : [0, 0, width, height]
+        // A subtract only ever clears, so it cannot put the union anywhere new.
+        if (op !== 'sub') widen(bounds)
+        for (let y = y0; y < y1; y += 1) {
+            const row = y * width
+            if (op === 'sub') { for (let x = x0; x < x1; x += 1) if (chan[row + x] >= 128) acc[row + x] = 0 }
+            else for (let x = x0; x < x1; x += 1) if (chan[row + x] > acc[row + x]) acc[row + x] = chan[row + x]
+        }
     }
-    let any = false
+    if (ux1 <= ux0 || uy1 <= uy0) return null
+
+    // Grey-on-opaque: alpha is 255 for the whole frame, so the background cannot
+    // be left as the allocator's zeros. One 32-bit fill covers it, and only the
+    // union rect is then written per pixel.
     const rgba = new Uint8ClampedArray(size * 4)
-    for (let i = 0; i < size; i += 1) {
-        const v = acc[i]
-        if (v >= 128) any = true
-        const j = i * 4
-        rgba[j] = v; rgba[j + 1] = v; rgba[j + 2] = v; rgba[j + 3] = 255
+    const words = new Uint32Array(rgba.buffer)
+    words.fill(opaque(0))
+    let any = false
+    for (let y = uy0; y < uy1; y += 1) {
+        const row = y * width
+        for (let x = ux0; x < ux1; x += 1) {
+            const v = acc[row + x]
+            if (!v) continue
+            if (v >= 128) any = true
+            words[row + x] = opaque(v)
+        }
     }
-    return any ? { rgba, width, height } : null
+    // The union rect bounds every non-zero pixel, so callers can hand it back as
+    // the scan window for anything derived from this mask.
+    return any ? { rgba, width, height, bounds: [ux0, uy0, ux1, uy1] } : null
+}
+
+
+/** Bounding box (ends exclusive) of the selected cells of a mask channel, or
+ *  null when nothing is selected. One pass, so op stacks can carry it. */
+export const channelBounds = (chan, width, height) => {
+    let minX = width; let minY = height; let maxX = -1; let maxY = -1
+    for (let y = 0; y < height; y += 1) {
+        const row = y * width
+        for (let x = 0; x < width; x += 1) {
+            if (!chan[row + x]) continue
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            maxY = y
+        }
+    }
+    return maxX < 0 ? null : [minX, minY, maxX + 1, maxY + 1]
 }
 
 /**

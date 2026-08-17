@@ -105,8 +105,9 @@ const bpe = (token) => {
             if (rank !== undefined && rank < bestRank) { bestRank = rank; best = i }
         }
         if (best === null) break
-        const merged = word[best] + word[best + 1]
-        word = [...word.slice(0, best), merged, ...word.slice(best + 2)]
+        // In place: the spread form built three arrays per merge, and a merge
+        // runs once per symbol pair in the word.
+        word.splice(best, 2, word[best] + word[best + 1])
         if (word.length === 1) break
     }
     bpeCache.set(token, word)
@@ -115,13 +116,15 @@ const bpe = (token) => {
 
 const clean = (text) => String(text || '').replace(/\s+/g, ' ').trim().toLowerCase()
 
+const utf8 = new TextEncoder()
+
 /** One phrase → token ids WITHOUT the specials. */
 const encodeOne = (text) => {
     const out = []
     for (const m of clean(text).matchAll(PAT)) {
         // UTF-8 bytes → byte symbols, so any script survives the round trip.
         let sym = ''
-        for (const b of new TextEncoder().encode(m[0])) sym += byteEncoder[b]
+        for (const b of utf8.encode(m[0])) sym += byteEncoder[b]
         for (const piece of bpe(sym)) {
             const id = encoder.get(piece)
             if (id !== undefined) out.push(id)

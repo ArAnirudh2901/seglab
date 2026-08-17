@@ -1268,6 +1268,78 @@ autoEscalate      false     # on-demand user action only
 | 17 | Visibility dormancy | hidden tab → ~30 MB | rebuild on re-focus |
 | 18 | Cross-tab OPFS reuse | 2nd tab on same photo encodes nothing | write lock per hash |
 
+### 12a. Every per-pixel pass is bounded by what it can touch **[MEASURED]**
+
+The lane's own cost was already band-limited (§10). What was not is the half that
+runs *after* it: on a click the app composed the op stack, unioned it with the
+live object, summarised the result twice, re-derived the tinted and ringed
+layers, and uploaded three canvases — each of them walking the whole proxy frame
+regardless of how much of it the selection occupied. A selection is typically a
+few percent of the frame, so nearly all of that work was reading zeros.
+
+Each of those passes is now bounded by a rect that something already knew:
+
+- The **lane** returns `maskRect` — the union of the mask box and the rect the
+  guided filter and region hygiene rewrote. Every non-zero alpha is inside it by
+  construction, so the client's summary scans it instead of the frame.
+- Every **committed op** carries the bounding box of its own channel, measured
+  once when it is pushed. Replaying the stack costs the sum of the objects' areas
+  instead of (stack depth × frame), and the composed mask hands its union rect
+  back as the scan window for everything derived from it.
+- **cv-refine** copies and re-expands only the mask's soft extent, padded by the
+  morphology radius that could grow it (zero today, so the pad is zero).
+- **`getMaskLayers`** skips zero pixels outright, tracks the tinted layer's own
+  extent alongside the core's, and uploads and shifts only those rects — eight
+  ring draws of a 200 px object on a 4000 px frame is a hundredth of the fill
+  rate it used to be.
+
+Every bound is optional and a missing one falls back to the whole frame, so an op
+stack restored from an older session still composes correctly. The rect passed to
+`summarizeMaskRGBA` is a promise, not a crop: the caller asserts nothing selected
+lies outside it, and what comes back is still the whole mask's coverage and bbox.
+Where a mask is composited rather than measured the rect comes from the soft
+extent (every non-zero pixel), never the ≥128 core, so the matted edge is never
+clipped.
+
+Measured, six clicks on the canonical NEF at its 1536×1024 proxy, same build with
+the bounds handed in versus forced to null: compose **30.5 → 19.8 ms** per click
+(−35%), wall **277 → 245 ms** (−12%). In isolation the gap widens with the stack:
+at 1600×1067 a twelve-op compose is **40.9 → 1.8 ms**, and its summary
+**4.4 → 2.1 ms**; at 4000×3000 (the escalated/export grid) it is **306 → 13 ms**.
+Outputs are byte-identical either way — the coexist probe's coverages and the
+region grids are unchanged.
+
+**What was measured out.** The same idea applied to `upsampleLogits` — bound the
+bicubic upsample to the rect that can produce a visible band, derived from the
+2D Catmull-Rom negative-tap bound — is worthless on real data and was reverted.
+Real SAM 2.1 logit floors are only −16 to −24, not the −30 a synthetic field
+suggests, which puts the safe threshold at about −8 to −10; and on a real photo
+12–23% of the 256² cells already sit above −6, scattered across the frame as
+distractor objects. The work rect came out at 100% of the frame on every click
+measured (four on cubes.webp, four on the NEF), so the pre-scan was pure cost.
+The upsample is bounded by the *field*, and the field is not sparse.
+
+### 12b. The debounce fires on the leading edge **[MEASURED]**
+
+With the per-pixel passes bounded, the largest single item left in a click was
+not computation at all: `scheduleRun` held every prompt for a trailing 80 ms
+before starting the run. A trailing debounce exists to absorb a stream — but all
+five call sites are one discrete gesture (a tap, an exclude click, a box or lasso
+*pointerup*, an undo, a re-run the queue asked for). None of them streams, and
+`runNow` already coalesces anything arriving mid-run through `state.runQueued`.
+So the window was doing nothing for an isolated click except delaying it.
+
+It now runs on the leading edge with a trailing coalesce: a prompt more than
+80 ms after the last one starts immediately, and one inside that window still
+collapses onto the trailing timer. `debounceArmed` still marks a pending trailing
+run, which is what the escalation gate and the headless `waitForRun` read.
+
+Measured, six clicks on the canonical NEF, same build and the same machine, with
+the leading edge on versus off: app time (wall minus the lane's own total)
+**133.8 → 53.0 ms** — the 80 ms, exactly — and wall **266.3 → 194.3 ms** (−27%).
+The cost is one extra decode when a genuine double-click lands outside the
+window, which is the already-existing `runQueued` path and not a new one.
+
 ---
 
 ## 13. Where WebAssembly belongs
