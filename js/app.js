@@ -684,7 +684,19 @@ const buildDemoScene = (longSide = DEMO.baseW) => {
     return c
 }
 
-els.pick.addEventListener('click', () => els.file.click())
+// A photo is coming: file dialog open, file dragged over the window, stage
+// cleared for the next one. Boot warm may since have been given back — the host
+// exits after 120 s idle and the governor sheds under pressure — and without
+// this the whole rebuild lands on the first click instead of on this moment.
+const warmOnIntent = async () => {
+    if (clientState.ready && encoderReady()) return
+    const cap = await bootProbe
+    if (!cap?.webgpu || !cap.f16 || cap.fallback || document.hidden) return
+    ensureWarm({ speculative: true }).catch(() => null)
+    warmEncoder({ speculative: true }).catch(() => null)
+}
+
+els.pick.addEventListener('click', () => { warmOnIntent(); els.file.click() })
 els.file.addEventListener('change', () => {
     const file = els.file.files?.[0]
     // Selecting the same file twice is a new import request too.
@@ -702,9 +714,10 @@ els.newimg.addEventListener('click', () => {
     els.stage.classList.remove('visible')
     els.dropzone.style.display = ''
     setStatus('Idle — import a photo to begin')
+    warmOnIntent()   // after the release above, or it would warm what this drops
 })
 
-window.addEventListener('dragover', (e) => { e.preventDefault(); els.dropzone.classList.add('drag') })
+window.addEventListener('dragover', (e) => { e.preventDefault(); warmOnIntent(); els.dropzone.classList.add('drag') })
 window.addEventListener('dragleave', () => els.dropzone.classList.remove('drag'))
 window.addEventListener('drop', (e) => {
     e.preventDefault()
@@ -3372,8 +3385,13 @@ const bootWarm = async () => {
         })
     }
     // Nobody waits on a background tab; no reason to take a GPU device from the
-    // foreground one to warm it.
+    // foreground one to warm it. The DOWNLOAD is not GPU work, so it starts
+    // now anyway — otherwise a tab opened in the background arrives at its
+    // first click with an empty model cache.
     if (document.hidden) {
+        import('./sam21-client.js')
+            .then(async (c) => { await c.hello('seglab'); await c.prefetch() })
+            .catch(() => null)
         await new Promise((resolve) => {
             const on = () => {
                 if (document.hidden) return

@@ -315,6 +315,9 @@ const OPS = {
         return status()
     },
     state: () => status(),
+    // Weights only, no session: a tab that cannot build yet (hidden at load)
+    // still gets the 78 MB into the cache instead of paying it on first click.
+    prefetch: () => { armPrefetch(); return status() },
     // Free everything for this origin. Governor top rung / explicit teardown.
     releaseAll: () => { releaseAll(); return status() },
     // Read-only, and now the only shape this has: the lane's identity is a set

@@ -335,6 +335,10 @@ export const warm = () => call('warm')
  *  — the lane arms its idle release only after one runs. */
 export const buildEncoder = () => call('buildEncoder')
 
+/** Pull the encoder weights into the cache without building anything. For a
+ *  tab that must not take a GPU device yet (hidden at load). */
+export const prefetch = () => call('prefetch')
+
 /** Report tab-side heavy work so the host holds its idle weight prefetch.
  *  Never connects a host just to say this. */
 export const noteBusy = (busy) => (state.port

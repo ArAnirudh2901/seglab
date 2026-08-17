@@ -1135,6 +1135,7 @@ export const embedStats = async (key, which = 'image_embed') => {
 
 export const laneState = () => ({
     encoder: !!state.encoder,
+    weightsPrefetched: prefetched,   // weights in the cache, session or not
     decoder: !!state.decoder,
     embedKeys: [...state.embeds.keys()],
     embedBytes: state.embeds.size * EMBED_BYTES,

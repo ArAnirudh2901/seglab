@@ -86,9 +86,11 @@ let warmPromise = null
 export const warmUp = ({ speculative = false } = {}) => {
     if (warmPromise) return warmPromise
     trace('warm-start', { model: LANE, speculative })
-    // A speculative (boot) warm yields to user work: lowest rank, and an
-    // `isCurrent` so clearHeavyQueue can cancel it while still queued rather
-    // than making an import decode wait behind a warm nobody asked for.
+    // A speculative (boot) warm yields to user work by RANK — an import decode
+    // is priority 0 and jumps it in the queue. It is not cancelled by an
+    // import: the weights it is fetching are exactly what that import's first
+    // click needs. `speculative` keeps clearHeavyQueue's abandon path for the
+    // case that actually blocks, a warm already stuck holding the slot.
     warmPromise = enqueueHeavy('model-warm', async () => {
         const c = await import('./sam21-client.js')
         await c.hello('seglab')
@@ -99,7 +101,7 @@ export const warmUp = ({ speculative = false } = {}) => {
         noteModel('sam21', { device: 'webgpu', scale: 'small', release: 'darktable-5.6.0' })
         emit({ type: 'state' })
         return clientState
-    }, speculative ? { priority: 'idle', isCurrent: () => true } : {})
+    }, speculative ? { priority: 'idle', speculative: true } : {})
     // STALE means cancelled before it ran. Drop the memo or every later warmUp
     // hands back a resolved promise that never built anything.
     warmPromise = warmPromise.then((r) => {
@@ -142,7 +144,7 @@ export const warmEncoder = ({ speculative = false } = {}) => {
         encoderBuilt = Boolean(r?.encoder ?? true)
         emit({ type: 'state' })
         return r
-    }, speculative ? { priority: 'idle', isCurrent: () => true } : {})
+    }, speculative ? { priority: 'idle', speculative: true } : {})
     encoderPromise = encoderPromise.then((r) => {
         if (r === STALE) encoderPromise = null
         return r

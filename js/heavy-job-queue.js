@@ -123,12 +123,13 @@ const pump = () => {
  */
 export const enqueueHeavy = (label, task, {
     priority = 'normal', signal = null, revision = null, isCurrent = null, timeoutMs = null,
-    onPreempt = null,
+    onPreempt = null, speculative = false,
 } = {}) => new Promise((resolve, reject) => {
     const job = {
         label,
         task,
         onPreempt,
+        speculative,
         rank: PRIORITY[priority] ?? PRIORITY.normal,
         seq: ++state.seq,
         signal,
@@ -164,7 +165,10 @@ export const cancelHeavyBefore = (revision) => {
 
 /** New-document reset: drop every queued DOCUMENT-SCOPED job (one that
  *  carries a revision or an isCurrent check). Document-agnostic jobs like a
- *  model warm survive — the new document needs them too.
+ *  model warm survive — the new document needs them too. A `speculative` job
+ *  (boot warm) is document-agnostic on purpose: cancelling it here moved the
+ *  whole cold model cost behind the import that cancelled it, which is the one
+ *  thing boot warm exists to prevent. It is still abandonable below.
  *
  *  A job already RUNNING cannot be interrupted, but it can be disowned. One that
  *  has outlived `STUCK_MS` belongs to a document the user has just replaced and
@@ -179,7 +183,7 @@ export const clearHeavyQueue = () => {
         if (job.revision !== null || typeof job.isCurrent === 'function') job.cancelled = true
     }
     const job = state.active
-    if (!job || (job.revision === null && typeof job.isCurrent !== 'function')) return
+    if (!job || (job.revision === null && typeof job.isCurrent !== 'function' && !job.speculative)) return
     if (Date.now() - job.startedAt < STUCK_MS) return
     settle(job, 'abandoned', () => job.resolve(STALE))
 }
