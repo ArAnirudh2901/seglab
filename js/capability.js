@@ -14,8 +14,9 @@
  * silently turn a low-memory device into an unsafe large-canvas configuration.
  */
 
+import { inferBackend, profileAdapter, requestAdapter } from './gpu-adapter.js'
+
 const MIB = 1024 * 1024
-const PROFILES = ['lite', 'standard', 'pro', 'ultra']
 const MODES = new Set(['conservative', 'balanced', 'performance'])
 
 const safeGB = (value, max) => {
@@ -53,58 +54,44 @@ export const readPhosmithResources = () => normalizePhosmithResources(
     typeof globalThis === 'undefined' ? null : globalThis.__PHOSMITH_DEVICE_RESOURCES__,
 )
 
-const lowerProfile = (profile) => ({ ultra: 'pro', pro: 'standard', standard: 'standard', lite: 'lite' }[profile] || 'standard')
 
 // Trusted-host tier ladder (usable editor budget the host vouches for, not
 // installed RAM). Unverified budgets never enter it.
-const TIER_MIN_GB = { standard: 8, pro: 12, ultra: 24 }
 
-const profileForMemory = (memoryGB, trusted, mode) => {
-    // Browser memory reports are unverifiable, so they never pick a tier —
-    // an untrusted budget always resolves to the conservative baseline.
-    if (!trusted) return 'lite'
-    let profile = 'standard'
-    if (memoryGB > 0 && memoryGB < TIER_MIN_GB.standard) profile = 'lite'
-    else if (memoryGB >= TIER_MIN_GB.ultra) profile = 'ultra'
-    else if (memoryGB >= TIER_MIN_GB.pro) profile = 'pro'
-    if (mode === 'conservative') profile = lowerProfile(profile)
-    return profile
-}
 
-const gpuTierFor = ({ webgpu, fallback, f16, textureLimit, storageBufferLimit }) => {
-    if (!webgpu || fallback) return 'none'
+/**
+ * No f16 is now 'none', not 'basic'. checkDevice refuses such an adapter and
+ * there is no lane to demote to, so 'basic' claimed acceleration the app cannot
+ * deliver — and policy read this field to set `samWebGPU`. 'basic' now means
+ * what it says: a real f16 GPU whose limits sit under what the lane sizes for.
+ * `software` is separate from `fallback`: a blocklisted driver puts Chrome on
+ * SwiftShader with isFallbackAdapter false.
+ */
+const gpuTierFor = ({ webgpu, fallback, software, f16, legacyBackend, textureLimit, storageBufferLimit }) => {
+    if (!webgpu || fallback || software || !f16) return 'none'
     const textureReady = !textureLimit || textureLimit >= 8192
     const storageReady = !storageBufferLimit || storageBufferLimit >= 128 * MIB
-    return f16 && textureReady && storageReady ? 'accelerated' : 'basic'
+    // d3d11/GL is Chrome's compatibility path — hardware too old for d3d12.
+    return textureReady && storageReady && !legacyBackend ? 'accelerated' : 'basic'
 }
 
 /**
  * The highest tier an UNVERIFIED browser may auto-run, chosen from signals that
  * cannot be spoofed *upward*:
  *   - `logicalProcessors` (hardwareConcurrency): not capped, a device-class proxy.
- *   - `gpuTier`: a usable, non-fallback WebGPU adapter — REQUIRED, because a
- *     GPU-less device runs SlimSAM on WASM, whose ORT heap holds ~3 GB (measured),
- *     so it must stay bounded at lite. 'accelerated' (f16 + healthy limits) is
- *     the strongest signal.
+ *   - `gpuTier`: a usable, non-fallback WebGPU adapter — REQUIRED. It used to be
+ *     required because the WASM alternative held a ~3 GB ORT heap (measured);
+ *     now it is required because there is no alternative at all — the mask lane
+ *     refuses an adapter without shader-f16. 'accelerated' is the strongest signal.
  *   - `deviceMemory`: used only DOWNWARD — a genuine sub-8 reading demotes; a
  *     reading of 8 (the privacy cap) never raises.
  *   - `mobile`: phones/tablets stay lite (small RAM, thermal throttling).
  * Capped at `standard8` — pro/ultra are Phosmith-verified-only or manual override.
  * A trusted host returns null (classifyCapability already has a real figure).
  */
-const autoTierFor = ({ trusted, cores, memoryGB, gpuTier, mobile }) => {
-    if (trusted) return null
-    if (mobile) return 'lite'
-    if (gpuTier === 'none') return 'lite'            // WASM-only → ~3 GB risk, stay bounded
-    if (memoryGB > 0 && memoryGB < 8) return 'lite'  // a real sub-8 reading is trusted down
-    if (!cores || cores < 6) return 'lite'           // no / low multi-core signal
-    // Usable GPU (SlimSAM runs at ~0.5 GB on WebGPU, not ~3 GB on WASM) + real
-    // multi-core. Accelerated adapter or a strong core count earns standard8.
-    return (gpuTier === 'accelerated' || cores >= 8) ? 'standard8' : 'lite'
-}
 
 const proxyFor = (profile, gpuTier, textureLimit) => {
-    // SlimSAM resizes every input to a 1024 long edge, so 1024 is the baseline
+    // The encoder resizes every input to a 1024 long edge, so 1024 is the baseline
     // that feeds the model its exact native frame (and a crisp preview) at no
     // extra model cost. Bigger values improve only interaction/preview
     // precision, so GPU strength earns a bounded increase above that.
@@ -128,19 +115,29 @@ export const classifyCapability = (input = {}) => {
     const memoryGB = host?.memoryGB || browserMemoryGB
     const memorySource = host?.memoryGB ? 'phosmith' : (browserMemoryGB ? 'browser' : 'unknown')
     const resourceMode = host?.mode || 'balanced'
-    const profile = profileForMemory(memoryGB, memorySource === 'phosmith', resourceMode)
     const gpuTier = gpuTierFor(input)
     const vramGB = host?.vramGB || 0
     const cores = Number(input.logicalProcessors) || 0
     const mobile = !!input.mobile
-    // The tier an unverified device may auto-run (capped at standard8, GPU- and
-    // core-gated). Applied by resolveBudget as the locked-budget default.
-    const autoTier = autoTierFor({ trusted: memorySource === 'phosmith', cores, memoryGB, gpuTier, mobile })
+    // One configuration (§11): there is no tier to estimate. `profile` is a
+    // stable label for telemetry and for proxyFor's size table, not a choice.
+    const profile = 'standard8'
 
     return {
         webgpu: !!input.webgpu,
         fallback: !!input.fallback,
+        software: !!input.software,
         f16: !!input.f16,
+        subgroups: !!input.subgroups,
+        // Adapter identity. May be '' (browsers minimise it) — read unknown as
+        // "no opinion", never "weak".
+        gpuVendor: input.gpuVendor || '',
+        gpuArchitecture: input.gpuArchitecture || '',
+        // 'd3d12' | 'metal' | 'vulkan' | 'd3d11' | … — '' unless Chrome's WebGPU
+        // Developer Features flag is on, so never a precondition for anything.
+        gpuBackend: input.gpuBackend || '',
+        legacyBackend: !!input.legacyBackend,
+        integratedGPU: !!input.integratedGPU,
         // Keep this public alias for existing integrations/tests.
         deviceMemoryGB: browserMemoryGB,
         browserMemoryGB,
@@ -158,13 +155,9 @@ export const classifyCapability = (input = {}) => {
         storageBufferLimit: Number(input.storageBufferLimit) || 0,
         gpuPreference: 'high-performance',
         profile,
-        // The tier an unverified device auto-runs (null once Phosmith supplies a
-        // real figure). Applied by resolveBudget; the manual toggle can exceed it.
-        autoTier,
-        estimatedProfile: autoTier, // back-compat alias for the profile-toggle UI
         proxyMax: proxyFor(profile, gpuTier, Number(input.textureLimit) || 0),
-        // Segmentation is SlimSAM-only. Kept as a stable diagnostic field for
-        // existing host integrations; it is deliberately never eligible.
+        // Kept as a stable diagnostic field for existing host integrations; it
+        // is deliberately never eligible.
         flagshipEligible: false,
     }
 }
@@ -187,7 +180,9 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
     const raw = {
         webgpu: false,
         fallback: false,
+        software: false,
         f16: false,
+        subgroups: false,
         browserMemoryGB: nav.deviceMemory || 0,
         logicalProcessors: nav.hardwareConcurrency || 0,
         mobile,
@@ -196,21 +191,40 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
         hostResources,
     }
     try {
-        if (nav.gpu) {
-            // The browser may decline the preference (for example on battery),
-            // so a regular request remains a valid fallback.
-            const adapter = await nav.gpu.requestAdapter({ powerPreference: 'high-performance' })
-                || await nav.gpu.requestAdapter()
-            if (adapter) {
-                raw.webgpu = true
-                raw.fallback = !!adapter.isFallbackAdapter
-                raw.f16 = adapter.features?.has?.('shader-f16') || false
-                raw.textureLimit = adapter.limits?.maxTextureDimension2D || 0
-                raw.storageBufferLimit = adapter.limits?.maxStorageBufferBindingSize || 0
-            }
+        // Same request the mask lane makes — see gpu-adapter.
+        const adapter = await requestAdapter()
+        const gpu = profileAdapter(adapter)
+        if (gpu) {
+            raw.webgpu = true
+            raw.fallback = !!adapter.isFallbackAdapter
+            raw.software = gpu.software
+            raw.f16 = gpu.f16
+            raw.subgroups = gpu.subgroups
+            raw.textureLimit = gpu.textureLimit
+            raw.storageBufferLimit = gpu.storageBufferLimit
+            raw.gpuVendor = gpu.vendor
+            raw.gpuArchitecture = gpu.architecture
+            raw.gpuBackend = inferBackend(gpu)
+            raw.legacyBackend = gpu.legacyBackend
+            raw.integratedGPU = gpu.integrated
+            raw.gpuName = gpu.name
         }
-    } catch { /* WebGPU is optional; the engine has a WASM lane. */ }
+    } catch { /* WebGPU is optional here; the lane gates on it separately. */ }
     return classifyCapability(raw)
 }
 
-export const RESOURCE_PROFILES = PROFILES
+/**
+ * Text lane availability. Previously refused on WebKit (`navigator.vendor ===
+ * "Apple Computer, Inc."`) on the theory that the lane hit a ~1 GB per-process
+ * ceiling and took the tab with it. Re-measured 2026-08-09: it completes fine
+ * on Safari (peaks ~6.3 GB, tab survives) — see the corrected memory. The
+ * ceiling doesn't exist, so WebKit is no longer refused; `?text=0` still
+ * disables the lane anywhere it isn't wanted.
+ */
+export const probeTextLane = (
+    search = typeof location !== 'undefined' ? location.search : '',
+) => {
+    const q = new URLSearchParams(search).get('text')
+    if (q === '0') return { ok: false, reason: 'disabled' }
+    return { ok: true, reason: 'ok' }
+}

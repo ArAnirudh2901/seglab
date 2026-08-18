@@ -1,73 +1,13 @@
 /**
- * sam-core (pure — no DOM, no transformers.js)
+ * sam-core (pure — no DOM, no model runtime)
  * ----------------------------------------------
- * Prompt/mask math for the on-device segmentation engine: mapping click/box
- * coordinates into the model's reshaped input space, building prompt tensor
- * payloads, picking the best of SAM's three candidate masks, and converting
- * a mask tensor into RGBA. Dependency-free so it can be unit-tested headless.
+ * Prompt/mask math for the on-device segmentation engine: picking the best of
+ * SAM's three candidate masks, mask channel composition, and mapping prompts
+ * into crop space. Dependency-free so it can be unit-tested headless.
  *
- * Coordinate model: SAM resizes the source so its longest side hits the
- * model input size (1024) — `reshaped_input_sizes` is that resized [h, w].
- * Prompts must be expressed in THAT space, while post_process_masks returns
- * masks back in the source's own size. All helpers here take the source
- * dims + reshaped pair so both ends agree on one reference frame.
+ * Prompts reach the decoder in proxy space; sam21-lane owns the scaling into
+ * model-input space, so nothing here needs the reshaped [h, w] pair.
  */
-
-/** Scale one source-space point into reshaped-input space. */
-export const scalePointToReshaped = (x, y, srcW, srcH, reshaped) => [
-    (x * reshaped[1]) / srcW,
-    (y * reshaped[0]) / srcH,
-]
-
-/**
- * Build the point-prompt payload from `[x, y, label]` clicks (label 1 =
- * include, 0 = exclude). Returns plain arrays + dims; the engine wraps them
- * in Tensors (this module stays transformers-free).
- *
- * @param {Array<[number, number, 0|1]>} clicks  source-space clicks
- * @param {number} srcW
- * @param {number} srcH
- * @param {[number, number]} reshaped  [h, w] model-input size
- */
-export const buildPointPrompt = (clicks, srcW, srcH, reshaped) => {
-    if (!Array.isArray(clicks) || clicks.length === 0) return null
-    const n = clicks.length
-    const points = new Float32Array(n * 2)
-    const labels = new BigInt64Array(n)
-    for (let i = 0; i < n; i += 1) {
-        const [x, y, label] = clicks[i]
-        const [rx, ry] = scalePointToReshaped(x, y, srcW, srcH, reshaped)
-        points[i * 2] = rx
-        points[i * 2 + 1] = ry
-        labels[i] = BigInt(label ? 1 : 0)
-    }
-    return {
-        points,
-        pointDims: [1, 1, n, 2],
-        labels,
-        labelDims: [1, 1, n],
-    }
-}
-
-/**
- * Build the box-prompt payload from a source-space `[x0, y0, x1, y1]` box.
- * Also reports the box centre (source space): when the prompt is ONLY a box,
- * the engine adds the centre as a positive click, both because whole-object
- * box selection benefits from an interior anchor and because the
- * transformers.js SAM forward() derives default labels from `input_points`
- * and cannot run point-free.
- */
-export const buildBoxPrompt = (box, srcW, srcH, reshaped) => {
-    if (!Array.isArray(box) || box.length !== 4) return null
-    const [x0, y0, x1, y1] = box
-    const [rx0, ry0] = scalePointToReshaped(Math.min(x0, x1), Math.min(y0, y1), srcW, srcH, reshaped)
-    const [rx1, ry1] = scalePointToReshaped(Math.max(x0, x1), Math.max(y0, y1), srcW, srcH, reshaped)
-    return {
-        box: new Float32Array([rx0, ry0, rx1, ry1]),
-        boxDims: [1, 1, 4],
-        center: [(Math.min(x0, x1) + Math.max(x0, x1)) / 2, (Math.min(y0, y1) + Math.max(y0, y1)) / 2],
-    }
-}
 
 /**
  * Under an ambiguous prompt, a candidate covering ≥ this much of the frame is
@@ -118,35 +58,37 @@ export const maskChannelCoverages = (maskData, width, height, channels) => {
 }
 
 /**
- * Extract one channel of a post-processed bool mask tensor ([1, C, H, W],
- * Uint8 0/1 data) as opaque white-on-black RGBA.
+ * Coverage + bbox of a white-on-black RGBA mask (reads the R channel).
+ *
+ * `rect` (ends exclusive) restricts the scan. It is a promise, not a crop: the
+ * caller is asserting no selected pixel lies outside it, so the coverage and
+ * bbox that come back are the WHOLE mask's. Pass a rect only when something
+ * already known bounds the mask — its own previous bbox, or the union of the
+ * pieces it was composed from.
  */
-export const maskChannelToRGBA = (maskData, width, height, channel) => {
-    const size = width * height
-    const offset = channel * size
-    const rgba = new Uint8ClampedArray(size * 4)
-    for (let i = 0; i < size; i += 1) {
-        const v = maskData[offset + i] ? 255 : 0
-        const j = i * 4
-        rgba[j] = v
-        rgba[j + 1] = v
-        rgba[j + 2] = v
-        rgba[j + 3] = 255
-    }
-    return rgba
-}
-
-/** Coverage + bbox of a white-on-black RGBA mask (reads the R channel). */
-export const summarizeMaskRGBA = (rgba, width, height) => {
+export const summarizeMaskRGBA = (rgba, width, height, rect = null) => {
     let count = 0
     let minX = width
     let minY = height
     let maxX = -1
     let maxY = -1
-    for (let y = 0; y < height; y += 1) {
+    const [rx0, ry0, rx1, ry1] = rect
+        ? [Math.max(0, rect[0]), Math.max(0, rect[1]), Math.min(width, rect[2]), Math.min(height, rect[3])]
+        : [0, 0, width, height]
+    // The soft extent is every non-zero pixel, which reaches past the >=128 core
+    // by the width of the matted edge. Anything that COMPOSITES the mask needs
+    // this one; anything that measures selected area needs the core.
+    let sx0 = width; let sy0 = height; let sx1 = -1; let sy1 = -1
+    for (let y = ry0; y < ry1; y += 1) {
         const row = y * width
-        for (let x = 0; x < width; x += 1) {
-            if (rgba[(row + x) * 4] >= 128) {
+        for (let x = rx0; x < rx1; x += 1) {
+            const v = rgba[(row + x) * 4]
+            if (!v) continue
+            if (x < sx0) sx0 = x
+            if (x > sx1) sx1 = x
+            if (y < sy0) sy0 = y
+            sy1 = y
+            if (v >= 128) {
                 count += 1
                 if (x < minX) minX = x
                 if (x > maxX) maxX = x
@@ -158,6 +100,8 @@ export const summarizeMaskRGBA = (rgba, width, height) => {
     return {
         coverage: count / (width * height),
         bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null,
+        // Ends exclusive — a scan window, not an inclusive bbox.
+        softBox: sx1 < 0 ? null : [sx0, sy0, sx1 + 1, sy1 + 1],
     }
 }
 
@@ -173,29 +117,120 @@ export const maskToChannel = (imageData) => {
     return chan
 }
 
+// Grey level as one opaque RGBA word, built through a byte view so the packing
+// follows the platform's endianness instead of assuming little-endian.
+const packScratch = new Uint8Array(4)
+const packWord = new Uint32Array(packScratch.buffer)
+const opaque = (v) => {
+    packScratch[0] = v; packScratch[1] = v; packScratch[2] = v; packScratch[3] = 255
+    return packWord[0]
+}
+
 /**
- * Replay an ordered op stack ({op:'add'|'sub', chan}) into a white-on-black
- * RGBA mask. Adds union per-pixel max (soft edges survive); subs zero where
- * the sub channel is selected. `floor` is an optional pre-flattened starting
- * channel. Returns null when nothing selected (callers keep the fast path).
+ * Replay an ordered op stack ({op:'add'|'sub', chan, bounds}) into a
+ * white-on-black RGBA mask. Adds union per-pixel max (soft edges survive); subs
+ * zero where the sub channel is selected. `floor` is an optional pre-flattened
+ * starting channel and `floorBounds` its extent. Returns null when nothing is
+ * selected (callers keep the fast path).
+ *
+ * `bounds`/`floorBounds` are ends-exclusive rects from channelBounds. They are
+ * an optimisation only: an op without one is replayed over the whole frame, so
+ * a stack restored from an older session still composes correctly.
  */
-export const composeChannels = (ops, width, height, floor = null) => {
+export const composeChannels = (ops, width, height, floor = null, floorBounds = null) => {
     const size = width * height
-    const acc = floor ? Uint8Array.from(floor) : new Uint8Array(size)
-    for (const { op, chan } of ops) {
+    // slice(), not Uint8Array.from(): from() walks the iterator protocol a byte
+    // at a time where slice() is a memcpy of the whole buffer.
+    const acc = floor ? floor.slice() : new Uint8Array(size)
+    // Every op knows where it lives, so replaying the stack costs the sum of the
+    // objects' areas rather than (stack depth x frame). A missing bound means an
+    // op from before this was tracked (a restored session) — scan it whole.
+    let ux0 = width; let uy0 = height; let ux1 = 0; let uy1 = 0
+    const widen = (b) => {
+        if (!b) { ux0 = 0; uy0 = 0; ux1 = width; uy1 = height; return }
+        if (b[0] < ux0) ux0 = b[0]
+        if (b[1] < uy0) uy0 = b[1]
+        if (b[2] > ux1) ux1 = b[2]
+        if (b[3] > uy1) uy1 = b[3]
+    }
+    if (floor) widen(floorBounds)
+    for (const { op, chan, bounds } of ops) {
         if (!chan || chan.length !== size) continue
-        if (op === 'sub') { for (let i = 0; i < size; i += 1) if (chan[i] >= 128) acc[i] = 0 }
-        else { for (let i = 0; i < size; i += 1) if (chan[i] > acc[i]) acc[i] = chan[i] }
+        const [x0, y0, x1, y1] = bounds && bounds[2] <= width && bounds[3] <= height
+            ? bounds : [0, 0, width, height]
+        // A subtract only ever clears, so it cannot put the union anywhere new.
+        if (op !== 'sub') widen(bounds)
+        for (let y = y0; y < y1; y += 1) {
+            const row = y * width
+            if (op === 'sub') { for (let x = x0; x < x1; x += 1) if (chan[row + x] >= 128) acc[row + x] = 0 }
+            else for (let x = x0; x < x1; x += 1) if (chan[row + x] > acc[row + x]) acc[row + x] = chan[row + x]
+        }
     }
-    let any = false
+    if (ux1 <= ux0 || uy1 <= uy0) return null
+
+    // Grey-on-opaque: alpha is 255 for the whole frame, so the background cannot
+    // be left as the allocator's zeros. One 32-bit fill covers it, and only the
+    // union rect is then written per pixel.
     const rgba = new Uint8ClampedArray(size * 4)
-    for (let i = 0; i < size; i += 1) {
-        const v = acc[i]
-        if (v >= 128) any = true
-        const j = i * 4
-        rgba[j] = v; rgba[j + 1] = v; rgba[j + 2] = v; rgba[j + 3] = 255
+    const words = new Uint32Array(rgba.buffer)
+    words.fill(opaque(0))
+    let any = false
+    for (let y = uy0; y < uy1; y += 1) {
+        const row = y * width
+        for (let x = ux0; x < ux1; x += 1) {
+            const v = acc[row + x]
+            if (!v) continue
+            if (v >= 128) any = true
+            words[row + x] = opaque(v)
+        }
     }
-    return any ? { rgba, width, height } : null
+    // The union rect bounds every non-zero pixel, so callers can hand it back as
+    // the scan window for anything derived from this mask.
+    return any ? { rgba, width, height, bounds: [ux0, uy0, ux1, uy1] } : null
+}
+
+
+/** Bounding box (ends exclusive) of the selected cells of a mask channel, or
+ *  null when nothing is selected. One pass, so op stacks can carry it. */
+export const channelBounds = (chan, width, height) => {
+    let minX = width; let minY = height; let maxX = -1; let maxY = -1
+    for (let y = 0; y < height; y += 1) {
+        const row = y * width
+        for (let x = 0; x < width; x += 1) {
+            if (!chan[row + x]) continue
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            maxY = y
+        }
+    }
+    return maxX < 0 ? null : [minX, minY, maxX + 1, maxY + 1]
+}
+
+/**
+ * One axis of a chebyshev dilation: two sweeps carrying the distance since the
+ * last set cell. Cost is one read/write per cell and does not depend on the
+ * radius, which is what keeps the mask-wide morphology linear.
+ */
+const spread = (src, dst, n, step, base, r) => {
+    let d = r + 1
+    for (let i = 0; i < n; i += 1) {
+        const p = base + i * step
+        d = src[p] ? 0 : d + 1
+        dst[p] = d <= r ? 1 : 0
+    }
+    d = r + 1
+    for (let i = n - 1; i >= 0; i -= 1) {
+        const p = base + i * step
+        d = src[p] ? 0 : d + 1
+        if (d <= r) dst[p] = 1
+    }
+}
+
+/** Chebyshev dilation of a binary field, separably: along x, then along y. */
+const dilateBinary = (src, dst, tmp, width, r, [x0, y0, x1, y1]) => {
+    for (let y = y0; y < y1; y += 1) spread(src, tmp, x1 - x0, 1, y * width + x0, r)
+    for (let x = x0; x < x1; x += 1) spread(tmp, dst, y1 - y0, width, y0 * width + x, r)
 }
 
 /**
@@ -205,18 +240,176 @@ export const composeChannels = (ops, width, height, floor = null) => {
  */
 export const dilateChannel = (chan, width, height, radius = 2) => {
     if (!radius) return chan
-    const out = new Uint8Array(chan.length)
-    for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-            if (!chan[y * width + x]) continue
-            const x0 = Math.max(0, x - radius)
-            const x1 = Math.min(width - 1, x + radius)
-            const y0 = Math.max(0, y - radius)
-            const y1 = Math.min(height - 1, y + radius)
-            for (let yy = y0; yy <= y1; yy += 1) out.fill(255, yy * width + x0, yy * width + x1 + 1)
+    const n = chan.length
+    const bin = new Uint8Array(n)
+    for (let i = 0; i < n; i += 1) bin[i] = chan[i] ? 1 : 0
+    const tmp = new Uint8Array(n)
+    const out = new Uint8Array(n)
+    dilateBinary(bin, out, tmp, width, radius, [0, 0, width, height])
+    for (let i = 0; i < n; i += 1) out[i] = out[i] ? 255 : 0
+    return out
+}
+
+/* ─── Boundary regularisation (the composed selection) ────────────────────── */
+
+// Everything below works inside the selection's bounding box grown by the
+// kernel. Nothing outside it can change, so a small object in a large frame
+// costs its own area instead of the frame's. `rect` is an INCLUSIVE bbox, the
+// shape summarizeMaskRGBA returns; the result is [x0, y0, x1, y1) exclusive.
+const workRect = (rect, width, height, margin) => (rect
+    ? [Math.max(0, Math.floor(rect[0]) - margin), Math.max(0, Math.floor(rect[1]) - margin),
+        Math.min(width, Math.floor(rect[2]) + 1 + margin), Math.min(height, Math.floor(rect[3]) + 1 + margin)]
+    : [0, 0, width, height])
+
+/**
+ * Close hairline gaps in the composed selection — a morphological closing of
+ * the ≥128 core, written back at full value.
+ *
+ * Two objects selected one after the other each stop a pixel short of the edge
+ * they share, so their union keeps a slit of background along it. The outline
+ * is a dilation of the core, so a two-pixel slit gets drawn as a border THROUGH
+ * the middle of what the user selected as one thing. A closing joins gaps
+ * narrower than 2r and leaves every other boundary exactly where it was.
+ *
+ * Add-only: it can never drop a selected pixel, so no object is lost to it.
+ * Outside the frame reads as foreground for the erosion, so a slit that runs
+ * off the frame edge closes to the edge instead of leaving a notch there.
+ * Returns the number of pixels filled.
+ */
+export const bridgeGaps = (rgba, width, height, { radius = 2, rect = null } = {}) => {
+    const r = Math.max(1, Math.round(radius))
+    const [x0, y0, x1, y1] = workRect(rect, width, height, r + 1)
+    if (x1 <= x0 || y1 <= y0) return 0
+    const n = width * height
+    const core = new Uint8Array(n)
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) core[row + x] = rgba[(row + x) * 4] >= 128 ? 1 : 0
+    }
+    const tmp = new Uint8Array(n)
+    const dil = new Uint8Array(n)
+    dilateBinary(core, dil, tmp, width, r, [x0, y0, x1, y1])
+    // Erosion is the complement of the dilation of the complement, so one
+    // primitive covers both halves of the closing.
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) dil[row + x] = dil[row + x] ? 0 : 1
+    }
+    const back = new Uint8Array(n)
+    dilateBinary(dil, back, tmp, width, r, [x0, y0, x1, y1])
+    let filled = 0
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) {
+            const p = row + x
+            if (back[p] || core[p]) continue
+            const j = p * 4
+            rgba[j] = 255; rgba[j + 1] = 255; rgba[j + 2] = 255; rgba[j + 3] = 255
+            filled += 1
         }
     }
-    return out
+    return filled
+}
+
+// Whether clearing a cell keeps the shape connected: with its 8 neighbours read
+// as a ring, one 0→1 transition means they form a single arc, so the cell is on
+// a boundary. Two or more means it is the LINK between separate parts — a 1 px
+// wire is exactly that — and clearing it would sever them.
+const SIMPLE = new Uint8Array(256)
+for (let code = 0; code < 256; code += 1) {
+    let arcs = 0
+    for (let k = 0; k < 8; k += 1) {
+        if (!((code >> k) & 1) && ((code >> ((k + 1) & 7)) & 1)) arcs += 1
+    }
+    SIMPLE[code] = arcs === 1 ? 1 : 0
+}
+
+const nbrCode = (core, p, x, y, w, box) => {
+    const up = y > box[1]; const dn = y < box[3] - 1
+    const lf = x > box[0]; const rt = x < box[2] - 1
+    let c = 0
+    if (up && core[p - w]) c |= 1
+    if (up && rt && core[p - w + 1]) c |= 2
+    if (rt && core[p + 1]) c |= 4
+    if (dn && rt && core[p + w + 1]) c |= 8
+    if (dn && core[p + w]) c |= 16
+    if (dn && lf && core[p + w - 1]) c |= 32
+    if (lf && core[p - 1]) c |= 64
+    if (up && lf && core[p - w - 1]) c |= 128
+    return c
+}
+
+/**
+ * Smooth the selection boundary: replace each value by the mean of its
+ * (2r+1)² neighbourhood.
+ *
+ * The mask is a soft band around the decoder's own level set, and across a
+ * straight edge that band is close to linear — a box mean of a linear ramp is
+ * the same ramp, so a straight or diagonal edge comes back unmoved and only
+ * the pixel-scale wobble averages out. That is curvature smoothing of the
+ * level set, which is what a jagged staircase needs; a hard 0/255 median
+ * would instead re-quantise the edge it is meant to soften.
+ *
+ * The one thing a mean cannot be trusted with is a thin structure: a 1 px wire
+ * averages below the decision level along its whole length and disappears. A
+ * core cell is therefore never cleared unless its neighbours form a single arc
+ * — the standard connectivity test — so wires and spokes keep their spine.
+ *
+ * Sliding windows: two passes, one add and one drop per cell, independent of r.
+ * Returns the number of pixels changed.
+ */
+export const smoothBoundary = (rgba, width, height, { radius = 1, rect = null } = {}) => {
+    const r = Math.max(1, Math.round(radius))
+    const box = workRect(rect, width, height, r + 1)
+    const [x0, y0, x1, y1] = box
+    if (x1 <= x0 || y1 <= y0) return 0
+    const n = width * height
+    const core = new Uint8Array(n)
+    const sums = new Int32Array(n)
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        let s = 0
+        const seed = Math.min(x0 + r, x1 - 1)
+        for (let x = x0; x <= seed; x += 1) s += rgba[(row + x) * 4]
+        for (let x = x0; x < x1; x += 1) {
+            const p = row + x
+            sums[p] = s
+            core[p] = rgba[p * 4] >= 128 ? 1 : 0
+            const drop = x - r
+            const add = x + r + 1
+            if (drop >= x0) s -= rgba[(row + drop) * 4]
+            if (add < x1) s += rgba[(row + add) * 4]
+        }
+    }
+    let changed = 0
+    for (let x = x0; x < x1; x += 1) {
+        const wx = Math.min(x + r, x1 - 1) - Math.max(x - r, x0) + 1
+        let s = 0
+        const seed = Math.min(y0 + r, y1 - 1)
+        for (let y = y0; y <= seed; y += 1) s += sums[y * width + x]
+        for (let y = y0; y < y1; y += 1) {
+            const p = y * width + x
+            const wy = Math.min(y + r, y1 - 1) - Math.max(y - r, y0) + 1
+            const v = rgba[p * 4]
+            const m = Math.round(s / (wx * wy))
+            const drop = y - r
+            const add = y + r + 1
+            if (drop >= y0) s -= sums[drop * width + x]
+            if (add < y1) s += sums[add * width + x]
+            if (m === v) continue
+            if (v >= 128 && m < 128) {
+                // Against the RUNNING core, not a snapshot: two neighbouring
+                // cells can each be safe to clear on their own and sever the
+                // shape between them if both go.
+                if (!SIMPLE[nbrCode(core, p, x, y, width, box)]) continue
+                core[p] = 0
+            } else if (v < 128 && m >= 128) core[p] = 1
+            const j = p * 4
+            rgba[j] = m; rgba[j + 1] = m; rgba[j + 2] = m; rgba[j + 3] = 255
+            changed += 1
+        }
+    }
+    return changed
 }
 
 /** True when (x, y) — or any pixel within `tolerance` px — is selected. */
@@ -280,119 +473,52 @@ const labelComponents = (bin, w, h) => {
     return { labels, areas }
 }
 
-/** Component label at (or within `radius` of) a seed point — a positive
- *  click can land a few pixels outside the mask the decoder returned. */
-const labelNearSeed = (labels, w, h, x, y, radius = 16) => {
-    const cx = Math.round(x)
-    const cy = Math.round(y)
-    for (let r = 0; r <= radius; r += 1) {
-        for (let dy = -r; dy <= r; dy += 1) {
-            for (let dx = -r; dx <= r; dx += 1) {
-                if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue // ring only
-                const px = cx + dx
-                const py = cy + dy
-                if (px < 0 || py < 0 || px >= w || py >= h) continue
-                const l = labels[py * w + px]
-                if (l) return l
-            }
-        }
-    }
-    return 0
-}
-
-/**
- * Clean a decoded mask in place:
- *   1. keep components containing (or near) a positive seed;
- *   2. keep unseeded components ≥ 1% of the largest kept one (an object
- *      split in two by an occluder — a bike behind a tree — must survive
- *      even though only one half was clicked);
- *   3. drop the rest (threshold crumbs/islands);
- *   4. fill interior holes below ~1% of the mask area (upsample pinholes) —
- *      big legitimate gaps (background seen through a frame) stay open.
- *
- * @param {Uint8ClampedArray} rgba  white-on-black mask, modified in place
- * @param {Array<[number, number]>} seeds  positive prompt points
- * @returns {{ kept: number, dropped: number, holesFilled: number }}
- */
-export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
-    const size = w * h
-    const bin = new Uint8Array(size)
-    let fgArea = 0
-    for (let i = 0; i < size; i += 1) {
-        if (rgba[i * 4] >= 64) { bin[i] = 1; fgArea += 1 }
-    }
-    if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
-
-    const { labels, areas } = labelComponents(bin, w, h)
-    const keep = new Set()
-    for (const [sx, sy] of seeds) {
-        const l = labelNearSeed(labels, w, h, sx, sy)
-        if (l) keep.add(l)
-    }
-    let largestKept = 0
-    if (keep.size === 0) {
-        // No seed hit anything (box/lasso edge cases) — keep the largest.
-        let best = 1
-        for (let k = 1; k < areas.length; k += 1) if (areas[k] > areas[best - 1]) best = k + 1
-        keep.add(best)
-    }
-    for (const l of keep) largestKept = Math.max(largestKept, areas[l - 1])
-    const minUnseeded = Math.max(16, largestKept * 0.005)
-    for (let k = 0; k < areas.length; k += 1) {
-        if (!keep.has(k + 1) && areas[k] >= minUnseeded) keep.add(k + 1)
-    }
-
-    let dropped = 0
-    for (let i = 0; i < size; i += 1) {
-        if (bin[i] && !keep.has(labels[i])) {
-            bin[i] = 0
-            dropped += 1
-            const j = i * 4
-            rgba[j] = 0
-            rgba[j + 1] = 0
-            rgba[j + 2] = 0
-        }
-    }
-
-    // Hole fill: label the background; components that never touch the
-    // image border are holes — fill the small ones.
-    const inv = new Uint8Array(size)
-    for (let i = 0; i < size; i += 1) inv[i] = bin[i] ? 0 : 1
-    const bg = labelComponents(inv, w, h)
-    const touchesBorder = new Set()
-    for (let x = 0; x < w; x += 1) {
-        if (bg.labels[x]) touchesBorder.add(bg.labels[x])
-        if (bg.labels[(h - 1) * w + x]) touchesBorder.add(bg.labels[(h - 1) * w + x])
-    }
-    for (let y = 0; y < h; y += 1) {
-        if (bg.labels[y * w]) touchesBorder.add(bg.labels[y * w])
-        if (bg.labels[y * w + w - 1]) touchesBorder.add(bg.labels[y * w + w - 1])
-    }
-    const maxHole = Math.max(64, (fgArea - dropped) * 0.01)
-    const fillLabel = new Set()
-    for (let k = 0; k < bg.areas.length; k += 1) {
-        if (!touchesBorder.has(k + 1) && bg.areas[k] <= maxHole) fillLabel.add(k + 1)
-    }
-    let holesFilled = 0
-    if (fillLabel.size) {
-        for (let i = 0; i < size; i += 1) {
-            if (fillLabel.has(bg.labels[i])) {
-                holesFilled += 1
-                const j = i * 4
-                rgba[j] = 255
-                rgba[j + 1] = 255
-                rgba[j + 2] = 255
-            }
-        }
-    }
-    return { kept: keep.size, dropped, holesFilled }
-}
-
 /** Component count of a mask (verify/debug hook). */
 export const countMaskComponents = (rgba, w, h) => {
     const bin = new Uint8Array(w * h)
     for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
     return labelComponents(bin, w, h).areas.length
+}
+
+/**
+ * Per-component geometry of a thresholded mask (verify/debug hook). A count
+ * alone cannot tell speckle from a second object dragged in, which is the
+ * whole question region hygiene answers — so this reports what the rules
+ * themselves test: area, bbox, solidity, and whether a click landed in it.
+ * Sorted largest first, capped at `limit`.
+ */
+export const maskRegions = (rgba, w, h, clicks = [], limit = 12) => {
+    const bin = new Uint8Array(w * h)
+    for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
+    const { labels, areas } = labelComponents(bin, w, h)
+    const rows = areas.map((area, k) => ({
+        area, label: k + 1, x0: w, y0: h, x1: 0, y1: 0, clicked: false,
+    }))
+    for (let i = 0; i < labels.length; i += 1) {
+        const l = labels[i]
+        if (!l) continue
+        const r = rows[l - 1]
+        const y = (i / w) | 0
+        const x = i - y * w
+        if (x < r.x0) r.x0 = x
+        if (x >= r.x1) r.x1 = x + 1
+        if (y < r.y0) r.y0 = y
+        if (y >= r.y1) r.y1 = y + 1
+    }
+    for (const [cx, cy, label] of clicks) {
+        if (label !== 1) continue
+        const i = Math.min(h - 1, Math.max(0, Math.round(cy))) * w
+            + Math.min(w - 1, Math.max(0, Math.round(cx)))
+        if (labels[i]) rows[labels[i] - 1].clicked = true
+    }
+    const total = areas.reduce((a, b) => a + b, 0)
+    return rows.sort((a, b) => b.area - a.area).slice(0, limit).map((r) => ({
+        area: r.area,
+        share: total ? r.area / total : 0,
+        box: [r.x0, r.y0, r.x1, r.y1],
+        solidity: r.area / Math.max(1, Math.max(r.x1 - r.x0, r.y1 - r.y0) ** 2),
+        clicked: r.clicked,
+    }))
 }
 
 /* ─── Crop-space helpers (M1 crop pyramid / HD export) ──────────────────── */
@@ -424,21 +550,6 @@ export const mapPromptsToCrop = (prompts, proxyToOriginal, rect) => {
         clampPoly,
         clampMargin: (prompts.clampMargin || 0) * proxyToOriginal,
     }
-}
-
-/** IoU of two white-on-black RGBA masks of identical dims (R ≥ 128 = on).
- *  Used to sanity-gate a crop re-decode against the mask the user approved:
- *  a low IoU means the decoder grabbed a different object — distrust it. */
-export const maskIoU = (a, b) => {
-    let inter = 0
-    let union = 0
-    for (let i = 0; i < a.length; i += 4) {
-        const av = a[i] >= 128
-        const bv = b[i] >= 128
-        if (av && bv) inter += 1
-        if (av || bv) union += 1
-    }
-    return union ? inter / union : 0
 }
 
 /**

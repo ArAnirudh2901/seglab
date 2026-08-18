@@ -3,7 +3,7 @@
  * ------------------------
  * Import a photo → select anything with clicks (+/−), a box, or a rough
  * lasso that snaps to the object. All inference on-device (sam-client →
- * worker → SlimSAM); this module owns only UI state, prompt collection,
+ * SAM 2.1 host); this module owns only UI state, prompt collection,
  * overlay rendering, and the lasso clamp.
  *
  * One reference frame: the photo is downscaled once into a ≤768 canonical
@@ -11,82 +11,53 @@
  * frame — display scaling is pure CSS, undone at the pointer.
  */
 
-import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
+import { countMaskComponents, maskRegions, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, channelBounds, pointInMask, dilateChannel, bridgeGaps, smoothBoundary } from './sam-core.js'
 import {
-    cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure, recycleWorker,
+    cancelBefore, candidateShape, clientState, detectorResidentMB, disposeDetectorIfIdle,
+    encodeImage, encoderReady, engineState, forgetEncoder, pickCandidate, releaseDocument,
+    releaseEmbeddings, segment, subscribe, warmEncoder, warmUp, relievePressure,
 } from './sam-client.js'
-import { applyMemoryPressure, climbBudget, resolveBudget } from './policy.js'
+import { createScopeControl, stepScope } from './scope-control.js'
+import { createGestures } from './gestures.js'
+import { applyMemoryPressure, resolveBudget } from './policy.js'
+import {
+    observePost, observeBandFraction, savePostFit, explainFit,
+    observeDetect, saveDetectMsPerCell, affordableCells,
+} from './hardware-fit.js'
 import { createMemoryGovernor } from './memory-governor.js'
-import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
+import { probeCapability, probeTextLane, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset, getOriginalBlob, getAssetKey } from './asset-store.js'
 import { saveSession, loadSession, clearSession } from './session-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
-import { detectCandidatesColorRegion, detectCandidatesYoloe, detectCandidatesYoloWorld } from './text-ui.js'
+import { detectCandidates, lastDetectCost } from './text-ui.js'
 import { suggest, buildFacets } from './search-taxonomy.js'
 import { modelRegistry, noteModel, isModelNoted, laneOfModel } from './model-registry.js'
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
+import { prefetchTextLane } from './model-prefetch.js'
 import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-client.js'
 
 // The user's own persisted profile choice — a deliberate decision, so it is
 // honored even on a memory-locked device (unlike a URL param, which a page
 // could set on its own behalf). 'auto' defers to resolveBudget's estimate.
-const PROFILE_OVERRIDE_KEY = 'seglab.profileOverride'
-const VALID_PROFILES = new Set(['lite', 'standard8', 'standard', 'pro', 'ultra'])
-const readProfileOverride = () => {
-    try {
-        const v = localStorage.getItem(PROFILE_OVERRIDE_KEY)
-        return VALID_PROFILES.has(v) ? v : null
-    } catch { return null }
-}
-let profileOverride = readProfileOverride()
-
-// The user's persisted YOLOE text-lane scale (parallel to profileOverride): auto
-// defers to the tier's detectorScale; s/m/l force it; 'off' disables the lane.
-const YOLOE_SCALE_KEY = 'seglab.yoloeScale'
-const VALID_YOLOE = new Set(['s', 'm', 'l', 'off'])
-const readYoloeScale = () => {
-    try { const v = localStorage.getItem(YOLOE_SCALE_KEY); return VALID_YOLOE.has(v) ? v : null } catch { return null }
-}
-let yoloeScaleOverride = readYoloeScale()
+// No profile override. One configuration (DESIGN-MASK-LANE §11): a preset
+// picked numbers but could not promise anything, because nothing enforced them
+// at allocation time. Memory is bounded by the single shared SAM 2.1 instance
+// and the governor instead.
 
 // Session budget: profile preset + URL overrides. The provisional budget is
-// LITE — nothing above it can be proven before the capability probe. Above the
-// auto-tier, only a trusted Phosmith hint, the user's own profile toggle, or
-// the governor's measured-headroom climb (one step, standard8 → standard) can
-// raise it.
-let BUDGET = resolveBudget(location.search, null, profileOverride, yoloeScaleOverride)
+// LITE — nothing above it can be proven before the capability probe, and a
+// plain browser stays lite forever unless a trusted Phosmith hint or the
+// user's own profile toggle raises it.
+let BUDGET = resolveBudget(location.search, null, null)
 let capability = null
 let pendingPhosmithResources = null
-
-// Measured-headroom climb state — page-lifetime only, never persisted: every
-// session must re-prove its headroom. `lastHeadroomAt` is the freshness stamp
-// the export/escalation predicates read; a shed or a new import zeroes it.
-let climbLatched = false
-let climbPoisoned = false
-let lastHeadroomAt = 0
-
-// Every budget re-resolution funnels through here so a latched climb is
-// re-applied (or correctly dropped: climbBudget re-checks eligibility, so a
-// manual override or a Phosmith trust flip wins over the climb).
-const recomputeBudget = () => {
-    let next = applyMemoryPressure(
-        resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride),
-        BUDGET.pressureLevel || 0,
-    )
-    if (climbLatched && !climbPoisoned) {
-        const climbed = climbBudget(location.search, capability, yoloeScaleOverride, next)
-        if (climbed) next = applyMemoryPressure(climbed, BUDGET.pressureLevel || 0)
-        else climbLatched = false
-    }
-    BUDGET = next
-}
 const bootProbe = probeCapability().then((cap) => {
     capability = pendingPhosmithResources
         ? withPhosmithResources(cap, pendingPhosmithResources)
         : cap
-    recomputeBudget()
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, null), BUDGET.pressureLevel || 0)
     refreshChips()
     return cap
 }).catch((err) => {
@@ -94,32 +65,73 @@ const bootProbe = probeCapability().then((cap) => {
     return capability
 })
 
-// No model loads before the user supplies an image. The warm request is
-// enqueued AFTER the import decode releases its bitmaps (heavy-job queue
-// serializes them regardless).
-let warmStarted = false
-const ensureWarm = () => {
-    warmStarted = true
-    return warmUp({ budget: BUDGET })
+/**
+ * hardware-fit's benchmark, run for free: every click already reports how long
+ * post-processing took for a proxy of known size, so the class estimate is only
+ * ever used until the first click of the session. Persisted per device.
+ * Skipped on the encoding click — that one's postMs sits behind a cold cache.
+ *
+ * Two figures, because postMs has two causes: the DEVICE's rate and the SCENE's
+ * band. A click whose refined area is unknown updates neither — dividing it by
+ * the proxy alone would credit a compact selection to the machine and report it
+ * ~4.5x slower than it is.
+ */
+const noteClickCost = (res) => {
+    const run = clientState.lastRun
+    if (!run || run.encoded || !(run.postMs > 0)) return
+    const mp = (res.width * res.height) / 1e6
+    if (!(mp > 0) || !(run.bandPixels > 0)) return
+    const fraction = run.bandPixels / (mp * 1e6)
+    const next = observePost(BUDGET.postMsPerMP, run.postMs, mp, fraction)
+    if (!next) return
+    BUDGET.postMsPerMP = next
+    BUDGET.postMsPerMPSource = 'measured'
+    BUDGET.postBandFraction = observeBandFraction(BUDGET.postBandFraction, fraction)
+    savePostFit({ msPerMP: next, bandFraction: BUDGET.postBandFraction })
 }
 
-const ACCENT = '#35e0c2'
-const POS_COLOR = '#35e08a'
-const NEG_COLOR = '#ff5d6c'
+/**
+ * The same benchmark for the text lane: a search reports its own inference time
+ * and the number of cells it ran, so the grid a device gets is sized on what
+ * that device measured rather than on class flags. Takes effect on the NEXT
+ * search (the plan for this one is already spent). Memory still caps cells from
+ * policy — this only ever lowers the ceiling further.
+ */
+const noteDetectCost = () => {
+    const cost = lastDetectCost()
+    if (!cost) return
+    const next = observeDetect(BUDGET.detectorMsPerCell, cost.inferMs, cost.cells)
+    if (!next) return
+    BUDGET.detectorMsPerCell = next
+    BUDGET.detectorMsPerCellSource = 'measured'
+    saveDetectMsPerCell(next)
+    BUDGET.detectorMaxCells = Math.min(BUDGET.detectorMaxCells, affordableCells(BUDGET))
+}
+
+// The mask lane warms at PAGE LOAD (see Boot), not at import. warmUp memoises,
+// so the import path calling it again is free.
+let warmStarted = false
+const ensureWarm = (opts) => {
+    warmStarted = true
+    return warmUp(opts)
+}
+
+const ACCENT = '#53d8ff'
+const POS_COLOR = '#9bf95b'
+const NEG_COLOR = '#f43f5e'
 
 const $ = (id) => document.getElementById(id)
 const els = {
-    main: $('main'), dropzone: $('dropzone'), stage: $('stage'),
+    main: $('main'), dropzone: $('dropzone'), stage: $('stage'), frame: $('frame'),
     photo: $('photo'), view: $('view'), overlay: $('overlay'), file: $('file'),
+    context: $('context'), hint: $('hint'), zoomreset: $('zoomreset'),
     pick: $('pick'), newimg: $('newimg'),
     status: $('status'), loadbar: $('loadbar'),
     prep: $('prep'), prepText: $('prep-text'),
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipModel: $('chip-model'), chipTiming: $('chip-timing'),
-    profileSelect: $('profile-select'),
-    yoloeSelect: $('yoloe-select'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
     signtoggle: $('signtoggle'), textwrap: $('textwrap'), textinput: $('textinput'), selectall: $('selectall'),
-    autocomplete: $('autocomplete'), refine: $('refine'),
+    autocomplete: $('autocomplete'), refine: $('refine'), scope: $('scope'),
     toleranceWrap: $('tolerance-wrap'), tolerance: $('tolerance'), toleranceValue: $('tolerance-value'),
     modes: {
         click: $('mode-click'), box: $('mode-box'),
@@ -149,6 +161,8 @@ const state = {
     textFacetSel: null,       // { axis → Set(value) } chips the user has toggled on
     textMulti: false,         // phrase implied "all/every"
     textBackend: null,        // 'detector:device:dtype' that actually ran the last search
+    textDriven: false,        // this selection came from a detector box, not a pointer
+    boxDrawn: false,          // state.box came from a drag — only then is it drawn
     mask: null,               // DERIVED: baseMask ∪ liveMask — the composed selection
     maskRaw: null,            // baseMask ∪ live raw decoder mask (E toggle)
     showRaw: false,
@@ -158,6 +172,8 @@ const state = {
     baseMask: null,           // ImageData replay of baseFloor+baseOps
     baseOps: [],              // [{op:'add'|'sub', chan:Uint8Array, kind}]
     baseFloor: null,          // flattened overflow of the op stack (Uint8Array)
+    baseFloorBounds: null,    // its extent, so a recompose never rescans the frame
+    baseBounds: null,         // extent of baseMask (union of the ops' extents)
     liveMask: null,           // the object the current clicks/box/lasso describe
     liveRaw: null,
     liveSummary: null,
@@ -169,9 +185,12 @@ const state = {
     runQueued: false,
     eagerEncode: null,        // idle-time encode promise; resolves null when input supersedes it
     encodePending: false,     // idle window was not calm enough; next selection will encode normally
-    modelPull: null,          // transient 'slimsam ⬇ 43%' text while weights stream in
+    modelPull: null,          // transient 'sam21 ⬇ 43%' text while weights stream in
     imageEpoch: 0,            // newest requested import; stale queued files never decode
     preprocessEpoch: 0,       // invalidates a queued idle encode on any user input
+    scope: null,              // { count, index, items } SAM's readings of the current click
+    scopeAt: null,            // [x, y] canonical anchor for the scope control
+    ghost: null,              // { alpha, side } coarse preview of a hovered candidate
 }
 
 // Commit bookkeeping for the headless gate: every finished run records
@@ -191,6 +210,9 @@ const bumpRevision = () => {
     // not-yet-started idle encode from jumping ahead of the user's selection.
     state.preprocessEpoch += 1
     clearHdPatch() // a new selection retires the escalation patch
+    // The scope control describes the PREVIOUS result and is anchored at the
+    // previous prompt; the run about to start replaces both.
+    hideScope()
     cancelBefore(state.revision)
 }
 
@@ -206,7 +228,6 @@ const refreshChips = () => {
     // it's noise here. Only shown once a text search has actually run.
     const textLane = state.textBackend ? ` · text: ${state.textBackend.split(':').slice(0, 2).join('/')}` : ''
     els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}${textLane}`
-    const profile = BUDGET.profile || 'standard'
     const gpu = capability?.gpuTier || 'probing'
     // Only a trusted host budget is shown as a memory figure; a browser's
     // deviceMemory report is unverifiable, so it never appears as a number.
@@ -218,13 +239,13 @@ const refreshChips = () => {
     const vendor = clientState.device === 'webgpu' && clientState.gpuInfo?.vendor
         ? ` (${clientState.gpuInfo.vendor})`
         : ''
-    els.chipDevice.textContent = `device: ${clientState.device || '—'}${vendor} · ${profile} · ${gpu}${memory}`
+    els.chipDevice.textContent = `device: ${clientState.device || '—'}${vendor} · ${gpu}${memory}`
     els.chipDevice.classList.toggle('on', clientState.device === 'webgpu')
     // The registry notepad answers "is it already on this machine?" without
     // touching Cache Storage — ✓ means no download will happen on next use.
     if (els.chipModel) {
         const noted = modelRegistry()
-        const have = ['slimsam', 'yoloe', 'yoloworld'].filter((id) => noted[id])
+        const have = ['sam21', 'yoloe', 'clip'].filter((id) => noted[id])
         els.chipModel.textContent = state.modelPull
             ? `models: ${state.modelPull}`
             : (have.length ? `models: ${have.map((id) => `${id} ✓`).join(' · ')}` : 'models: none cached yet')
@@ -236,31 +257,7 @@ const refreshChips = () => {
             ? `encode ${run.encodeMs}ms · decode ${run.decodeMs}ms · post ${run.postMs}ms`
             : `decode ${run.decodeMs}ms · post ${run.postMs}ms (cached)`)
         : '— ms'
-    if (els.profileSelect) {
-        els.profileSelect.value = profileOverride || 'auto'
-        const autoOpt = els.profileSelect.querySelector('option[value="auto"]')
-        // Auto now APPLIES the capability auto-tier (from GPU + core signals),
-        // not just a suggestion — show the tier it resolved to. A measured-
-        // headroom climb labels itself so 'standard' is visibly earned, not set.
-        const autoName = BUDGET.profileSource === 'auto-climb'
-            ? 'standard — measured'
-            : (BUDGET.memoryLocked ? (capability?.autoTier || 'lite') : profile)
-        if (autoOpt) autoOpt.textContent = `Profile: Auto (${autoName})`
-        // Warn when a manual override goes ABOVE the safe auto ceiling — the
-        // user is vouching for this device, past what the signals prove safe.
-        const overAuto = profileOverride && (PROFILE_RANK[profileOverride] || 0) > (PROFILE_RANK[autoName] || 0)
-        els.profileSelect.title = overAuto
-            ? `Forcing "${profileOverride}" above this device's safe auto tier ("${autoName}"). You're vouching for it — the memory governor still steps back down if it can't keep up.`
-            : 'Resource profile — Auto picks the highest tier this device can safely run; force a tier if you know it can take more.'
-    }
-    if (els.yoloeSelect) {
-        els.yoloeSelect.value = yoloeScaleOverride || 'auto'
-        const autoOpt = els.yoloeSelect.querySelector('option[value="auto"]')
-        if (autoOpt) autoOpt.textContent = BUDGET.yoloe === false ? 'Text: Auto (off)' : `Text: Auto (${BUDGET.detectorScale || 's'})`
-    }
 }
-
-const PROFILE_RANK = { lite: 0, standard8: 1, standard: 2, pro: 3, ultra: 4 }
 
 /** A Phosmith WebView can tighten or expand its usable-memory budget after the
  * editor has loaded. Existing image/model allocations are never enlarged in
@@ -273,19 +270,17 @@ const applyPhosmithResources = (resources = readPhosmithResources()) => {
     const previous = capability
     capability = withPhosmithResources(capability, resources)
     // Pressure is a one-way ratchet: a live budget update never resets it.
-    // recomputeBudget re-checks a latched climb — a trust flip drops it.
-    recomputeBudget()
+    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, null), BUDGET.pressureLevel || 0)
     const memoryReduced = previous.memoryGB > 0 && capability.memoryGB > 0
         && capability.memoryGB < previous.memoryGB
     const needsHeavyRelease = memoryReduced
-        || (PROFILE_RANK[capability.profile] || 0) < (PROFILE_RANK[previous.profile] || 0)
     // A host downgrade is a real resource event, not only a UI-label change:
     // immediately release reloadable residents before the next allocation.
     if (needsHeavyRelease) relievePressure(3).catch(() => {})
     refreshChips()
     if (state.hasImage) {
         const suffix = needsHeavyRelease ? '; heavy GPU residents released' : ''
-        setStatus(`Resource budget updated — ${BUDGET.profile} profile applies to the next import/export${suffix}`)
+        setStatus(`Resource budget updated — applies to the next import/export${suffix}`)
     }
     return capability
 }
@@ -294,58 +289,15 @@ window.addEventListener('phosmithresourceschange', (event) => {
     applyPhosmithResources(event.detail ?? readPhosmithResources())
 })
 
-/** The profile toggle: a deliberate, persisted user choice. 'auto' clears the
- *  override and returns to resolveBudget's estimate; any named tier forces it,
- *  including above the estimate's own 'standard' ceiling — the user is
- *  vouching for their own device here, not a page claiming it for itself. */
-const setProfileOverride = (value) => {
-    const next = VALID_PROFILES.has(value) ? value : null
-    profileOverride = next
-    try {
-        if (next) localStorage.setItem(PROFILE_OVERRIDE_KEY, next)
-        else localStorage.removeItem(PROFILE_OVERRIDE_KEY)
-    } catch { /* private browsing / storage disabled — override stays in-memory only */ }
-    const previousProfile = BUDGET.profile
-    // A manual choice beats a latched climb: after the override resolves,
-    // profileSource is 'manual', climbBudget refuses, and the latch clears.
-    recomputeBudget()
-    const needsHeavyRelease = (PROFILE_RANK[BUDGET.profile] || 0) < (PROFILE_RANK[previousProfile] || 0)
-    if (needsHeavyRelease) relievePressure(3).catch(() => {})
-    refreshChips()
-    if (state.hasImage) {
-        const suffix = needsHeavyRelease ? '; heavy GPU residents released' : ''
-        setStatus(`Resource budget updated — ${BUDGET.profile} profile applies to the next import/export${suffix}`)
-    }
-}
-
-els.profileSelect?.addEventListener('change', (e) => {
-    setProfileOverride(e.target.value === 'auto' ? null : e.target.value)
-})
-
-/** Text-lane scale toggle (parallel to profile): persisted, honored on locked
- *  budgets. s/m/l force the scale; 'off' → YOLO-World open-vocab fallback. */
-const setYoloeScale = (value) => {
-    yoloeScaleOverride = VALID_YOLOE.has(value) ? value : null
-    try {
-        if (yoloeScaleOverride) localStorage.setItem(YOLOE_SCALE_KEY, yoloeScaleOverride)
-        else localStorage.removeItem(YOLOE_SCALE_KEY)
-    } catch { /* storage disabled — in-memory only */ }
-    recomputeBudget()
-    refreshChips()
-}
-els.yoloeSelect?.addEventListener('change', (e) => {
-    setYoloeScale(e.target.value === 'auto' ? null : e.target.value)
-})
-
 subscribe((event) => {
     if (event.type === 'progress') {
         const d = event.detail || {}
         if (d.status === 'progress' && d.total) {
             const pct = Math.round((d.loaded / d.total) * 100)
             els.loadbar.style.width = `${pct}%`
-            // Progress can be SlimSAM or a text detector — name what's pulling.
-            const model = /yolo-?world/i.test(d.name) ? 'YOLO-World'
-                : /clip/i.test(d.name) ? 'CLIP text' : /yoloe/i.test(d.name) ? 'YOLOE' : 'SlimSAM'
+            // Progress can be the mask lane or a text detector — name what's pulling.
+            const model = /clip/i.test(d.name) ? 'CLIP text'
+                : /yoloe/i.test(d.name) ? 'YOLOE' : 'SAM 2.1'
             const mb = Math.max(1, Math.round(d.total / 1e6))
             setStatus(`Downloading ${model} — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~${mb} MB)`)
         } else if (d.status === 'done') {
@@ -376,8 +328,8 @@ subscribe((event) => {
         }
         return
     }
-    if (clientState.ready && (!isModelNoted('slimsam') || clientState.device)) {
-        noteModel('slimsam', clientState.device ? { device: clientState.device } : {})
+    if (clientState.ready && (!isModelNoted('sam21') || clientState.device)) {
+        noteModel('sam21', clientState.device ? { device: clientState.device } : {})
     }
     refreshChips()
     if (clientState.ready && !state.running && !state.hasImage) {
@@ -455,6 +407,16 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
         && preprocessEpoch === state.preprocessEpoch
         && revision === state.revision
     state.eagerEncode = (async () => {
+        // Session already standing (boot): the settle gate below guards session
+        // CREATE, which is paid, so waiting on it only delays the first click.
+        if (encoderReady() && !(BUDGET.pressureLevel || 0)) {
+            if (!current() || document.hidden) return null
+            const r = await encodeImage(els.view, { revision })
+            if (!current() || r?.stale) return null
+            state.encodePending = false
+            if (!state.running) setStatus(`${readyStatus} · prepared locally`)
+            return r
+        }
         await waitForIdle()
         if (!current() || document.hidden) return null
         // Do not stack the proxy encoder immediately behind the model's own
@@ -462,30 +424,33 @@ const scheduleEagerEncode = (imageEpoch, revision, readyStatus) => {
         // the first selection instead of forcing an unsafe memory peak. The
         // baseline profile waits longer for the same reason.
         const lite = BUDGET.profile === 'lite'
-        const calm = await waitForCalm(lite ? { frames: 16, maxWaitMs: 10000 } : { frames: 12, maxWaitMs: 6000 })
-        if (!current()) return null
-        // The governor may have shed between scheduling and now: a speculative
-        // encode on a host already under memory pressure is exactly the peak the
-        // ratchet is trying to avoid, so defer to the (user-initiated) first click.
-        if ((BUDGET.pressureLevel || 0) > 0) {
-            state.encodePending = true
-            return null
+        const window = lite ? { frames: 16, maxWaitMs: 10000 } : { frames: 12, maxWaitMs: 6000 }
+        // The device rarely settles on the FIRST window after a big import,
+        // which is exactly when the encode matters most. Abandoning there left
+        // the whole encoder build + forward pass on the first click. Retry on a
+        // later window instead; a click or a new image bumps revision/epoch and
+        // `current()` drops this on the spot.
+        let calm = false
+        for (let attempt = 0; attempt < 3 && !calm; attempt += 1) {
+            // The governor may have shed since scheduling: a speculative encode
+            // under memory pressure is the peak the ratchet exists to avoid.
+            if ((BUDGET.pressureLevel || 0) > 0) {
+                state.encodePending = true
+                return null
+            }
+            calm = await waitForCalm(window)
+            if (!current()) return null
+            if (!calm) {
+                state.encodePending = true
+                console.warn('[seglab] idle encode deferred — device has not settled', { attempt: attempt + 1 })
+            }
         }
-        if (!calm) {
-            state.encodePending = true
-            console.warn('[seglab] idle encode deferred — device did not settle after model warm')
-            return null
-        }
-        // prime: one throwaway decode initializes the decoder session too.
-        // gpuOnly on an unverified budget: the engine refuses to pay the WASM
-        // lane's multi-GB arena for a prewarm nobody asked for — the first
-        // real click pays it knowingly.
-        const result = await encodeImage(els.view, { revision, prime: true, gpuOnly: BUDGET.memoryLocked === true })
-        if (result?.skipped) {
-            state.encodePending = true
-            console.log('[seglab] eager encode skipped — wasm lane on an unverified device; first selection will encode')
-            return null
-        }
+        if (!calm) return null
+        // The `gpuOnly` guard that used to sit here protected against paying the
+        // WASM lane's multi-GB arena for a prewarm nobody asked for. There is no
+        // WASM lane now — the encode is WebGPU or it does not happen — so the
+        // guard, and the `skipped` reply it waited for, are both gone.
+        const result = await encodeImage(els.view, { revision })
         if (!current() || result?.stale) return null
         state.encodePending = false
         if (!state.running) setStatus(`${readyStatus} · prepared locally`)
@@ -516,11 +481,21 @@ const showImage = async (source, {
     // any new decode starts. Model weights stay; the queue serializes the
     // decode against any still-running kernel.
     clearHeavyQueue()
-    if (warmStarted) releaseDocument()
-    // Headroom measured against the outgoing document must not vouch for this
-    // one (a fresh NEF changes the memory picture); the climb latch stays —
-    // only its freshness-gated extras (warm-export, escalation) re-earn.
-    lastHeadroomAt = 0
+    // Gated on a PRIOR document, not warmStarted: boot warm sets warmStarted
+    // before the first import, and releaseAll would drop the fresh decoder.
+    //
+    // Embeddings ONLY on a swap. releaseAll drops the last session, which takes
+    // the GPU device with it, and a swap is followed immediately by an encode
+    // that has to rebuild device + session + pipeline set — the ~976 MB is
+    // handed straight back and the next click pays for it. Restore-on-reload
+    // makes this the common path, not the rare one: the restored photo sets
+    // hasImage before the user's first import, so the boot-built encoder was
+    // being torn down on essentially every import. Under real pressure the
+    // memory is worth more than the click, so shed properly there.
+    if (state.hasImage) {
+        if (BUDGET.pressureLevel || 0) { releaseDocument(); forgetEncoder() }
+        else releaseEmbeddings()
+    }
 
     // A RAW container's embedded JPEG preview (not the 33 MB sensor payload)
     // becomes the only image decoded during interaction.
@@ -528,9 +503,10 @@ const showImage = async (source, {
         els.prepText.textContent = 'Extracting the camera preview…'
         setStatus('Reading the camera preview — original sensor data stays untouched')
         const preview = await extractRawPreview(source, {
-            // A 1024px interaction proxy never benefits from decoding a larger
-            // embedded thumbnail. Higher trusted profiles can request more.
-            proxyMinEdge: Math.max(768, BUDGET.proxyMax || 1024),
+            // The proxy is sized per AXIS (proxy-plan), so its LONG edge runs
+            // past proxyMax on a non-square frame — ask for a preview big enough
+            // to fill it, or the extra rows would just be upscaled back.
+            proxyMinEdge: Math.max(768, BUDGET.proxyMax || 1024, BUDGET.proxyLongMax || 0),
         })
         if (!imageRequestIsCurrent(imageEpoch)) { hidePrep(epoch); return null }
         if (preview) {
@@ -583,6 +559,7 @@ const showImage = async (source, {
     clearPrompts()
     els.dropzone.style.display = 'none'
     els.stage.classList.add('visible')
+    gestures.reset() // a new photo starts at 1× — inherited pan is disorienting
     const frameMode = transform.proxyActive
         ? `adaptive ${transform.proxyW}×${transform.proxyH} proxy`
         : 'native interaction frame (proxy disabled)'
@@ -595,7 +572,7 @@ const showImage = async (source, {
     // Persist the document now: until the first commit the whole import would
     // otherwise be lost to a power cut.
     persistSession({ immediate: true })
-    // The proxy is on screen; ONLY NOW does SlimSAM warm (queued — it can
+    // The proxy is on screen; ONLY NOW does the mask lane warm (queued — it can
     // never overlap the decode that just released its bitmaps). On an
     // UNVERIFIED budget the warm itself waits one settle window too, so
     // session-create + GPU pipeline compile never bursts while the import is
@@ -604,7 +581,10 @@ const showImage = async (source, {
     // never sees an encode op before its warm op.
     hidePrep(epoch)
     const startEngine = async () => {
-        if (BUDGET.memoryLocked) await new Promise((resolve) => setTimeout(resolve, 1200))
+        // The 1200 ms memoryLocked stagger that sat here guarded session-create
+        // against the import flush. Boot warm builds the decoder long before an
+        // import, so it delayed only the encode; the encoder's own build is
+        // still gated by the calm window below.
         try { await ensureWarm() } catch (err) {
             console.warn('[seglab] model warm failed (first selection will retry):', err?.message)
         }
@@ -638,7 +618,17 @@ const loadFile = async (file) => {
             console.log('[seglab][ui] raw-import-start', { name: file.name, bytes: file.size })
             return await queueImage(file, { raw: true, sourceBytes: file.size }, imageEpoch)
         }
-        if (!file.type?.startsWith('image/')) return
+        // A blank `type` is common and does NOT mean "not an image": drags from
+        // some apps, files the OS has no registered type for, and several RAW
+        // siblings all arrive that way. Returning on it dropped the import with
+        // no import, no error and no status change — the app just looked dead.
+        // Let the decoder be the judge; a genuine non-image rejects below and
+        // the catch says so.
+        if (file.type && !file.type.startsWith('image/')) {
+            setStatus(`That file is ${file.type}, not an image.`)
+            return
+        }
+        if (!file.type) console.warn('[seglab][ui] file arrived with no MIME type; decoding by content', { name: file.name })
         // Hand the compressed File straight to asset-store — it decodes only a
         // ≤proxyMax proxy (never the full-res frame) and keeps the Blob for
         // bounded re-decodes. EXIF orientation is honoured inside importOriginal.
@@ -694,7 +684,19 @@ const buildDemoScene = (longSide = DEMO.baseW) => {
     return c
 }
 
-els.pick.addEventListener('click', () => els.file.click())
+// A photo is coming: file dialog open, file dragged over the window, stage
+// cleared for the next one. Boot warm may since have been given back — the host
+// exits after 120 s idle and the governor sheds under pressure — and without
+// this the whole rebuild lands on the first click instead of on this moment.
+const warmOnIntent = async () => {
+    if (clientState.ready && encoderReady()) return
+    const cap = await bootProbe
+    if (!cap?.webgpu || !cap.f16 || cap.fallback || document.hidden) return
+    ensureWarm({ speculative: true }).catch(() => null)
+    warmEncoder({ speculative: true }).catch(() => null)
+}
+
+els.pick.addEventListener('click', () => { warmOnIntent(); els.file.click() })
 els.file.addEventListener('change', () => {
     const file = els.file.files?.[0]
     // Selecting the same file twice is a new import request too.
@@ -704,7 +706,7 @@ els.file.addEventListener('change', () => {
 els.newimg.addEventListener('click', () => {
     beginImageRequest() // invalidate a queued file/idle encode before cleanup
     clearHeavyQueue()
-    if (warmStarted) releaseDocument()
+    if (state.hasImage) { releaseDocument(); forgetEncoder() }   // releaseAll drops the session too
     state.hasImage = false
     hidePrep()
     clearPrompts()
@@ -712,9 +714,10 @@ els.newimg.addEventListener('click', () => {
     els.stage.classList.remove('visible')
     els.dropzone.style.display = ''
     setStatus('Idle — import a photo to begin')
+    warmOnIntent()   // after the release above, or it would warm what this drops
 })
 
-window.addEventListener('dragover', (e) => { e.preventDefault(); els.dropzone.classList.add('drag') })
+window.addEventListener('dragover', (e) => { e.preventDefault(); warmOnIntent(); els.dropzone.classList.add('drag') })
 window.addEventListener('dragleave', () => els.dropzone.classList.remove('drag'))
 window.addEventListener('drop', (e) => {
     e.preventDefault()
@@ -728,18 +731,13 @@ window.addEventListener('paste', (e) => {
 
 const shedMemory = (level, { announce = true } = {}) => {
     const previous = BUDGET.pressureLevel || 0
-    // Real pressure permanently cancels headroom climbing this session, and
-    // "down always wins" includes the climbed tier itself: demote the base back
-    // to the auto tier FIRST so the ratchet floors apply to standard8's caps,
-    // not the climbed standard's higher ones.
-    climbPoisoned = true
-    lastHeadroomAt = 0
-    if (climbLatched) {
-        climbLatched = false
-        recomputeBudget()
-    }
     BUDGET = applyMemoryPressure(BUDGET, level)
     if ((BUDGET.pressureLevel || 0) >= 2) disposeCvRefine() // idle wasm worker goes first
+    // The policy change above only governs the NEXT search; a worker already
+    // resident keeps its arena until it is terminated, and on WebKit that arena
+    // is the largest thing the app is holding. Skipped while a search is in
+    // flight — see disposeDetectorIfIdle.
+    if (level >= 1) disposeDetectorIfIdle()
     if (announce && BUDGET.pressureLevel > previous) {
         if (BUDGET.pressureLevel >= 3) {
             setStatus('Memory pressure detected — running in safe mode.')
@@ -751,52 +749,110 @@ const shedMemory = (level, { announce = true } = {}) => {
         }
         refreshChips()
     }
-    return relievePressure(level).catch(() => []).then((freed) => {
-        // The engine op frees ORT's allocations, but the worker's grown wasm
-        // Memory stays mapped (wasm memory never shrinks) — at L3 on the wasm
-        // lane the worker itself is recycled; termination returns it to the OS.
-        if ((BUDGET.pressureLevel || 0) >= 3 && clientState.device === 'wasm' && recycleWorker('pressure')) {
-            state.encodePending = true
-            freed.push('worker')
-        }
-        return freed
-    })
+    // L1 does not touch the lane: releaseEncoder returns 37 MB (§LEDGER_MB) and
+    // costs a full rebuild on the next click — 0.9-19.9 s of Metal shader
+    // compile on WebKit. The detector above is the real L1 win. L2 releases the
+    // 976 MB device pool, which is worth a rebuild. forgetEncoder moves with it,
+    // or encoderReady() keeps claiming a session that is gone.
+    if (level < 2) return Promise.resolve([])
+    forgetEncoder()
+    return relievePressure(level).catch(() => [])
 }
 
-// Backgrounded tab → drop the detector (cheap to reload). Deliberately NOT
-// shedMemory: the pressure ratchet is one-way, so ratcheting here would let a
-// single tab switch permanently disable eager-encode, the GPU detector lane
-// and the headroom climb for the whole session. Housekeeping, not pressure.
+// Backgrounded tab → drop the detector (cheap to reload) and stop optional
+// detail escalation. The full image remains a compressed Blob, not RGBA RAM.
 document.addEventListener('visibilitychange', () => {
-    if (document.hidden && state.hasImage) relievePressure(1).catch(() => {})
+    if (document.hidden && state.hasImage) shedMemory(1, { announce: false })
 })
 
 // Runtime memory governor — the real safety net (memory-governor.js). It reads
 // measured agent-cluster bytes (measureUserAgentSpecificMemory, sees WASM),
 // timer drift (device swap signal) and JS heap; the old JS-heap-only watchdog
-// was blind to the WASM/GPU memory that actually OOMs the app. onHeadroom is
-// the tier-climb signal: PROVEN sustained headroom (real bytes well under
-// budget, no drift, 4 clean cycles) raises a live standard8 auto-tier one step
-// to 'standard' (policy.climbBudget) — the only path an unverified browser has
-// above standard8. Any pressure event poisons climbing for the session.
+// was blind to the WASM/GPU memory that actually OOMs the app. onHeadroom is the
+// tier-climb signal (wired to the adaptive tier in a later step); for now it is
+// telemetry only.
 const DEBUG = /[?&]debug=1\b/.test(location.search)
+
+/* Allocation ledger — the governor's only input on WebKit.
+ *
+ * Both byte APIs the governor reads (`measureUserAgentSpecificMemory`,
+ * `performance.memory`) are Chromium-only, so on Safari and Firefox
+ * `decidePressure` was left with timer drift alone. Drift is an OS-swap signal;
+ * WebKit reaps a tab against a per-WebContent-PROCESS footprint limit, which is
+ * reached with the machine nowhere near swap ("This webpage was reloaded because
+ * it was using significant memory"). The two are decoupled, so the whole shed
+ * ladder — relievePressure L1–L3 — was unreachable on the engine that needs it.
+ *
+ * The app cannot observe that ceiling. It CAN account for what it allocated, and
+ * the dominant terms are step functions the lane already reports. Anchors are the
+ * lane's own measurement triplet (js/sam21-lane.js releaseIdle, all-Chrome, one
+ * tab, canonical NEF) plus the host's exit figure:
+ *
+ *   encoder live                       2096 MB
+ *   releaseEncoder()  (device held)    2059 MB   -37 MB   → encoderSession
+ *   releaseAll()      (device dropped) 1120 MB  -976 MB   → devicePool
+ *   worker exit                         446 MB  -674 MB   → workerWarm
+ *
+ * Coarse and device-independent by construction — a ladder needs the ordering to
+ * be right, not the absolute. On non-Chromium this legitimately sits at or over
+ * the 1900 MB budget whenever an encoder is live, and the resulting L1/L2 posture
+ * (no detector, no eager encode, no escalation, crops ≤ 1280) is the INTENDED
+ * consequence, not an accident: it matches the independent evidence that WebKit
+ * cannot take the crop path or the text lane.
+ */
+const LEDGER_MB = { base: 260, workerWarm: 674, devicePool: 976, encoderSession: 37 }
+let laneStatus = () => null
+import('./sam21-client.js').then((m) => { laneStatus = m.hostStatus }).catch(() => { /* lane not up */ })
+
+const estimateFootprintMB = () => {
+    const s = laneStatus() || null
+    const lane = s?.lane || null
+    let mb = LEDGER_MB.base
+    if (s) {
+        // A worker that has ever built an encoder holds ORT's arena until it
+        // EXITS; releasing sessions does not give it back (host §1.4).
+        if (s.builtEncoder) mb += LEDGER_MB.workerWarm
+        // The pool is pinned by the DEVICE, and any session holds the device —
+        // which is why the 9.9 MB decoder is not a cheap anchor.
+        if (lane?.encoder || lane?.decoder) mb += LEDGER_MB.devicePool
+        if (lane?.encoder) mb += LEDGER_MB.encoderSession
+    }
+    // The text lane is a SEPARATE worker with its own ORT arena, and it was
+    // missing from the ledger entirely — on WebKit, where the ledger is the only
+    // input, the lane that peaks near a gigabyte was the one thing the governor
+    // could not see. Freed only by terminating the worker, so residency tracks
+    // the worker (sam-client §DETECT_RESIDENT_MB).
+    mb += detectorResidentMB()
+    // Buffers the app sizes itself, so these are exact rather than anchored.
+    const px = (w, h) => ((w || 0) * (h || 0) * 4) / (1024 * 1024)
+    mb += px(els.view?.width, els.view?.height)
+    mb += px(els.overlay?.width, els.overlay?.height)
+    mb += px(els.photo?.naturalWidth, els.photo?.naturalHeight)   // decoded preview
+    const tf = getTransform?.()
+    if (tf?.workingActive) mb += px(tf.workingW, tf.workingH)
+    // Overlay layer cache: tinted fill + border ring, both frame-sized.
+    if (layerCache?.fill) mb += 2 * px(els.overlay?.width, els.overlay?.height)
+    // The selection. Everything above is a step function, so without this the
+    // estimate cannot respond to the user WORKING at all — the shape of the
+    // reported WebKit reap. An op is 1 byte/px; the composed frames are RGBA.
+    const chanMB = ((els.view?.width || 0) * (els.view?.height || 0)) / (1024 * 1024)
+    mb += chanMB * (state.baseOps.length + (state.baseFloor ? 1 : 0))
+    for (const m of [state.baseMask, state.mask, state.maskRaw, state.liveMask, state.liveRaw]) {
+        if (m) mb += px(m.width, m.height)
+    }
+    return mb
+}
+
 const governor = createMemoryGovernor({
     getBudget: () => BUDGET,
+    getEstimateMB: estimateFootprintMB,
     isActive: () => state.hasImage && !document.hidden,
     onPressure: (level) => shedMemory(level, { announce: level >= 2 }),
     onHeadroom: () => {
-        // Freshness stamp first — the export/escalation predicates treat recent
-        // proven headroom as the license to keep/spend more transient memory.
-        lastHeadroomAt = Date.now()
+        // Placeholder until adaptive tiering consumes it. Proven headroom means
+        // the device is comfortably under its tier budget with no swap.
+        if (DEBUG) console.log('[seglab][governor] headroom proven — climb candidate')
         window.__seglabHeadroom = (window.__seglabHeadroom || 0) + 1
-        if (climbLatched || climbPoisoned) return
-        const next = climbBudget(location.search, capability, yoloeScaleOverride, BUDGET)
-        if (!next) return
-        BUDGET = next
-        climbLatched = true
-        refreshChips()
-        if (DEBUG) console.log('[seglab][governor] headroom proven — climbed to standard')
-        setStatus('Headroom verified — export quality raised to standard (applies to the next export/import)')
     },
     onSample: DEBUG ? (s) => console.log('[seglab][governor]', s) : undefined,
 })
@@ -823,9 +879,7 @@ const hibernateEngine = () => {
     samIdleTimer = null
     if (!state.hasImage) return
     if (state.running) { samIdleTimer = setTimeout(hibernateEngine, 5000); return } // busy — retry
-    relievePressure(3)
-        .then(() => { if (clientState.device === 'wasm') recycleWorker('hibernate') })
-        .catch(() => {})
+    relievePressure(3).catch(() => {})
     state.encodePending = true // next selection rebuilds + re-encodes; status reflects it
     if (DEBUG) console.log('[seglab] idle hibernate — session arena released; next selection rebuilds')
 }
@@ -843,7 +897,15 @@ for (const ev of ['pointerdown', 'pointerup', 'keydown', 'wheel']) {
 // Modes where include/exclude applies — via the sign toggle or right/Alt-click.
 const SIGN_MODES = new Set(['click', 'magic', 'color', 'region', 'rect', 'ellipse', 'polygon'])
 
+const TEXT_LANE = probeTextLane()
+const TEXT_LANE_REFUSAL = 'Text search is switched off for this session (?text=0).'
+if (!TEXT_LANE.ok) {
+    els.modes.text.disabled = true
+    els.modes.text.title = TEXT_LANE_REFUSAL
+}
+
 const setMode = (mode) => {
+    if (mode === 'text' && !TEXT_LANE.ok) { setStatus(TEXT_LANE_REFUSAL); return }
     if (mode !== 'polygon') state.polygonDraft = []
     state.mode = mode
     for (const [name, btn] of Object.entries(els.modes)) {
@@ -853,11 +915,16 @@ const setMode = (mode) => {
     els.toleranceWrap.hidden = mode !== 'magic' && mode !== 'color'
     els.textwrap.hidden = mode !== 'text'
     els.selectall.hidden = mode !== 'text' || state.textCandidates.length === 0
+    syncContextRow()
     if (mode !== 'text') { hideAutocomplete(); clearRefine() }
     if (mode === 'text') {
         els.textinput.focus()
         void hintTextSearch()
+        // Intent signal: pull the detector's weights while the phrase is typed,
+        // rather than at boot (a session that never searches must not pay).
+        prefetchTextLane()
     }
+    renderOverlay() // each tool shows only its own marks (ownTool)
 }
 els.modes.click.addEventListener('click', () => setMode('click'))
 els.modes.box.addEventListener('click', () => setMode('box'))
@@ -895,10 +962,12 @@ const refreshButtons = () => {
 function clearPrompts() {
     state.clicks = []
     state.box = null
+    state.boxDrawn = false
     state.lasso = null
     state.manual = null
     state.polygonDraft = []
     state.textCandidates = []
+    state.textDriven = false
     clearRefine()
     state.mask = null
     state.maskRaw = null
@@ -906,6 +975,8 @@ function clearPrompts() {
     state.baseMask = null
     state.baseOps = []
     state.baseFloor = null
+    state.baseFloorBounds = null
+    state.baseBounds = null
     clearLive()
     state.score = 0
     state.drag = null
@@ -953,6 +1024,13 @@ const undoPrompt = () => {
 els.undo.addEventListener('click', undoPrompt)
 els.reset.addEventListener('click', () => { clearPrompts(); setStatus('Cleared') })
 window.addEventListener('keydown', (e) => {
+    // Shortcuts are single letters, and the search box takes free text — so
+    // typing "rose" was firing r (clear prompts) and e (raw toggle), and Enter
+    // in that box could close a polygon. A window-level listener has to check
+    // where the key actually went.
+    const t = e.target
+    if (t && (t.isContentEditable || /^(input|textarea|select)$/i.test(t.tagName || ''))) return
+    if (e.metaKey || e.ctrlKey || e.altKey) return
     if (e.key === 'Enter' && state.mode === 'polygon' && state.polygonDraft.length >= 3) {
         e.preventDefault()
         finishPolygon()
@@ -970,7 +1048,183 @@ window.addEventListener('keydown', (e) => {
         renderOverlay()
         setStatus(state.showRaw ? 'Showing RAW decoder mask (E to toggle back)' : 'Showing refined mask')
     }
+    // SAM answers every click with three masks — subpart, part, whole — and one
+    // point on a rose makes "the petal" and "the bloom" equally correct. No
+    // scoring rule resolves that; only the user knows which they meant.
+    // Arbitration picks the default, this walks the rest. C grows the
+    // selection, shift+C shrinks it, and neither costs a decode: the planes are
+    // already in memory, so this is an upsample and a guided filter.
+    if (e.key === 'c' || e.key === 'C') cycleSelection(e.shiftKey ? -1 : 1)
 })
+
+/* ─── Scope control — SAM's other readings of the same click ───────────────
+ *
+ * One point on a rose makes "the petal" and "the bloom" equally correct, and
+ * §10a establishes that no ranking rule picks between them: measured on one
+ * click at confidence 0.94, the three candidates covered 1.9 / 6.3 / 13.2 % of
+ * the frame. That is the "it left parts out" complaint, and it is a UI problem
+ * — the right answer was always in memory, reachable only by knowing to press
+ * C. This surfaces the choice at the click, sized so the user can see which is
+ * which before committing to one.
+ *
+ * A repaint, not a decode: picking a candidate re-runs only the post pipeline
+ * over a parked plane. Hovering costs even less — a 256² threshold, no
+ * upsample and no guided filter (sam21-adapter §sam21CandidateShape). */
+
+const previewCandidate = (index) => {
+    state.ghost = index === null ? null : candidateShape(index)
+    renderOverlay()
+}
+
+/** Anchor the control at the prompt the user actually made. */
+const scopeAnchor = () => {
+    let last = state.clicks[state.clicks.length - 1]
+    for (let i = state.clicks.length - 1; i >= 0; i -= 1) {
+        if (state.clicks[i][2] === 1) { last = state.clicks[i]; break }
+    }
+    if (last) return [last[0], last[1]]
+    if (state.box) return [(state.box[0] + state.box[2]) / 2, state.box[3]]
+    return null
+}
+
+/** Canvas pixels per CSS pixel — the overlay is the image's own size, so a
+ *  gesture threshold in CSS px has to be converted before it means anything. */
+const overlayScale = () => {
+    const rect = els.overlay.getBoundingClientRect()
+    return rect.width ? [els.overlay.width / rect.width, els.overlay.height / rect.height] : [1, 1]
+}
+
+const scopeControl = els.scope ? createScopeControl({
+    mount: els.scope,
+    surface: els.overlay,
+    // Click mode only: every other tool owns the drag and the wheel.
+    enabled: () => !state.running && !!state.liveMask && state.mode === 'click',
+    inside: (x, y) => {
+        if (!state.liveMask) return false
+        const [kx, ky] = overlayScale()
+        return pointInMask(state.liveMask, x * kx, y * ky)
+    },
+    geometry: () => {
+        // Stage space, not overlay space: the overlay rides inside the zoom
+        // frame, so under any zoom or pan its box is offset from the control's
+        // positioning context. getBoundingClientRect already reports the
+        // transformed box, so the scale factors need no zoom term of their own.
+        const rect = els.overlay.getBoundingClientRect()
+        const host = els.stage.getBoundingClientRect()
+        if (!rect.width || !state.scopeAt) return null
+        const ox = rect.left - host.left
+        const oy = rect.top - host.top
+        // Fall back to the click when the mask has not been rasterised yet.
+        const bounds = layerCache.bounds && layerCache.mask
+            ? [oy + layerCache.bounds[1] * (rect.height / layerCache.mask.height),
+                oy + layerCache.bounds[3] * (rect.height / layerCache.mask.height)]
+            : null
+        return {
+            anchor: [ox + state.scopeAt[0] * (rect.width / els.overlay.width),
+                oy + state.scopeAt[1] * (rect.height / els.overlay.height)],
+            bounds,
+            width: host.width,
+            height: host.height,
+            // The swatches are painted from a square resize of the FRAME, so
+            // the un-squash factor is the photo's box — the stage only happens
+            // to match it while it hugs the photo.
+            aspect: rect.width / rect.height,
+        }
+    },
+    onPick: (i) => selectScope(i),
+    onPreview: (i) => previewCandidate(i),
+    // The swatches are drawn from the same parked fields the hover preview
+    // uses — a 256² threshold each, no upsample and no guided filter.
+    shape: (i) => candidateShape(i),
+}) : null
+
+/* ─── View gestures ───────────────────────────────────────────────────────
+ * Zoom and pan live outside this module because the bindings are a property of
+ * the DEVICE, not of the tool: the same two-finger movement is a scope step
+ * over the selection, a pan on a trackpad, and a pinch on glass. */
+const gestures = createGestures({
+    stage: els.stage,
+    frame: els.frame,
+    surface: els.overlay,
+    hint: els.hint,
+    readout: els.zoomreset,
+    active: () => state.hasImage,
+    // A second finger is a view gesture, never a stroke: drop whatever the
+    // first one started, before it commits a mask nobody asked for.
+    onGestureStart: () => {
+        if (!state.drag && !state.brush) return
+        clearLongPress()
+        state.drag = null
+        state.brush = null
+        renderOverlay()
+    },
+    onZoom: () => { if (state.scope) scopeControl?.place() },
+})
+
+/** The sign toggle is the touch stand-in for a second mouse button. On a
+ *  pointer device right/⌥-click already says it, so it is one control fewer. */
+const wantsSign = () => SIGN_MODES.has(state.mode) && document.body.dataset.input === 'touch'
+const syncContextRow = () => {
+    els.context.classList.toggle(
+        'on',
+        wantsSign() || state.mode === 'magic' || state.mode === 'color' || state.mode === 'text',
+    )
+}
+syncContextRow()
+
+const hideScope = () => {
+    state.scope = null
+    state.scopeAt = null
+    if (state.ghost) { state.ghost = null; renderOverlay() }
+    scopeControl?.hide()
+}
+
+const renderScope = () => {
+    // One reading is not a choice, and a committed-only selection has no live
+    // object to re-read. Both mean there is nothing to offer.
+    if (!state.scope || state.scope.count < 2 || !state.liveMask || !state.scopeAt) { hideScope(); return }
+    scopeControl?.update(state.scope)
+}
+
+
+/** Adopt a repainted candidate — shared by the pointer and the C key. */
+const adoptCandidate = (res) => {
+    state.ghost = null
+    state.liveMask = res.imageData
+    state.liveRaw = res.rawImageData
+    state.liveSummary = res.summary
+    recomposeMask()
+    state.score = res.score
+    state.scope = res.candidates || state.scope
+    renderOverlay()
+    refreshButtons()
+    renderScope()
+    const c = res.candidates
+    const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
+    const at = c ? ` (${c.index + 1} of ${c.count})` : ''
+    setStatus(`Selected ${(coverage * 100).toFixed(1)}% of frame${at} · pick a shape, or scroll over the selection`)
+}
+
+function selectScope(index) {
+    if (state.running || !state.liveMask || index === state.scope?.index) return
+    const res = pickCandidate(index)
+    if (res) adoptCandidate(res)
+}
+
+/** The keyboard path into the scope control. Clamps like every other one — a
+ *  selection that jumps from the whole subject back to a speck reads as a bug. */
+function cycleSelection(delta) {
+    if (state.running || !state.liveMask || !state.scope) return
+    const want = stepScope(state.scope.index, delta, state.scope.count)
+    if (want === state.scope.index) {
+        setStatus(delta > 0 ? 'Nothing larger for this click' : 'Nothing smaller for this click')
+        return
+    }
+    const res = pickCandidate(want)
+    if (res) adoptCandidate(res)
+}
+
+addEventListener('resize', () => { if (state.scope) scopeControl?.place() })
 
 /* ─── Pointer handling ───────────────────────────────────────────────────── */
 
@@ -1004,17 +1258,41 @@ const ellipseMask = ([x0, y0, x1, y1]) => manualMask((ctx) => {
 
 // Union two white-on-black masks per-pixel max, so the refined soft boundary
 // band survives composition (a hard 0/255 write would harden every edge).
-const softUnion = (base, patch) => {
+/** Smallest rect covering both, either of which may be absent. Ends exclusive. */
+const unionBounds = (a, b) => {
+    if (!a) return b || null
+    if (!b) return a
+    return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]
+}
+
+// Opaque black as one RGBA word, packed through a byte view so the fill does
+// not assume a little-endian platform.
+const OPAQUE_BLACK = (() => {
+    const b = new Uint8Array(4)
+    b[3] = 255
+    return new Uint32Array(b.buffer)[0]
+})()
+
+const softUnion = (base, patch, patchBounds = null) => {
     const w = patch.width
     const h = patch.height
-    const out = base && base.width === w && base.height === h
-        ? new ImageData(new Uint8ClampedArray(base.data), w, h)
-        : new ImageData(w, h)
+    const hasBase = base && base.width === w && base.height === h
+    const out = hasBase ? new ImageData(new Uint8ClampedArray(base.data), w, h) : new ImageData(w, h)
     const o = out.data
     const p = patch.data
-    for (let i = 0; i < p.length; i += 4) {
-        if (p[i] > o[i]) { o[i] = p[i]; o[i + 1] = p[i + 1]; o[i + 2] = p[i + 2] }
-        o[i + 3] = 255
+    // Alpha is 255 everywhere in this convention, so a fresh buffer still needs
+    // one pass — but a copied base already carries it, and then only the patch's
+    // own extent has anything to say.
+    if (!hasBase) { const words = new Uint32Array(o.buffer); words.fill(OPAQUE_BLACK) }
+    const [x0, y0, x1, y1] = hasBase && patchBounds
+        ? [Math.max(0, patchBounds[0]), Math.max(0, patchBounds[1]), Math.min(w, patchBounds[2]), Math.min(h, patchBounds[3])]
+        : [0, 0, w, h]
+    for (let y = y0; y < y1; y += 1) {
+        const row = y * w
+        for (let x = x0; x < x1; x += 1) {
+            const i = (row + x) * 4
+            if (p[i] > o[i]) { o[i] = p[i]; o[i + 1] = p[i + 1]; o[i + 2] = p[i + 2] }
+        }
     }
     return out
 }
@@ -1027,8 +1305,9 @@ const recomposeBase = () => {
     const W = els.view.width
     const H = els.view.height
     if (!state.baseOps.length && !state.baseFloor) { state.baseMask = null; return }
-    const res = composeChannels(state.baseOps, W, H, state.baseFloor)
+    const res = composeChannels(state.baseOps, W, H, state.baseFloor, state.baseFloorBounds)
     state.baseMask = res ? new ImageData(res.rgba, W, H) : null
+    state.baseBounds = res ? res.bounds : null
 }
 
 const pushBaseOp = (op, imageData, kind, { dilate = 0 } = {}) => {
@@ -1038,13 +1317,23 @@ const pushBaseOp = (op, imageData, kind, { dilate = 0 } = {}) => {
     const chan = dilate
         ? dilateChannel(maskToChannel(imageData), imageData.width, imageData.height, dilate)
         : maskToChannel(imageData)
-    state.baseOps.push({ op, chan, kind })
+    // Measured once, here — every later recompose reads it instead of scanning
+    // the frame again, and there is one recompose per click, undo and restore.
+    const bounds = channelBounds(chan, imageData.width, imageData.height)
+    state.baseOps.push({ op, chan, kind, bounds })
     if (state.baseOps.length > MAX_BASE_OPS) {
         const oldest = state.baseOps.shift()
         const floor = state.baseFloor || new Uint8Array(els.view.width * els.view.height)
-        if (oldest.op === 'sub') { for (let i = 0; i < floor.length; i += 1) if (oldest.chan[i] >= 128) floor[i] = 0 }
-        else { for (let i = 0; i < floor.length; i += 1) if (oldest.chan[i] > floor[i]) floor[i] = oldest.chan[i] }
+        const [x0, y0, x1, y1] = oldest.bounds || [0, 0, els.view.width, els.view.height]
+        const W = els.view.width
+        for (let y = y0; y < y1; y += 1) {
+            const row = y * W
+            if (oldest.op === 'sub') { for (let x = x0; x < x1; x += 1) if (oldest.chan[row + x] >= 128) floor[row + x] = 0 }
+            else for (let x = x0; x < x1; x += 1) if (oldest.chan[row + x] > floor[row + x]) floor[row + x] = oldest.chan[row + x]
+        }
         state.baseFloor = floor
+        // A subtract can only clear, so the floor's extent never grows on one.
+        if (oldest.op !== 'sub') state.baseFloorBounds = unionBounds(state.baseFloorBounds, oldest.bounds)
     }
     recomposeBase()
 }
@@ -1093,6 +1382,7 @@ const restoreSession = async () => {
         if (sameFrame && saved.mask) {
             state.baseOps = []
             state.baseFloor = saved.mask
+            state.baseFloorBounds = channelBounds(saved.mask, saved.w, saved.h)
             recomposeBase()
             recomposeMask()
             renderOverlay()
@@ -1112,17 +1402,59 @@ const restoreSession = async () => {
     }
 }
 
+/**
+ * Regularise the composed selection, in place.
+ *
+ * Two objects selected one after the other each stop a pixel short of the edge
+ * they share, so their union keeps a hairline of background along it — and the
+ * outline, being a dilation of the mask, then draws a border THROUGH the middle
+ * of what the user selected as one thing. Measured on six adjacent cubes: 26
+ * enclosed slivers, and a boundary a third longer than the shape needs.
+ *
+ * Both are properties of the UNION, not of any one object, so they are
+ * re-derived here on every recompose and never baked into an op — undo and
+ * subtract keep working on exactly what the tools committed.
+ */
+const regularizeMask = (mask, bbox) => {
+    const long = Math.max(mask.width, mask.height)
+    // Half a decoder cell (the grid is 256²): a gap that narrow is two decodes
+    // disagreeing about one cell, not background the user wants kept. A full
+    // cell (r=3 at this frame) starts closing real pockets between objects.
+    const filled = bridgeGaps(mask.data, mask.width, mask.height,
+        { radius: Math.max(1, Math.round(long / 512)), rect: bbox })
+    // Manual geometry is exact by contract — a drawn rectangle keeps its
+    // corners. Only a decoded boundary carries the wobble worth averaging out.
+    const changed = state.manual ? 0 : smoothBoundary(mask.data, mask.width, mask.height,
+        { radius: Math.max(1, Math.round(long / 1024)), rect: bbox })
+    return filled || changed
+}
+
 /** Rebuild the composed truth (state.mask/maskSummary) from base ∪ live. */
 const recomposeMask = () => {
+    // Where the union can possibly be: the committed ops' extent plus the live
+    // object's. Both are already known, so neither the union nor the summary
+    // has to look at the rest of the frame. Ends exclusive; a null means "not
+    // known", which falls back to the whole frame.
+    const liveBounds = state.liveSummary?.softBox || null
     if (state.liveMask) {
-        state.mask = softUnion(state.baseMask, state.liveMask)
+        state.mask = softUnion(state.baseMask, state.liveMask, liveBounds)
     } else if (state.baseMask) {
         state.mask = new ImageData(new Uint8ClampedArray(state.baseMask.data), state.baseMask.width, state.baseMask.height)
     } else {
         state.mask = null
     }
-    state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw) : null
-    state.maskSummary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height) : null
+    state.maskRaw = state.liveRaw ? softUnion(state.baseMask, state.liveRaw, liveBounds) : null
+    // unionBounds keeps a null (unknown) side null, so an untracked piece still
+    // widens the scan back to the whole frame.
+    const scan = state.liveMask ? unionBounds(state.baseBounds, liveBounds) : state.baseBounds
+    let summary = state.mask ? summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height, scan) : null
+    if (summary?.bbox && regularizeMask(state.mask, summary.bbox)) {
+        // Regularisation only rewrites inside the bbox it was handed, so the
+        // second summary needs no more than that same window.
+        const rect = [summary.bbox[0], summary.bbox[1], summary.bbox[2] + 1, summary.bbox[3] + 1]
+        summary = summarizeMaskRGBA(state.mask.data, state.mask.width, state.mask.height, rect)
+    }
+    state.maskSummary = summary
     persistSession() // debounced + snapshot-at-write: a drag costs one save
 }
 
@@ -1130,6 +1462,26 @@ const clearLive = () => {
     state.liveMask = null
     state.liveRaw = null
     state.liveSummary = null
+    hideScope()
+}
+
+/**
+ * Start a NEW live object. Every tool that opens a fresh SAM prompt set goes
+ * through here, because two things have to happen together and used to happen
+ * in only some of the places:
+ *
+ *   the finished object COMMITS — it is part of the visible selection, so a
+ *   box drawn after a click must not unselect what the click selected
+ *   its prompts GO WITH IT — carried over, the old box/clicks keep shipping the
+ *   old object's extent, so the decode is asked for two objects at once
+ */
+const beginNewObject = () => {
+    if (state.liveMask) pushBaseOp('add', state.liveMask, 'click')
+    clearLive()
+    state.clicks = []
+    state.box = null
+    state.boxDrawn = false
+    state.lasso = null
 }
 
 const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
@@ -1137,15 +1489,10 @@ const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
     // must never wipe an existing selection.
     if (!summarizeMaskRGBA(imageData.data, imageData.width, imageData.height).bbox) return
     const hadMask = !!(state.maskSummary && state.maskSummary.bbox)
-    // A live SAM object is part of the visible selection — keep it.
-    if (state.liveMask) pushBaseOp('add', state.liveMask, 'click')
+    beginNewObject()                       // the live SAM object commits with it
     pushBaseOp(negative ? 'sub' : 'add', imageData, kind)
-    state.clicks = []
-    state.box = null
-    state.lasso = null
     state.textCandidates = []
     clearRefine()
-    clearLive()
     state.manual = state.baseMask ? { kind, ...geometry } : null
     recomposeMask()
     state.score = 0
@@ -1243,6 +1590,8 @@ const commitBrushMask = () => {
     // the final whole-selection result: flatten the stack to this one op.
     state.baseOps = []
     state.baseFloor = null
+    state.baseFloorBounds = null
+    state.baseBounds = null
     state.baseMask = null
     clearLive()
     if (summary.bbox) pushBaseOp('add', imageData, 'brush')
@@ -1325,13 +1674,38 @@ const eventNegative = (e) => e.button === 2 || e.altKey || state.sign === 0
 
 els.overlay.addEventListener('contextmenu', (e) => e.preventDefault())
 
+/* Touch has no second button and no modifier key. A press that stays put turns
+ * the tap into an exclude — the same thing right/⌥-click does for a pointer,
+ * and the only exclude gesture that needs no visible control. Click mode only:
+ * every other tool commits on the press or owns the drag. */
+const LONG_PRESS_MS = 480
+let longPressTimer = null
+const clearLongPress = () => {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null }
+}
+const armLongPress = () => {
+    clearLongPress()
+    longPressTimer = setTimeout(() => {
+        longPressTimer = null
+        const d = state.drag
+        if (!d || d.kind !== 'tap' || d.moved || d.negative) return
+        d.negative = true
+        navigator.vibrate?.(12)
+        setStatus('Exclude — lift your finger to remove this from the selection')
+    }, LONG_PRESS_MS)
+}
+
 els.overlay.addEventListener('pointerdown', (e) => {
     if (!state.hasImage) return
     e.preventDefault()
     els.overlay.setPointerCapture(e.pointerId)
     const [x, y] = toCanvas(e)
+    // Any pointer prompt ends the text-driven selection; the text branch below
+    // re-arms it when the tap lands on a detected box.
+    state.textDriven = false
     if (state.mode === 'click') {
         state.drag = { kind: 'tap', start: [x, y], moved: false, negative: e.button === 2 || e.altKey, pointerType: e.pointerType }
+        if (e.pointerType === 'touch' && !state.drag.negative) armLongPress()
     } else if (state.mode === 'box') {
         state.drag = { kind: 'box', start: [x, y], now: [x, y] }
     } else if (state.mode === 'lasso') {
@@ -1363,7 +1737,10 @@ els.overlay.addEventListener('pointermove', (e) => {
     const [x, y] = toCanvas(e)
     if (state.drag.kind === 'tap') {
         const moveThreshold = state.drag.pointerType === 'touch' ? 12 : 5
-        if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > moveThreshold) state.drag.moved = true
+        if (Math.hypot(x - state.drag.start[0], y - state.drag.start[1]) > moveThreshold) {
+            state.drag.moved = true
+            clearLongPress()
+        }
         return
     }
     if (state.drag.kind === 'box' || state.drag.kind === 'rect' || state.drag.kind === 'ellipse') {
@@ -1388,6 +1765,7 @@ els.overlay.addEventListener('pointermove', (e) => {
 els.overlay.addEventListener('pointerup', (e) => {
     const drag = state.drag
     state.drag = null
+    clearLongPress()
     if (!drag || !state.hasImage) return
     const [x, y] = toCanvas(e)
 
@@ -1397,27 +1775,12 @@ els.overlay.addEventListener('pointerup', (e) => {
         const [sx, sy] = drag.start
         // Discard degenerate boxes (a stray click instead of a drag).
         if (Math.abs(x - sx) > 8 && Math.abs(y - sy) > 8) {
-            state.manual = null
-            state.box = [Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)]
-            state.lasso = null // a box replaces a lasso region
-            bumpRevision()
-            scheduleRun()
+            applyBoxPrompt([Math.min(sx, x), Math.min(sy, y), Math.max(sx, x), Math.max(sy, y)])
         }
         renderOverlay()
         refreshButtons()
     } else if (drag.kind === 'lasso') {
-        const prompts = lassoToPrompts(drag.points)
-        if (prompts) {
-            // A fresh lasso is a fresh selection: it replaces earlier
-            // prompts (the reference interaction), and later clicks refine
-            // INSIDE it (the clamp keeps everything within lasso ∪ margin).
-            state.lasso = { poly: drag.points, ...prompts }
-            state.manual = null
-            state.clicks = []
-            state.box = null
-            bumpRevision()
-            scheduleRun()
-        }
+        applyLassoPrompt(drag.points)
         renderOverlay()
         refreshButtons()
     } else if (drag.kind === 'region' && drag.points.length >= 3) {
@@ -1447,10 +1810,8 @@ function applyClickPrompt(x, y, label) {
     state.manual = null
     if (label === 1) {
         if (state.liveMask && !pointInMask(state.liveMask, x, y)) {
-            // A click OUTSIDE the live object selects a NEW object: commit the
-            // finished one so it can never be unselected by later clicks.
-            pushBaseOp('add', state.liveMask, 'click')
-            clearLive()
+            // A click OUTSIDE the live object selects a NEW object.
+            beginNewObject()
             state.clicks = [[x, y, 1]]
         } else {
             state.clicks.push([x, y, 1])
@@ -1479,12 +1840,54 @@ function applyClickPrompt(x, y, label) {
     setStatus('Nothing to exclude here — click an object first')
 }
 
+/** A box prompt, from a drag or from a text candidate. `drawn` is false when
+ *  the user typed a phrase instead of dragging: still a prompt, never a mark. */
+function applyBoxPrompt(box, { drawn = true } = {}) {
+    state.manual = null
+    beginNewObject()
+    state.box = box
+    state.boxDrawn = drawn
+    bumpRevision()
+    scheduleRun()
+}
+
+/** A lasso prompt. Returns false for a polygon too degenerate to prompt with,
+ *  which must leave the current selection untouched. */
+function applyLassoPrompt(poly) {
+    const prompts = lassoToPrompts(poly)
+    if (!prompts) return false
+    state.manual = null
+    beginNewObject()
+    state.lasso = { poly, ...prompts }
+    bumpRevision()
+    scheduleRun()
+    return true
+}
+
+const DEBOUNCE_MS = 80
 let debounceTimer = null
 let debounceArmed = false // a run is scheduled but not yet started (waitForRun must see this)
+let lastScheduleAt = -Infinity
+/** Leading edge, then a trailing coalesce. Every call site is one discrete
+ *  gesture (tap, exclude, box/lasso pointerup, undo, a queued re-run) — none is
+ *  a pointermove stream — so an isolated prompt has nothing to wait for and used
+ *  to pay the full window anyway. A second prompt inside the window still
+ *  collapses onto the trailing edge, and one that lands mid-run is absorbed by
+ *  runNow's own runQueued path. */
 const scheduleRun = () => {
+    const now = performance.now()
+    if (!debounceArmed && now - lastScheduleAt >= DEBOUNCE_MS) {
+        lastScheduleAt = now
+        void runNow()
+        return
+    }
     clearTimeout(debounceTimer)
     debounceArmed = true
-    debounceTimer = setTimeout(() => { debounceArmed = false; runNow() }, 80)
+    debounceTimer = setTimeout(() => {
+        debounceArmed = false
+        lastScheduleAt = performance.now()
+        void runNow()
+    }, DEBOUNCE_MS)
 }
 
 async function runNow() {
@@ -1503,16 +1906,10 @@ async function runNow() {
         ? 'Preparing this photo for selection…'
         : (clientState.ready ? 'Selecting…' : 'Selecting… (first run loads the model)'))
     try {
-        // The engine runs the whole post pipeline (lasso clamp → hygiene →
-        // edge refinement) off-thread and returns both masks.
-        const res = await segment(els.view, {
-            clicks,
-            box,
-            clampPoly: state.lasso?.poly || null,
-            clampMargin: state.lasso?.margin || 0,
-            revision,
-            budget: BUDGET,
-        })
+        // A lasso reaches the lane as its point + box (see lassoToPrompts
+        // above), not as a polygon: the polygon clamp is an EXPORT-time step,
+        // applied in mapPromptsToCrop.
+        const res = await segment(els.view, { clicks, box, revision })
         if (res.stale) {
             console.log('[seglab][ui] selection-stale', { revision })
             logCommit(revision, 'stale')
@@ -1524,8 +1921,10 @@ async function runNow() {
             return
         }
 
+        const tApply = performance.now()
         logCommit(revision, res.usable ? 'committed' : 'unusable')
         console.log('[seglab][ui] selection-result', { revision, usable: res.usable, lane: res.lane, score: res.score, encoded: res.encoded })
+        noteClickCost(res)
         if (res.encoded) state.encodePending = false // paid; the cache serves the rest
         if (!res.usable) {
             // Only the live object misses; committed regions survive.
@@ -1538,21 +1937,51 @@ async function runNow() {
             state.liveSummary = res.summary
             recomposeMask()
             state.score = res.score
+            // Offer SAM's other readings of this click at the click itself.
+            state.scope = res.candidates || null
+            state.scopeAt = scopeAnchor()
+            renderScope()
             const coverage = state.maskSummary ? state.maskSummary.coverage : res.summary.coverage
-            setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}`)
+            // The hint is only honest when there is something to cycle TO.
+            const more = (res.candidates?.count ?? 1) > 1 ? ' · too much or too little? the shapes below it are the other readings' : ''
+            setStatus(`Selected — ${res.lane} · confidence ${res.score.toFixed(2)} · ${(coverage * 100).toFixed(1)}% of frame${res.encoded ? '' : ' · cached'}${more}`)
         }
+        const tCompose = performance.now()
         renderOverlay()
         refreshButtons()
+        const tPaint = performance.now()
         // Optional wasm cleanup on the committed one-channel mask (lazy-loads
         // on first use; skipped under pressure ≥ 2; failure keeps this mask).
         if (res.usable) await maybeCvRefine(revision, clicks)
+        const tCv = performance.now()
         // Show the coarse mask first, then sharpen a tiny object at native res.
         if (res.usable) await maybeEscalate(revision)
+        // The half no lane timer can see. `lastRun` covers encode/decode/post;
+        // this covers what the app does with the mask afterwards, which on a
+        // small frame is the larger half.
+        state.lastPaint = {
+            composeMs: +(tCompose - tApply).toFixed(1),
+            paintMs: +(tPaint - tCompose).toFixed(1),
+            cvMs: +(tCv - tPaint).toFixed(1),
+            escalateMs: +(performance.now() - tCv).toFixed(1),
+        }
     } catch (err) {
         logCommit(revision, 'error')
         if (revision !== state.revision) return
         console.error('[seglab] selection failed:', err)
-        setStatus(`Selection failed: ${err?.message}`)
+        // WebGPU is a hard requirement (§4), so on a browser without it EVERY
+        // selection fails — and the raw runtime text ("no available backend
+        // found. ERR: [webgpu] Error: Failed to get GPU adapter. You may need
+        // to enable fla…") is what the user was being shown. That is the whole
+        // first-run experience on Safari and Firefox today. Say what is wrong
+        // and what to do instead of leaking the runtime's internals.
+        // WebGPU now ships by default in Chrome/Edge, Firefox 141+ (Windows) /
+        // 145+ (macOS) and Safari 26, so "unsupported browser" is the wrong
+        // advice — an up-to-date one is the fix.
+        const msg = String(err?.message || '')
+        setStatus(/no available backend|gpu adapter|webgpu|shader-f16/i.test(msg)
+            ? 'On-device selection needs WebGPU, which this browser isn’t providing. Updating to a current Chrome, Edge, Firefox or Safari usually fixes it.'
+            : `Selection failed: ${err?.message}`)
     } finally {
         state.running = false
         noteInteraction() // a completed selection resets the idle-reclaim clock
@@ -1570,7 +1999,7 @@ async function runObjectSubtract(x, y) {
     state.running = true
     setStatus('Removing object from selection…')
     try {
-        const res = await segment(els.view, { clicks: [[x, y, 1]], revision, budget: BUDGET })
+        const res = await segment(els.view, { clicks: [[x, y, 1]], revision })
         if (res.stale || revision !== state.revision) { logCommit(revision, 'stale'); return }
         if (!res.usable) {
             logCommit(revision, 'unusable')
@@ -1608,27 +2037,50 @@ async function maybeCvRefine(revision, clicks) {
     const { width, height } = state.liveMask
     if (Math.max(width, height) > 1024) return
     const src = state.liveMask.data
+    const options = { minArea: 16, openRadius: 0, closeRadius: 0 }
+    // Nothing here can put alpha outside the mask's own soft extent: minArea
+    // removal clears, hole filling only fills enclosed cells, and a close is the
+    // one op that can grow — by its radius, which is what the pad covers. So the
+    // full-frame channel the worker's contract wants is a rect copy into an
+    // already-zeroed buffer, and everything derived from the answer scans the
+    // same rect.
+    const pad = Math.max(options.openRadius, options.closeRadius)
+    const soft = state.liveSummary?.softBox
+    const ax0 = soft ? Math.max(0, soft[0] - pad) : 0
+    const ay0 = soft ? Math.max(0, soft[1] - pad) : 0
+    const ax1 = soft ? Math.min(width, soft[2] + pad) : width
+    const ay1 = soft ? Math.min(height, soft[3] + pad) : height
     const alpha = new Uint8Array(width * height)
-    for (let p = 0; p < alpha.length; p += 1) alpha[p] = src[p * 4]
+    for (let y = ay0; y < ay1; y += 1) {
+        const row = y * width
+        for (let x = ax0; x < ax1; x += 1) alpha[row + x] = src[(row + x) * 4]
+    }
     const seeds = (clicks || []).filter((c) => c[2]).map((c) => [Math.round(c[0]), Math.round(c[1])])
     const refined = await refineAlpha({
         alpha, // transferred — detached after this call
         width,
         height,
         seeds,
-        options: { minArea: 16, openRadius: 0, closeRadius: 0 },
+        options,
         revision,
         budget: BUDGET,
     })
     if (!refined || revision !== state.revision || !state.liveMask) return
     const out = new ImageData(width, height)
     const d = out.data
-    for (let p = 0, i = 0; p < refined.length; p += 1, i += 4) {
-        const v = refined[p]
-        d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255
+    // Alpha is 255 frame-wide: one 32-bit fill, then colour only inside the rect.
+    new Uint32Array(d.buffer).fill(OPAQUE_BLACK)
+    for (let y = ay0; y < ay1; y += 1) {
+        const row = y * width
+        for (let x = ax0; x < ax1; x += 1) {
+            const v = refined[row + x]
+            if (!v) continue
+            const i = (row + x) * 4
+            d[i] = v; d[i + 1] = v; d[i + 2] = v
+        }
     }
     state.liveMask = out
-    state.liveSummary = summarizeMaskRGBA(d, width, height)
+    state.liveSummary = summarizeMaskRGBA(d, width, height, [ax0, ay0, ax1, ay1])
     recomposeMask()
     renderOverlay()
 }
@@ -1639,8 +2091,20 @@ async function maybeCvRefine(revision, clicks) {
 // tiny AND the original out-resolves the proxy, re-decode ONE native crop,
 // merge it back, and cache it for HD export. Auto on Std/Pro (autoEscalate);
 // ?escalate=0 disables. No native headroom (proxy == original) ⇒ nothing to gain.
-const shouldEscalate = (summary) => {
-    if (!BUDGET.autoEscalate || !hasOriginal() || !summary?.bbox) return false
+// `force` = the user asked for it. §11 retires AUTOMATIC escalation (a native
+// re-decode per click costs another full encode), but keeps it available as an
+// explicit per-image action — everything below this line is still checked.
+const shouldEscalate = (summary, force = false) => {
+    if (BUDGET.escalateDisabled) return false                       // explicit opt-out wins
+    // A text pick is ONE deliberate, already-expensive action, so it opts into
+    // the re-decode that §11 retired for click bursts (which paid a native
+    // encode per click). It is also the path that needs it most: the detector
+    // localises a subject that can be 1% of the frame, and at that size the
+    // proxy mask loses whole parts of it — measured on the canonical NEF, a
+    // tulip's right petal and lower petals were simply absent from the 1024
+    // proxy mask and came back once the crop was decoded at native resolution.
+    const wanted = force || BUDGET.autoEscalate || state.textDriven
+    if (!wanted || !hasOriginal() || !summary?.bbox) return false
     const tf = getTransform()
     if (!tf) return false
     // Escalation crops decode from the working copy when one exists (bounded
@@ -1649,29 +2113,37 @@ const shouldEscalate = (summary) => {
     const srcW = wActive ? tf.workingW : tf.originalW
     const srcH = wActive ? tf.workingH : tf.originalH
     if (Math.max(srcW, srcH) / Math.max(tf.proxyW, tf.proxyH) < 1.2) return false
-    // Without a working copy, Safari cannot region-decode a JPEG: a RAW
-    // preview or a very large compressed upload would turn this optional
-    // convenience into another full-frame decode. Keep selection on the
-    // bounded proxy there; export still relinks at native detail.
-    if (!wActive && (tf.sourceWasRaw || (tf.sourceBytes || 0) >= 24 * 1024 * 1024)) return false
-    if ((srcW * srcH) / 1e6 > (BUDGET.escalateMaxMP || 24)) return false
+    // The hazard a working copy exists to avoid: a host that cannot bound a
+    // decode (no ImageDecoder — Safari) materializes the whole raster for any
+    // crop, so a 45 MP source would cost a full-frame decode. That is a
+    // property of the HOST, not of the file, and `workingActive` is exactly the
+    // signal for it — when a working copy is live the crop comes from that
+    // bounded blob and is safe. Gating on sourceWasRaw/sourceBytes instead
+    // blocked the case that benefits most: on a region-decoding host a RAW
+    // crop is cheap (measured 965x876 out of 8256x5504 in 1.6 s).
+    if (!wActive && typeof ImageDecoder === 'undefined') return false
+    // Cost tracks the CROP a region decode materializes, not the frame it is
+    // cut from; capping frame megapixels rejected every large photo for a crop
+    // that was under one megapixel.
     const [minX, minY, maxX, maxY] = summary.bbox
+    const p2o = tf.originalW / tf.proxyW
+    const cropMP = ((maxX - minX) * p2o * (maxY - minY) * p2o) / 1e6
+    if (cropMP > (BUDGET.escalateMaxMP || 24)) return false
+    // The tiny-bbox test is a COST heuristic for the automatic path; an explicit
+    // escalation is already the user paying for it deliberately.
+    if (force) return true
     const diag = Math.hypot(maxX - minX, maxY - minY)
     return diag < Math.hypot(els.view.width, els.view.height) * 0.15
 }
 
-async function maybeEscalate(revision) {
+async function maybeEscalate(revision, { force = false } = {}) {
     // The tiny-bbox test must see the live object, not the composed union.
-    if (!state.liveMask || !shouldEscalate(state.liveSummary)) return
-    // On a climbed budget, escalation's native re-decode transient (~2 GB on a
-    // NEF) additionally requires FRESH measured headroom — the climb proved
-    // residency was low, not that this peak fits. Manual/trusted tiers vouch.
-    if (BUDGET.profileSource === 'auto-climb' && Date.now() - lastHeadroomAt >= 30_000) return
+    if (!state.liveMask || !shouldEscalate(state.liveSummary, force)) return
     // One escalation per SETTLED selection: skip while more input is pending,
     // and let a click-burst supersede us before the heavy crop pipeline starts.
-    if (state.runQueued || debounceArmed) return
-    await new Promise((r) => setTimeout(r, 250))
-    if (revision !== state.revision || state.runQueued || debounceArmed) return
+    if (!force && (state.runQueued || debounceArmed)) return
+    if (!force) await new Promise((r) => setTimeout(r, 250))
+    if (revision !== state.revision || (!force && (state.runQueued || debounceArmed))) return
     // Deliberately NOT the modal veil: the mask is already on screen and usable,
     // and this only sharpens it. Blocking here would claim the app is unusable
     // when it isn't. The status line reports the work instead.
@@ -1729,12 +2201,13 @@ let detectTimer = null
  *  and the first search is the slow one. Local state only — no network. */
 function hintTextSearch() {
     if (!state.hasImage || state.mode !== 'text') return
-    // Two on-device lanes: YOLOE (fast baked vocab) then YOLO-World (any phrase,
-    // CLIP-conditioned). Both download once, then cache.
-    setStatus('Text search ready — describe any object, e.g. “flower”, “the red car”')
+    // One open-vocabulary lane, downloaded once then cached. Encoded phrases are
+    // persisted too, so a repeated search never rebuilds the text encoder.
+    setStatus('Text search ready — describe anything, e.g. “orange tulip”, “a rusty bicycle”')
 }
 
 async function runDetect(phrase) {
+    if (!TEXT_LANE.ok) { setStatus(TEXT_LANE_REFUSAL); return }
     if (!state.hasImage || !phrase.trim()) {
         state.textCandidates = []
         clearRefine()
@@ -1744,36 +2217,16 @@ async function runDetect(phrase) {
     }
     bumpRevision()
     const revision = state.revision
-    // YOLOE (fast baked vocab) unless turned off; both lanes run on WASM or GPU.
-    const yoloeEnabled = BUDGET.yoloe !== false
-    const yoloeScale = BUDGET.detectorScale || 's'
-    const ywScale = ['s', 'm', 'l', 'x'].includes(yoloeScale) ? yoloeScale : 's'
     const idleMs = BUDGET.detectorDispose === 'now' ? 0 : (BUDGET.detectorIdleMs || 0)
     const evict = BUDGET.detectorEvictOnEncode === true
-    // GPU-first on every vendor; the pressure ratchet (detectorWebGPU=false)
-    // pins the lanes to their wasm floor until the tab is calm again.
-    const webgpu = BUDGET.detectorWebGPU !== false
     setStatus(`Looking for “${phrase.trim()}”… (first search downloads the detector, then it's cached)`)
     if (revision !== state.revision) return // superseded while checking
     try {
-        // Fast baked-vocab YOLOE first; anything its vocab can't name falls to
-        // the open-vocab YOLO-World lane (CLIP-conditioned, arbitrary phrases).
-        let res = null
-        if (yoloeEnabled) {
-            res = await detectCandidatesYoloe(phrase, { scale: yoloeScale, idleMs, evict, webgpu })
-            if (revision !== state.revision) return
-        }
-        if (!res) {
-            res = await detectCandidatesYoloWorld(phrase, { scale: ywScale, idleMs, evict, webgpu })
-            if (revision !== state.revision) return // superseded by newer input
-        }
-        if (!res) {
-            // Both OBJECT lanes empty: a colour-qualified "stuff" phrase (green
-            // leaves / blue sky) is served from pixel evidence — colour-region
-            // proposals over the same cached frame, no model.
-            res = await detectCandidatesColorRegion(phrase)
-            if (revision !== state.revision) return
-        }
+        // One open-vocabulary lane: the phrase conditions the detector directly,
+        // so there is no vocabulary to miss and nothing to fall back to.
+        const res = await detectCandidates(phrase, { idleMs, evict, budget: BUDGET })
+        noteDetectCost()
+        if (revision !== state.revision) return // superseded by newer input
         state.textBackend = res?.backend || null
         refreshChips()
         if (!res || res.candidates.length === 0) {
@@ -1785,17 +2238,24 @@ async function runDetect(phrase) {
             return
         }
         state.textMulti = res.multi
-        // Singular phrase, one object: select it outright — no refine, no tap.
-        if (!res.multi && res.candidates.length === 1) {
+        // Every match is the SAME class: the phrase named that class, so all of
+        // them are the answer — take them without asking. Only a mixed-label
+        // result is a real choice, and that falls through to the chips below.
+        const oneClass = new Set(res.candidates.map((c) => c.label)).size === 1
+        if (oneClass) {
             state.textCandidates = res.candidates
             clearRefine()
             els.selectall.hidden = true
-            setStatus(`Selecting “${phrase.trim()}”…`)
-            selectCandidate(0)
+            if (res.candidates.length === 1) {
+                setStatus(`Selecting “${phrase.trim()}”…`)
+                selectCandidate(0)
+            } else {
+                await selectAll(`“${phrase.trim()}”`)
+            }
             return
         }
-        // Several instances: group them into sub-class refine chips (one
-        // detection pass, filtering is free) and show every match to start.
+        // Mixed labels: group them into sub-class refine chips (one detection
+        // pass, filtering is free) and show every match to start.
         setupFacets(res.candidates)
         els.selectall.hidden = state.textCandidates.length < 2
         const n = state.textCandidates.length
@@ -1804,8 +2264,16 @@ async function runDetect(phrase) {
     } catch (err) {
         if (revision !== state.revision) return
         console.error('[seglab] detect failed:', err)
-        setStatus(BUDGET.profile === 'lite' && /load|memory|alloc|abort/i.test(String(err?.message))
-            ? 'Text selection is unavailable on this device’s safe memory profile.'
+        // A worker killed for memory surfaces as its own death (watchdog) or as
+        // whatever fetch was in flight when the process went — on WebKit that is
+        // the bare string "Load failed", which names neither the cause nor a way
+        // out. Both mean the same thing to the user, so say that instead.
+        const outOfMemory = err?.code === 'detect-worker-died'
+            || /load failed|out of memory|memory|alloc|abort/i.test(String(err?.message))
+        setStatus(outOfMemory
+            ? (BUDGET.profile === 'lite'
+                ? 'Text selection is unavailable on this device’s safe memory profile.'
+                : 'This browser ran out of memory for text search — click the object instead, or try Chrome.')
             : `Text detection failed: ${err?.message}`)
     }
 }
@@ -1814,21 +2282,21 @@ async function runDetect(phrase) {
 const selectCandidate = (i) => {
     const c = state.textCandidates[i]
     if (!c) return
-    state.box = c.box.slice()
-    state.clicks = []
-    state.lasso = null
-    state.manual = null
+    // Kept as a prompt so a later click refines INSIDE the detected object, but
+    // never drawn: the user typed a phrase, they did not drag a box.
+    applyBoxPrompt(c.box.slice(), { drawn: false })
+    state.textDriven = true // earns the native-crop sharpen (shouldEscalate)
     state.textCandidates = []
     clearRefine()
     els.selectall.hidden = true
-    bumpRevision()
-    scheduleRun()
 }
 
-/** Union every candidate into one mask (multi-instance: "all bottles"). */
-async function selectAll() {
+/** Union every candidate into one mask (multi-instance: "all bottles").
+ *  Never bind straight to an event — arg 1 would be the Event. */
+async function selectAll(noun = 'objects') {
     const boxes = state.textCandidates.map((c) => c.box.slice())
     if (boxes.length === 0 || state.running) return
+    beginNewObject()   // whatever was live stays selected; these boxes are new
     bumpRevision()
     const revision = state.revision
     state.running = true
@@ -1836,11 +2304,11 @@ async function selectAll() {
     clearRefine()
     state.manual = null
     els.selectall.hidden = true
-    setStatus(`Selecting ${boxes.length} objects…`)
+    setStatus(`Selecting ${boxes.length} ${noun}…`)
     try {
         let union = null
         for (const box of boxes) {
-            const res = await segment(els.view, { box, revision, budget: BUDGET })
+            const res = await segment(els.view, { box, revision })
             if (res.stale || revision !== state.revision) return
             if (!res.usable) continue
             if (!union) {
@@ -1854,10 +2322,8 @@ async function selectAll() {
         if (!union) { setStatus('No objects selected'); return }
         // The multi-instance union commits as one op; Z removes it whole.
         pushBaseOp('add', union, 'text')
-        clearLive()
         recomposeMask()
-        state.box = null
-        setStatus(`Selected ${boxes.length} objects`)
+        setStatus(`Selected ${boxes.length} ${noun}`)
         renderOverlay()
         refreshButtons()
     } finally {
@@ -2040,32 +2506,95 @@ els.textinput.addEventListener('keydown', (e) => {
 })
 els.textinput.addEventListener('focus', renderAutocomplete)
 els.textinput.addEventListener('blur', () => setTimeout(hideAutocomplete, 120))
-els.selectall.addEventListener('click', selectAll)
+els.selectall.addEventListener('click', () => selectAll())
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
 // Layers rebuild only when the committed mask object changes. A brush stroke
 // draws its own lightweight canvas preview, so pointermove never allocates a
 // full-size overlay or runs an 8-pass outline dilation on the UI thread.
-let layerCache = { mask: null, fill: null }
+let layerCache = { mask: null, fill: null, ring: null }
 
-/** Colorize the white-on-black mask; cached per committed mask object. */
+// Outline offsets — the union of the shape shifted this way IS its dilation, so
+// the border costs 8 GPU-side drawImage calls instead of a JS dilation pass.
+const RING_DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1]]
+
+/** Colorize the white-on-black mask + trace its border; cached per mask object. */
 const getMaskLayers = (mask) => {
     if (layerCache.mask === mask) return layerCache
     const { width, height, data: src } = mask
     // luma → alpha + accent tint in one pass — no intermediate canvas/readback.
     const img = new ImageData(width, height)
     const d = img.data
-    for (let i = 0; i < d.length; i += 4) {
-        d[i] = 53; d[i + 1] = 224; d[i + 2] = 194
-        d[i + 3] = src[i]
+    // The border traces a HARD core, not the tinted fill: the refined mask has a
+    // feathered edge, and dilating a soft alpha gives a wide double band where a
+    // single crisp line is what tells the user which pixels are actually in.
+    const core = new ImageData(width, height)
+    const c = core.data
+    // The core's extent, free in this pass — the scope control uses it to sit
+    // clear of the selection instead of on top of the thing being judged.
+    let minX = width; let minY = height; let maxX = -1; let maxY = -1
+    // The tinted layer's own extent, which reaches past the core by the width of
+    // the matted edge. Both buffers start transparent, so a pixel the mask does
+    // not touch needs no write at all — on a typical selection that is most of
+    // the frame, and this pass runs on every mask change including brush frames.
+    let sMinX = width; let sMinY = height; let sMaxX = -1; let sMaxY = -1
+    for (let y = 0; y < height; y += 1) {
+        const row = y * width
+        for (let x = 0; x < width; x += 1) {
+            const i = (row + x) * 4
+            const v = src[i]
+            if (!v) continue
+            d[i] = 53; d[i + 1] = 224; d[i + 2] = 194; d[i + 3] = v
+            if (x < sMinX) sMinX = x
+            if (x > sMaxX) sMaxX = x
+            if (y < sMinY) sMinY = y
+            sMaxY = y
+            if (v >= 128) {
+                c[i] = 255; c[i + 1] = 255; c[i + 2] = 255; c[i + 3] = 255
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                maxY = y
+            }
+        }
     }
     const fill = new OffscreenCanvas(width, height)
-    fill.getContext('2d').putImageData(img, 0, 0)
+    // Dirty-rect upload: outside the extent the ImageData is the transparent the
+    // canvas already is.
+    if (sMaxX >= 0) fill.getContext('2d').putImageData(img, 0, 0, sMinX, sMinY, sMaxX - sMinX + 1, sMaxY - sMinY + 1)
 
-    layerCache = { mask, fill }
+    // Dilate the core and subtract it: what is left is a band that hugs the
+    // outside of the selection, at mask resolution, so it stays exact under any
+    // display scale. Width is relative to the frame, not fixed px, so it reads
+    // the same on a 900 px proxy and a 4000 px native frame.
+    const solid = new OffscreenCanvas(width, height)
+    const r = Math.max(2, Math.round(Math.min(width, height) * 0.003))
+    const ring = new OffscreenCanvas(width, height)
+    const rc = ring.getContext('2d')
+    if (maxX >= 0) {
+        const cw = maxX - minX + 1
+        const ch = maxY - minY + 1
+        solid.getContext('2d').putImageData(core, 0, 0, minX, minY, cw, ch)
+        // Every draw is the core's rect, not the frame: eight shifted copies of a
+        // 200 px object on a 4000 px frame is a hundredth of the fill rate.
+        for (const [dx, dy] of RING_DIRS) rc.drawImage(solid, minX, minY, cw, ch, minX + dx * r, minY + dy * r, cw, ch)
+        rc.globalCompositeOperation = 'destination-out'
+        rc.drawImage(solid, minX, minY, cw, ch, minX, minY, cw, ch)
+        rc.globalCompositeOperation = 'source-in'
+        rc.fillStyle = ACCENT
+        rc.fillRect(minX - r, minY - r, cw + 2 * r, ch + 2 * r)
+    }
+
+    layerCache = { mask, fill, ring, bounds: maxX < 0 ? null : [minX, minY, maxX, maxY] }
     return layerCache
 }
+
+// Prompt geometry belongs to the tool that drew it. Switching tools hides the
+// other tools' marks — a dashed box left over from Box mode reads as part of
+// what the current tool is doing — and switching back shows them again, since
+// the state itself is kept.
+const ownTool = (owner) => !!owner && state.mode === owner
 
 // Coalesce paint bursts (pointermove) into one paint per frame.
 let overlayScheduled = false
@@ -2076,6 +2605,7 @@ function renderOverlay() {
 }
 
 function paintOverlay() {
+    const tPaint = performance.now()
     const ctx = overlayCtx
     const { width, height } = els.overlay
     ctx.clearRect(0, 0, width, height)
@@ -2094,16 +2624,47 @@ function paintOverlay() {
         ctx.fillRect(0, 0, width, height)
         ctx.restore()
     } else if (shownMask) {
-        const { fill } = getMaskLayers(shownMask)
+        const { fill, ring } = getMaskLayers(shownMask)
         ctx.globalAlpha = 0.32
         ctx.drawImage(fill, 0, 0)
         ctx.globalAlpha = 1
+        // The border carries a dark halo because the accent alone vanishes over
+        // a light subject, and the boundary is the one thing the user checks.
+        ctx.save()
+        ctx.shadowColor = 'rgba(0,0,0,0.55)'
+        ctx.shadowBlur = Math.max(2, Math.min(width, height) * 0.004)
+        ctx.drawImage(ring, 0, 0)
+        ctx.shadowBlur = 0
+        ctx.drawImage(ring, 0, 0) // opaque line on top of its own halo
+        ctx.restore()
+    }
+
+    // Hover preview of another candidate. Field-resolution and smoothed on
+    // purpose: it is a "roughly this much" answer, and pretending otherwise
+    // would cost the post pipeline the hover exists to avoid.
+    if (state.ghost) {
+        const g = state.ghost
+        if (!g.canvas) {
+            const img = new ImageData(g.side, g.side)
+            for (let i = 0; i < g.alpha.length; i += 1) {
+                const o = i * 4
+                img.data[o] = 255; img.data[o + 1] = 214; img.data[o + 2] = 120
+                img.data[o + 3] = g.alpha[i]
+            }
+            g.canvas = new OffscreenCanvas(g.side, g.side)
+            g.canvas.getContext('2d').putImageData(img, 0, 0)
+        }
+        ctx.save()
+        ctx.imageSmoothingEnabled = true
+        ctx.globalAlpha = 0.42
+        ctx.drawImage(g.canvas, 0, 0, width, height)
+        ctx.restore()
     }
 
     const markerR = Math.max(4, Math.min(width, height) * 0.009)
 
-    // Persisted box (dashed).
-    if (state.box) {
+    // Persisted box (dashed) — only the one the user dragged, in Box mode.
+    if (state.box && state.boxDrawn && ownTool('box')) {
         ctx.setLineDash([7, 5])
         ctx.strokeStyle = ACCENT
         ctx.lineWidth = 1.75
@@ -2112,7 +2673,7 @@ function paintOverlay() {
     }
 
     // Text candidates: numbered boxes to tap.
-    for (let i = 0; i < state.textCandidates.length; i += 1) {
+    for (let i = 0; ownTool('text') && i < state.textCandidates.length; i += 1) {
         const [x0, y0, x1, y1] = state.textCandidates[i].box
         ctx.setLineDash([6, 4])
         ctx.strokeStyle = 'rgba(90,160,255,0.95)'
@@ -2129,18 +2690,20 @@ function paintOverlay() {
     }
 
     // Lasso region (kept faint once the mask lands, so the clamp is visible).
-    if (state.lasso) {
+    if (state.lasso && ownTool('lasso')) {
         ctx.beginPath()
         ctx.moveTo(state.lasso.poly[0][0], state.lasso.poly[0][1])
         for (const [px, py] of state.lasso.poly.slice(1)) ctx.lineTo(px, py)
         ctx.closePath()
-        ctx.strokeStyle = state.mask ? 'rgba(53,224,194,0.25)' : 'rgba(90,160,255,0.9)'
+        ctx.strokeStyle = state.mask ? 'rgba(83,216,255,0.25)' : 'rgba(90,160,255,0.9)'
         ctx.lineWidth = 2.5
         ctx.stroke()
     }
 
-    if (state.manual?.poly?.length >= 3) {
-        const { poly, kind } = state.manual
+    // Manual geometry names its own tool, so it is its own owner.
+    const manual = ownTool(state.manual?.kind) ? state.manual : null
+    if (manual?.poly?.length >= 3) {
+        const { poly, kind } = manual
         ctx.beginPath()
         ctx.moveTo(poly[0][0], poly[0][1])
         for (const [px, py] of poly.slice(1)) ctx.lineTo(px, py)
@@ -2149,19 +2712,19 @@ function paintOverlay() {
         ctx.lineWidth = 2
         ctx.stroke()
     }
-    if (state.manual?.box) {
-        const [x0, y0, x1, y1] = state.manual.box
+    if (manual?.box) {
+        const [x0, y0, x1, y1] = manual.box
         ctx.strokeStyle = 'rgba(255,194,94,0.9)'
         ctx.lineWidth = 2
-        if (state.manual.kind === 'ellipse') {
+        if (manual.kind === 'ellipse') {
             ctx.beginPath()
             ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, 0, Math.PI * 2)
             ctx.stroke()
         } else ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
     }
-    if (state.manual?.seed) {
+    if (manual?.seed) {
         ctx.beginPath()
-        ctx.arc(state.manual.seed[0], state.manual.seed[1], markerR * 1.7, 0, Math.PI * 2)
+        ctx.arc(manual.seed[0], manual.seed[1], markerR * 1.7, 0, Math.PI * 2)
         ctx.strokeStyle = 'rgba(255,194,94,0.95)'
         ctx.lineWidth = 2
         ctx.stroke()
@@ -2215,7 +2778,7 @@ function paintOverlay() {
     }
 
     // Click markers.
-    for (const [x, y, label] of state.clicks) {
+    for (const [x, y, label] of (ownTool('click') ? state.clicks : [])) {
         ctx.beginPath()
         ctx.arc(x, y, markerR, 0, Math.PI * 2)
         ctx.fillStyle = label ? POS_COLOR : NEG_COLOR
@@ -2224,6 +2787,11 @@ function paintOverlay() {
         ctx.strokeStyle = 'rgba(255,255,255,0.9)'
         ctx.stroke()
     }
+
+    // The scope control is placed off the mask's extent, which only exists once
+    // the layers are rasterised — so re-place it here, after that has happened.
+    if (state.scope && els.scope && !els.scope.hidden) scopeControl?.place()
+    if (state.lastPaint) state.lastPaint.paintMs = +(performance.now() - tPaint).toFixed(1)
 }
 
 /* ─── Cutout export ──────────────────────────────────────────────────────── */
@@ -2266,19 +2834,11 @@ els.cutout.addEventListener('click', async () => {
     // in the app, and the user is waiting on a file, not the canvas.
     const epoch = showPrep(wasNative ? 'Rebuilding the cutout at full resolution…' : 'Building the cutout…')
     try {
-        // Detector and wasm-refine workers are unrelated to a cutout export and
-        // hold memory. Keeping the detector warm through the heaviest pixel op
-        // requires POSITIVE proof of headroom, not just absence of pressure —
-        // pressure is a lagging signal (the export itself is the trigger), and
-        // memory-locked iGPU devices run device==='webgpu' too. So: warm only
-        // when not on the WASM floor, not under pressure, AND (for unverified
-        // budgets) the governor measured real headroom within the last 30 s.
-        // Trusted hosts vouched real memory and often lack the measure API
-        // (Safari/WebView), so absence-of-pressure suffices there. Devices that
-        // can't measure never prove headroom → always shed → safe default.
-        const tight = clientState.device === 'wasm' || (BUDGET.pressureLevel || 0) > 0
-            || (BUDGET.memoryLocked && Date.now() - lastHeadroomAt >= 30_000)
-        if (tight) await relievePressure(1)
+        // Detector, encoder and wasm-refine all hold memory an export does not
+        // need. relievePressure covers only the mask lane, so the detect worker
+        // (up to 1030 MB) needs its own call.
+        await relievePressure(1)
+        disposeDetectorIfIdle()
         disposeCvRefine()
         let out = null
         if (wasNative) {
@@ -2363,9 +2923,6 @@ window.__seglab = {
     // Boot capability probe result { webgpu, fallback, f16, deviceMemoryGB,
     // profile } — awaits the probe so it is never null.
     capability: async () => { await bootProbe; return capability },
-    // Memory governor instance (cycleNow / feedMeasurement) — the live climb
-    // gate drives headroom cycles through this instead of waiting minutes.
-    governor,
     // Current resolved budget (including a dynamic Phosmith resource hint).
     resourceBudget: async () => { await bootProbe; return { ...BUDGET } },
     // Native host test/integration hook. Production hosts normally inject the
@@ -2427,9 +2984,16 @@ window.__seglab = {
         mode: clientState.mode,
         lane: clientState.lane,
         lastRun: clientState.lastRun,
+        lastPaint: state.lastPaint || null,
         hasImage: state.hasImage,
         maskSummary: state.maskSummary,
         score: state.score,
+        // The live prompt set, so a check can see WHAT was asked for and not
+        // just what came back. `tool` is the active mode (`mode` is the lane's).
+        tool: state.mode,
+        box: state.box ? state.box.slice() : null,
+        boxDrawn: state.boxDrawn,
+        lasso: !!state.lasso,
         clicks: state.clicks.length,
         baseOps: state.baseOps.length,
         revision: state.revision,
@@ -2437,6 +3001,26 @@ window.__seglab = {
         manual: state.manual?.kind || null,
         escalated: !!getHdPatch(state.revision),
     }),
+    // What the scope control is offering right now — the swatches as rendered,
+    // so a scripted check sees the same choices the user does.
+    scope: () => (state.scope ? {
+        count: state.scope.count,
+        index: state.scope.index,
+        hidden: !!els.scope?.hidden,
+        shapes: (els.scope?.querySelectorAll('.scope-shape') || []).length,
+        // A swatch with no canvas means the mask behind it was gone at paint
+        // time — the fallback block, which is worth seeing in a check.
+        drawn: [...(els.scope?.querySelectorAll('.scope-shape') || [])].filter((n) => n.querySelector('canvas')).length,
+        pressed: [...(els.scope?.querySelectorAll('.scope-shape') || [])]
+            .findIndex((n) => n.getAttribute('aria-pressed') === 'true'),
+    } : null),
+    // llmfit ships the inputs behind every estimate; so does this. Reports the
+    // judgement for the loaded image, or for w×h if one is given.
+    hardwareFit: (w, h) => explainFit(
+        w || els.view.width || 1,
+        h || els.view.height || 1,
+        BUDGET,
+    ),
     maskStats: () => {
         if (!state.mask) return null
         const { data, width, height } = state.mask
@@ -2444,12 +3028,60 @@ window.__seglab = {
         for (let i = 0; i < data.length; i += 4) {
             if (data[i] > 16 && data[i] < 240) soft += 1
         }
-        return { components: countMaskComponents(data, width, height), softPixels: soft }
+        return {
+            components: countMaskComponents(data, width, height),
+            softPixels: soft,
+            maskW: width,
+            maskH: height,
+            clickPoints: state.clicks.map(([x, y, l]) => [Math.round(x), Math.round(y), l]),
+            regions: maskRegions(data, width, height, state.clicks),
+        }
+    },
+    // The composed mask's value channel, base64. Aggregate stats cannot answer
+    // boundary questions — how wide the gap between two selections is, what a
+    // radius would join — so a check gets the pixels and runs sam-core itself.
+    maskPixels: () => {
+        if (!state.mask) return null
+        const { data, width, height } = state.mask
+        const chan = new Uint8Array(width * height)
+        for (let i = 0; i < chan.length; i += 1) chan[i] = data[i * 4]
+        let s = ''
+        for (let i = 0; i < chan.length; i += 0x8000) s += String.fromCharCode.apply(null, chan.subarray(i, i + 0x8000))
+        return { w: width, h: height, b64: btoa(s) }
+    },
+    // Crop re-decode with shouldEscalate() bypassed, reporting the gate's own
+    // IoU against the proxy mask — the only hook that surfaces that number, so
+    // escalateMinIoU can be calibrated from measurements instead of taste.
+    // `minIoU: 0` observes a re-decode the shipping gate would have rejected.
+    forceEscalateCrop: async ({ minIoU = 0, merge = true } = {}) => {
+        if (!state.liveMask) return { error: 'no live mask' }
+        const t0 = performance.now()
+        try {
+            const crop = await escalateCrop(state.liveMask, currentPrompts(), {
+                budget: { ...BUDGET, cropMaxSide: 2048, cropMaxMP: 0, escalateMinIoU: minIoU },
+                revision: state.revision,
+            })
+            if (!crop) return { fired: false }
+            if (merge) { mergeCropIntoProxy(crop); renderOverlay() }
+            return {
+                fired: true, decoded: crop.decoded, rect: crop.rect, iou: +(crop.iou ?? -1).toFixed(4),
+                cropW: crop.width, cropH: crop.height, ms: +(performance.now() - t0).toFixed(0),
+            }
+        } catch (err) { return { error: String(err?.message || err) } }
     },
     // Run the real HD export and measure the composited full-res cutout.
     // `probe` = { cx, cy, r } in ORIGINAL px (a synthetic disc): reports the
     // max radial error of the alpha boundary vs the analytic circle — the
     // quantitative "no loss at native resolution" check.
+    // Why a null export was null. buildCutout has five silent null returns and
+    // the gates could only report `undefined×undefined`; this names the branch.
+    exportDiag: () => ({
+        mask: !!state.mask,
+        original: hasOriginal(),
+        transform: !!getTransform(),
+        manual: !!state.manual,
+        revision: state.revision,
+    }),
     exportCutout: async (probe = null) => {
         if (!state.mask) return null
         const res = await buildCutout(state.mask, currentPrompts(), {
@@ -2511,6 +3143,12 @@ window.__seglab = {
     // ORIGINAL px against a synthetic disc `probe` {cx,cy,r}: the native patch
     // when escalation fired, else the proxy mask upscaled (the control). Lets
     // the gate compare escalate=1 vs ?escalate=0 on one metric.
+    // Explicit escalation — the §11 user action. Auto-escalation stays off.
+    escalate: async () => {
+        await maybeEscalate(state.revision, { force: true })
+        const patch = getHdPatch(state.revision)
+        return { fired: !!patch, decoded: !!(patch && patch.decoded) }
+    },
     escalation: (probe = null) => {
         const patch = getHdPatch(state.revision)
         const out = { fired: !!patch, decoded: !!(patch && patch.decoded) }
@@ -2559,19 +3197,21 @@ window.__seglab = {
         await waitForRun()
         return window.__seglab.state()
     },
+    // Box mode's drag, without the pointer stream — the same state a finished
+    // drag leaves (pointerup above), so a scripted check exercises the box
+    // prompt and its interaction with later clicks.
+    boxAt: async (x0, y0, x1, y1) => {
+        applyBoxPrompt([Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)])
+        await waitForRun()
+        return window.__seglab.state()
+    },
     lassoCircle: async (cx, cy, r, n = 28) => {
         const poly = []
         for (let i = 0; i < n; i += 1) {
             const a = (i / n) * Math.PI * 2
             poly.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r])
         }
-        const prompts = lassoToPrompts(poly)
-        if (!prompts) throw new Error('degenerate test lasso')
-        state.lasso = { poly, ...prompts }
-        state.clicks = []
-        state.box = null
-        bumpRevision()
-        scheduleRun()
+        if (!applyLassoPrompt(poly)) throw new Error('degenerate test lasso')
         await waitForRun()
         return window.__seglab.state()
     },
@@ -2633,14 +3273,41 @@ window.__seglab = {
         const s = window.__seglab.state()
         return { ...s, ...(window.__seglab.maskStats() || {}) }
     },
-    // Direct YOLO-World lane probe (bypasses runDetect revision/evict churn) —
-    // returns raw candidate count + backend for scripted validation.
-    testYoloWorld: async (phrase) => {
+    // Direct detector probe (bypasses runDetect revision/evict churn) — returns
+    // raw candidate count + backend for scripted validation.
+    testDetect: async (phrase) => {
         try {
-            const res = await detectCandidatesYoloWorld(phrase, { scale: 's', idleMs: 0, evict: false })
+            const res = await detectCandidates(phrase, { idleMs: 0, evict: false, budget: BUDGET })
             return res
                 ? { n: res.candidates.length, backend: res.backend, labels: res.candidates.map((c) => c.label).slice(0, 6) }
                 : { n: 0, backend: null }
+        } catch (err) { return { error: String(err?.message || err) } }
+    },
+    // Every ranking stage in ORIGINAL px — says which stage dropped, merged or
+    // truncated the box the detector actually saw.
+    testDetectStages: async (phrase) => {
+        try {
+            const { detectStages } = await import('./text-ui.js')
+            return await detectStages(phrase, { budget: BUDGET })
+        } catch (err) { return { error: String(err?.message || err) } }
+    },
+    // Raw detector scores before ranking — separates "phrase unknown" from
+    // "object below the 640² resolution floor".
+    testDetectRaw: async (phrase, threshold = 0.001, slots = null, grid = undefined) => {
+        try {
+            const { detectRaw } = await import('./text-ui.js')
+            return await detectRaw(phrase, { threshold, slots, budget: BUDGET, ...(grid ? { grid } : {}) })
+        } catch (err) { return { error: String(err?.message || err) } }
+    },
+    // Phrase → 512-d MobileCLIP2 vector, for asserting the open-vocab path
+    // end to end (an arbitrary phrase must produce a finite unit vector).
+    testEncodePhrase: async (phrase) => {
+        try {
+            const { encodePhrases } = await import('./text-encode.js')
+            const { vectors, backend } = await encodePhrases([phrase])
+            let norm = 0
+            for (const v of vectors) norm += v * v
+            return { dim: vectors.length, norm: Math.sqrt(norm), backend, finite: vectors.every(Number.isFinite) }
         } catch (err) { return { error: String(err?.message || err) } }
     },
     // Deterministic REFINE-CHIP plumbing (no detector): feed pre-tagged
@@ -2678,7 +3345,7 @@ if (!window.__seglabNoRestore) restoreSession().catch(() => {})
 
 // Register the SW as early as possible so it's controlling the page before any
 // model fetches start. On second+ visits the SW intercepts from the cache —
-// eliminating repeated SlimSAM downloads entirely.
+// eliminating repeated weight downloads entirely.
 // Only runs in secure contexts (HTTPS or localhost); file:// is silently skipped.
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js', { scope: './' })
@@ -2696,8 +3363,57 @@ if ('serviceWorker' in navigator) {
 setMode('click')
 refreshChips()
 
-// Deliberately NO model warm here: nothing downloads or compiles until the
-// user has supplied an image and its bounded proxy is on screen.
-bootProbe.catch(() => {})
+// Warm at page load, not at import: waiting for an image put the whole cold
+// cost — ORT, model pointer, decoder build, 78 MB weight fetch — in front of
+// the first click. Only the cheap half warms; the encoder SESSION is the ~1 GB
+// half and still waits for an image, which ENCODER_IDLE_MS would drop anyway.
+// Every step stays on the heavy-job queue — nothing here runs concurrently.
+const bootWarm = async () => {
+    const cap = await bootProbe
+    if (!cap?.webgpu || !cap.f16 || cap.fallback) return   // §4: no lane on this device
+    // First visit: until the SW controls the page, weights land only in the HTTP
+    // cache and get pulled again on eviction. Bounded — HTTP cache still works.
+    if ('serviceWorker' in navigator && !navigator.serviceWorker.controller) {
+        await new Promise((resolve) => {
+            const done = () => {
+                clearTimeout(timer)
+                navigator.serviceWorker.removeEventListener('controllerchange', done)
+                resolve()
+            }
+            const timer = setTimeout(done, 3000)
+            navigator.serviceWorker.addEventListener('controllerchange', done)
+        })
+    }
+    // Nobody waits on a background tab; no reason to take a GPU device from the
+    // foreground one to warm it. The DOWNLOAD is not GPU work, so it starts
+    // now anyway — otherwise a tab opened in the background arrives at its
+    // first click with an empty model cache.
+    if (document.hidden) {
+        import('./sam21-client.js')
+            .then(async (c) => { await c.hello('seglab'); await c.prefetch() })
+            .catch(() => null)
+        await new Promise((resolve) => {
+            const on = () => {
+                if (document.hidden) return
+                document.removeEventListener('visibilitychange', on)
+                resolve()
+            }
+            document.addEventListener('visibilitychange', on)
+        })
+    }
+    try {
+        await ensureWarm({ speculative: true })
+        // Then the encoder SESSION. This is the ~1 GB resident and the ~1.3 s
+        // shader compile that otherwise land on the first click; the lane arms
+        // its idle release only after an encode RUNS, so a session built here
+        // stands until a photo arrives. Cost is stated in DESIGN §4: an idle
+        // page holds the encoder. The governor still sheds it under pressure
+        // and the host's 120 s idle exit still reclaims an abandoned tab.
+        await warmEncoder({ speculative: true })
+    } catch (err) {
+        console.warn('[seglab] boot warm failed (first import retries):', err?.message)
+    }
+}
+bootWarm()
 
 console.log('[seglab] ready')

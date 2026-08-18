@@ -1,75 +1,57 @@
 /**
- * yoloe-detect — YOLOE-26 prompt-free vision lane (raw onnxruntime-web).
+ * yoloe-detect — YOLOE-26L TEXT-PROMPT vision lane (raw onnxruntime-web).
  *
- * The fast baked-vocabulary detector. Prompt-free (LRPC) bakes a ~4585-class
- * vocabulary into the head, so this needs NO text encoder: it detects everything
- * with class labels and the MAIN thread matches the user's phrase to those labels
- * (see text-ui + text-core phraseMatchesLabel). Arbitrary phrases that hit no
- * baked class fall through to the YOLO-World open-vocab lane (yolo-world-detect.js).
+ * ONE open-vocabulary detector. It replaces both predecessors: the prompt-free
+ * lane (a 4585-class vocabulary baked into an LRPC head, so arbitrary phrases
+ * were impossible) and YOLO-World (a second model for the same job, reached only
+ * when the first failed). Class embeddings arrive as a live `txt_feats` input,
+ * so any phrase works and there is nothing to fall back to.
  *
- * Hosted in the disposable detect-worker so its ORT wasm arena (which only grows)
- * stays out of the segmentation worker. Runs on WebGPU where available, WASM
- * otherwise. Output is NMS-free — output0 [1,300,38] = xyxy, score, class, 32 mask
- * coeffs (masks ignored; SlimSAM owns masks). Boxes are returned normalized [0,1]
- * against the square so the caller un-letterboxes with the existing contract.
+ * RepRTA lives INSIDE the graph (scripts/export-yoloe-text.py), so this takes
+ * raw MobileCLIP2-B vectors from js/text-encode.js and the adapter can never
+ * drift out of sync with the detector it feeds.
  *
- * onnxruntime-web is resolved vendored-first, CDN fallback (mirrors
- * model-assets.js). Until scripts vendor it, the CDN copy serves the plain dev
- * server; the COEP production path REQUIRES the vendored copy (2a.6).
+ * Contract: images[1,3,640,640] f32 + txt_feats[1,nc,512] f32 → output0[1,300,38]
+ * = xyxy, score, slot index, 32 mask coefficients. NMS-free, like the prompt-free
+ * export before it, so the caller does not run NMS for dedup — only for merging
+ * across scales. Boxes are normalized [0,1] against the square.
+ *
+ * fp16 (55.4 MB, blanket conversion, max score delta 0.00097 vs fp32). The -pf
+ * export could not take fp16 because onnxconverter-common mistyped its LRPC
+ * head; this variant has no LRPC head, so the blocker left with it.
  */
 
 import { YOLOE_INPUT } from './text-core.js'
+import { webgpuWorthTrying } from './gpu-adapter.js'
+import { loadOrt } from './ort-loader.js'
 
-const SCALES = new Set(['n', 's', 'm', 'l', 'x'])
+/**
+ * Upper bound on class slots. The export traces at 32, but the class axis is
+ * DYNAMIC, so that width is a tracing detail and never a runtime limit — swept
+ * live on this graph, nc = 1·2·22·32·45·64·128 all return [1,300,38] and cost
+ * 128·132·134·134·137·138·146 ms. Essentially flat, so the cap exists only to
+ * bound the tensor, not to ration anything. 48 clears the largest taxonomy
+ * expansion ("animal" → 45 labels + the phrase + its object form); 32 silently
+ * truncated that one, and which 13 kinds got dropped was list order.
+ */
+export const MAX_SLOTS = 48
+export const DIM = 512
 
-const ORT_VERSION = '1.22.0'
-const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`
-const ORT_LOCAL = new URL('../lib/ort-web/', import.meta.url).href
-const ORT_FILE = 'ort.webgpu.bundle.min.mjs'
-const modelURL = (scale) => new URL(`../models/yoloe/yoloe-26${scale}-seg-pf.onnx`, import.meta.url).href
-const vocabURL = (scale) => new URL(`../models/yoloe/yoloe-26${scale}-pf.vocab.json`, import.meta.url).href
-
-let ortPromise = null
-/** Import onnxruntime-web (vendored first) and point its wasm loader at the same
- *  directory, so the WASM EP fallback resolves offline too. */
-const loadOrt = () => {
-    ortPromise ??= (async () => {
-        for (const base of [ORT_LOCAL, ORT_CDN]) {
-            try {
-                const ort = await import(/* @vite-ignore */ base + ORT_FILE)
-                ort.env.wasm.wasmPaths = base
-                ort.env.wasm.numThreads = (typeof self !== 'undefined' && self.crossOriginIsolated)
-                    ? Math.max(1, Math.min(4, ((typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4) - 1))
-                    : 1
-                return ort
-            } catch { /* try next source */ }
-        }
-        throw new Error('onnxruntime-web unavailable (no vendored copy and CDN blocked)')
-    })()
-    return ortPromise
-}
-
-const vocabCache = new Map() // scale → { [id]: label }
-const loadVocab = async (scale) => {
-    if (!vocabCache.has(scale)) vocabCache.set(scale, await (await fetch(vocabURL(scale))).json())
-    return vocabCache.get(scale)
-}
+const modelURL = new URL('../models/yoloe/yoloe-26l-text.fp16.onnx', import.meta.url).href
 
 let session = null
 let sessionPromise = null
-let loadedScale = null
-let loadedEps = null // the EP preference the session was built under
 let backend = null // 'webgpu' | 'wasm' — the EP that actually built
 
-/** Build the session for `scale`, trying the allowed EPs in order (ORT falls
- *  back silently inside a multi-EP list, so probe one at a time to record the
- *  EP). GPU-first on every vendor; wasm is the floor, and the only lane when
- *  the pressure ratchet has cleared detectorWebGPU. */
-const buildSession = async (ort, scale, eps) => {
+/** Build the session, trying WebGPU then WASM (ORT falls back silently inside a
+ *  multi-EP list, so probe one at a time to record the EP). A software adapter is
+ *  skipped outright — it builds fine and then runs slower than WASM. */
+const buildSession = async (ort) => {
     let lastErr
+    const eps = (await webgpuWorthTrying()) ? ['webgpu', 'wasm'] : ['wasm']
     for (const ep of eps) {
         try {
-            const s = await ort.InferenceSession.create(modelURL(scale), {
+            const s = await ort.InferenceSession.create(modelURL, {
                 executionProviders: [ep],
                 graphOptimizationLevel: 'all',
             })
@@ -80,32 +62,15 @@ const buildSession = async (ort, scale, eps) => {
     throw lastErr || new Error('yoloe: no execution provider available')
 }
 
-export const loadYoloe = (scale = 's', { webgpu = true } = {}) => {
-    if (!SCALES.has(scale)) scale = 's'
-    const eps = webgpu ? ['webgpu', 'wasm'] : ['wasm']
-    const epsKey = eps.join()
-    if (session && loadedScale === scale && loadedEps === epsKey) return Promise.resolve(session)
-    if (sessionPromise && loadedScale === scale && loadedEps === epsKey) return sessionPromise
-    if (session) disposeYoloe() // scale/EP switch — release the old session first
-    loadedScale = scale
-    loadedEps = epsKey
+export const loadYoloe = () => {
+    if (session) return Promise.resolve(session)
+    if (sessionPromise) return sessionPromise
     sessionPromise = (async () => {
         const ort = await loadOrt()
-        try {
-            await loadVocab(scale)
-            session = await buildSession(ort, scale, eps)
-        } catch (err) {
-            // The requested scale's files may simply not be deployed ('s' is the
-            // baseline every deploy vendors) — fall back rather than fail search.
-            if (scale === 's') throw err
-            console.warn(`[seglab] yoloe-26${scale} unavailable (${err?.message}); falling back to scale s`)
-            loadedScale = 's'
-            await loadVocab('s')
-            session = await buildSession(ort, 's', eps)
-        }
+        session = await buildSession(ort)
         return session
     })()
-    sessionPromise.catch(() => { if (loadedEps === epsKey) { sessionPromise = null; loadedScale = null; loadedEps = null } })
+    sessionPromise.catch(() => { sessionPromise = null })
     return sessionPromise
 }
 
@@ -122,27 +87,32 @@ export const disposeYoloe = () => {
     const s = session
     session = null
     sessionPromise = null
-    loadedScale = null
-    loadedEps = null
     backend = null
     try { s?.release?.() } catch { /* already gone */ }
 }
 
-export const yoloeLoaded = () => !!session
-export const yoloeBackend = () => backend
-
 /**
  * Detect over `frame` — { data: RGB bytes, width, height } already letterboxed
- * into the 640² square (top-left) by the caller. Returns
- * { dets: [{ box:[x0,y0,x1,y1] normalized [0,1] to the square, score, label }],
- *   backend }. `scale` picks the model; `dispose`/`idleMs` free the session after.
+ * into the 640² square (top-left) by the caller — conditioned on `txtFeats`, a
+ * Float32Array of k×DIM L2-normalized MobileCLIP2 vectors (k = the caller's
+ * phrase count, up to MAX_SLOTS). Returns
+ * { dets: [{ box:[x0,y0,x1,y1] normalized [0,1] to the square, score, classIdx }],
+ *   backend }. classIdx indexes the caller's phrase list.
+ *
+ * Exactly k classes are fed, never a padded 32. The head emits each anchor once
+ * per class into a fixed top-300, so padding by repetition spent the whole
+ * budget on duplicates — measured 10 unique boxes out of 300 for a one-phrase
+ * query, which capped recall at ~10 instances regardless of the scene.
  */
-export const detectYoloe = async ({ frame, threshold = 0.25, scale = 's', webgpu = true, dispose = false, idleMs = 0 }) => {
+export const detectYoloe = async ({ frame, txtFeats, threshold = 0.25, dispose = false, idleMs = 0 }) => {
     cancelIdle()
     const ort = await loadOrt()
-    const s = await loadYoloe(scale, { webgpu })
-    const vocab = await loadVocab(loadedScale || scale) // fallback may have loaded 's'
+    const s = await loadYoloe()
     const side = YOLOE_INPUT
+    // Per-cell cost, measured from HERE — after the session exists. A cold
+    // build is a one-off of the worker's life; hardware-fit budgets the part
+    // that repeats per cell.
+    const t0 = performance.now()
     try {
         // RGB bytes → NCHW float32 [0,1]. frame is exactly side², 3-channel.
         const d = frame.data
@@ -153,8 +123,12 @@ export const detectYoloe = async ({ frame, threshold = 0.25, scale = 's', webgpu
             chw[plane + p] = d[i + 1] / 255
             chw[2 * plane + p] = d[i + 2] / 255
         }
-        const input = new ort.Tensor('float32', chw, [1, 3, side, side])
-        const out = await s.run({ [s.inputNames[0]]: input })
+        const nc = Math.floor(txtFeats.length / DIM)
+        if (nc < 1) throw new Error('yoloe: no class embeddings')
+        const out = await s.run({
+            images: new ort.Tensor('float32', chw, [1, 3, side, side]),
+            txt_feats: new ort.Tensor('float32', txtFeats, [1, nc, DIM]),
+        })
         const o0 = out[s.outputNames[0]] // [1, 300, 38]
         const [, n, ch] = o0.dims
         const data = o0.data
@@ -165,10 +139,13 @@ export const detectYoloe = async ({ frame, threshold = 0.25, scale = 's', webgpu
             if (score < threshold) continue
             let x1 = data[b]; let y1 = data[b + 1]; let x2 = data[b + 2]; let y2 = data[b + 3]
             if (Math.max(x1, y1, x2, y2) <= 1.5) { x1 *= side; y1 *= side; x2 *= side; y2 *= side } // normalized guard
-            const cls = Math.round(data[b + 5])
-            dets.push({ box: [x1 / side, y1 / side, x2 / side, y2 / side], score, label: vocab[cls] ?? `#${cls}` })
+            dets.push({
+                box: [x1 / side, y1 / side, x2 / side, y2 / side],
+                score,
+                classIdx: Math.round(data[b + 5]),
+            })
         }
-        return { dets, backend }
+        return { dets, backend, inferMs: performance.now() - t0 }
     } finally {
         if (dispose) disposeYoloe()
         else scheduleIdle(idleMs)

@@ -1,10 +1,10 @@
 /**
  * model-registry — the lightweight "notepad" of models this browser already
- * holds. localStorage, read synchronously at boot: the UI can say "slimsam ✓"
+ * holds. localStorage, read synchronously at boot: the UI can say "sam21 ✓"
  * without opening Cache Storage, OPFS, or fetching a manifest. Written when a
  * download completes / a lane becomes ready; absence of an entry means "will
  * download on first use", never an error. Registry is a HINT for display —
- * loading still goes through model-assets/transformers cache as the truth.
+ * the Cache Storage / OPFS copy is the truth.
  */
 
 const KEY = 'seglab.modelRegistry.v1'
@@ -15,7 +15,7 @@ const read = () => {
     try { return JSON.parse(localStorage.getItem(KEY)) || {} } catch { return {} }
 }
 
-/** { slimsam: {device, notedAt, …}, gdino: {…}, owlv2: {…}, yoloe: {…} } */
+/** { sam21: {device, notedAt, …}, yoloe: {…}, clip: {…} } */
 export const modelRegistry = () => (cache ??= read())
 
 /** Record (or update) a model the browser now holds. Merges meta. */
@@ -30,11 +30,10 @@ export const noteModel = (id, meta = {}) => {
 
 export const isModelNoted = (id) => Boolean(modelRegistry()[id])
 
-/** Lane id from a transformers/detect progress event's model name. */
+/** Lane id from a download-progress event's model name. */
 export const laneOfModel = (name = '') => {
-    if (/yolo-?world/i.test(name)) return 'yoloworld'
-    if (/clip/i.test(name)) return 'clip'
+    if (/clip/i.test(name)) return 'clip' // text encoder + its BPE/table assets
     if (/yoloe/i.test(name)) return 'yoloe'
-    if (/slimsam|sam/i.test(name)) return 'slimsam'
+    if (/sam/i.test(name)) return 'sam21' // one mask lane, so any SAM is that one
     return null
 }

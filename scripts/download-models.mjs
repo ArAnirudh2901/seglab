@@ -1,25 +1,20 @@
 #!/usr/bin/env node
 /**
  * Vendors every runtime asset SEGLAB needs, so the app serves fully offline:
- *   lib/transformers/transformers.min.js     — pinned transformers.js bundle
- *   lib/ort/ort-wasm-simd-threaded*.{mjs,wasm} — ORT wasm (asyncify = Chromium/FF
- *                                              pair, plain = Safari pair)
- *   models/Xenova/slimsam-77-uniform/…       — SlimSAM fp32 (WebGPU) + q8 (WASM)
- *   models/onnx-community/grounding-dino-…/…  — Grounding DINO q4f16, --detector
- *   models/onnx-community/owlv2-…/…          — OWLv2 q8, only with --detector
- *   models/manifest.json                     — presence signal read at runtime
+ *   lib/ort-web/…              — onnxruntime-web (WebGPU ESM bundle + wasm loader)
+ *   models/manifest.json       — presence signal read at runtime
  *
- * lib/ and models/ are gitignored (~90 MB core, +314 MB with --detector).
- * Idempotent: complete files are skipped. Fails loudly if the
- * transformers→ORT version pin ever drifts.
+ * Everything else is BUILT, not fetched — no hub publishes the exact artifacts
+ * this app runs — so this script verifies those exist and names the script that
+ * produces each one.
+ *
+ * lib/ and models/ are gitignored (~25 MB fetched, ~92 MB built core).
+ * Idempotent: complete files are skipped.
  *
  * Usage: node scripts/download-models.mjs [--detector]
  *
  *   (core)       click/box/lasso selection + export run with no network.
- *   --detector   also vendors both text-select lanes so "phrase → boxes" is
- *                offline on any device: Grounding DINO q4f16 (accelerated) and
- *                OWLv2 q8 (universal fallback). Skipped by default — 314 MB,
- *                and the feature is optional/disposable at runtime.
+ *   --detector   also registers the open-vocabulary text-search artifacts.
  */
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
@@ -28,103 +23,73 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-const TRANSFORMERS_VERSION = '4.2.0'
-// Must equal dependencies["onnxruntime-web"] of the pinned transformers build.
-const ORT_VERSION = '1.26.0-dev.20260416-b7804b056c'
-// Standalone onnxruntime-web for the YOLOE text lane (js/yoloe-detect.js) — a
-// separate pin from the transformers-bundled ORT above.
-const ORT_WEB_VERSION = '1.22.0'
-const SLIMSAM = 'Xenova/slimsam-77-uniform'
-// Must equal DETECTORS in js/detect-engine.js (model + weightFile per lane).
-const OWLV2 = 'onnx-community/owlv2-base-patch16-ensemble-ONNX'
-const GDINO = 'onnx-community/grounding-dino-tiny-ONNX'
+// The ONE runtime. There is no second ORT build and no transformers.js: the
+// SlimSAM lane that needed them is gone, and with it ~35 MB of wasm and a
+// version-pin check that existed only to keep those two in step.
+//
+// MUST be >= 1.24.3. The 1.22 WebGPU fp16 kernels compute SAM 2.1's encoder
+// WRONG — silently, with a confident-looking mask covering 99.6% of the frame
+// (spikes/sam21/FINDINGS.md §1.2). fp16 is what keeps resident memory under
+// 2 GB, so downgrading this re-breaks the memory contract as well as quality.
+// spikes/sam21/ortver.html is the gate: re-run it on any change here.
+const ORT_WEB_VERSION = '1.27.0'
+
+const ORT_WEB_FILES = [
+    'ort.webgpu.bundle.min.mjs',
+    // 1.23+ renamed the WebGPU-capable wasm from .jsep to .asyncify; the bundle
+    // dynamically imports it, so the old names produce "no available backend".
+    'ort-wasm-simd-threaded.asyncify.mjs',
+    'ort-wasm-simd-threaded.asyncify.wasm',
+]
+
+// The mask lane. Core, not optional — without these the app cannot segment at
+// all, so a missing one is a hard failure rather than a note.
+const CORE_ASSETS = [
+    ['models/sam21/encoder.fp16.onnx', 'python3 scripts/export-sam21.py'],
+    ['models/sam21/decoder.fp16.onnx', 'python3 scripts/export-sam21.py'],
+    ['models/sam21/model.json', 'python3 scripts/export-sam21.py'],
+]
+
+// Open-vocabulary text search. Built locally: no hub publishes a YOLOE
+// text-prompt ONNX, and the text tower has to be the MobileCLIP2-B one
+// YOLOE-26L was trained against or RepRTA receives out-of-distribution vectors.
+const DETECTOR_ASSETS = [
+    ['models/yoloe/yoloe-26l-text.fp16.onnx', 'python3 scripts/export-yoloe-text.py'],
+    ['models/clip-text/mclip2-text.q4.onnx', 'python3 scripts/export-clip-text.py'],
+    ['models/clip-text/mclip2-embed.i8', 'python3 scripts/export-clip-text.py'],
+    ['models/clip-text/mclip2-embed.scale.f32', 'python3 scripts/export-clip-text.py'],
+    ['models/clip-text/merges.txt', 'python3 scripts/export-clip-text.py'],
+]
 
 const withDetector = process.argv.includes('--detector')
 
-const ORT_FILES = [
-    'ort-wasm-simd-threaded.asyncify.mjs',
-    'ort-wasm-simd-threaded.asyncify.wasm',
-    'ort-wasm-simd-threaded.mjs',
-    'ort-wasm-simd-threaded.wasm',
-]
-// YOLOE lane runtime: the WebGPU ESM bundle + its jsep wasm loader + wasm binary
-// (the bundle still fetches the .jsep.mjs loader at runtime).
-const ORT_WEB_FILES = [
-    'ort.webgpu.bundle.min.mjs',
-    'ort-wasm-simd-threaded.jsep.mjs',
-    'ort-wasm-simd-threaded.jsep.wasm',
-]
-// fp32 (unsuffixed) serves device:webgpu, q8 (_quantized) serves device:wasm —
-// exactly the dtypes pinned in js/sam-engine.js LANES.draft.
-const SLIMSAM_FILES = [
-    'config.json',
-    'preprocessor_config.json',
-    { file: 'quantize_config.json', optional: true },
-    'onnx/vision_encoder.onnx',
-    'onnx/vision_encoder_quantized.onnx',
-    'onnx/prompt_encoder_mask_decoder.onnx',
-    'onnx/prompt_encoder_mask_decoder_quantized.onnx',
-]
-
-// q8 only — the exact dtype js/detect-engine.js pins for the OWLv2 WASM lane.
-const OWLV2_FILES = [
-    'config.json',
-    'preprocessor_config.json',
-    'tokenizer.json',
-    'tokenizer_config.json',
-    'onnx/model_quantized.onnx',
-]
-
-// q4f16 only — the exact dtype js/detect-engine.js pins for the accelerated
-// Grounding DINO WebGPU lane.
-const GDINO_FILES = [
-    'config.json',
-    'preprocessor_config.json',
-    'tokenizer.json',
-    'tokenizer_config.json',
-    'onnx/model_q4f16.onnx',
-]
-
-const hubJobs = (repo, files) => files.map((entry) => {
-    const file = typeof entry === 'string' ? entry : entry.file
-    return {
-        url: `https://huggingface.co/${repo}/resolve/main/${file}`,
-        dest: `models/${repo}/${file}`,
-        optional: typeof entry === 'object' && entry.optional,
-    }
-})
-
-const jobs = [
-    {
-        url: `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/transformers.min.js`,
-        dest: 'lib/transformers/transformers.min.js',
-    },
-    ...ORT_FILES.map((f) => ({
-        url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/${f}`,
-        dest: `lib/ort/${f}`,
-    })),
-    ...(withDetector ? ORT_WEB_FILES.map((f) => ({
-        url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_WEB_VERSION}/dist/${f}`,
-        dest: `lib/ort-web/${f}`,
-    })) : []),
-    ...hubJobs(SLIMSAM, SLIMSAM_FILES),
-    ...(withDetector ? hubJobs(GDINO, GDINO_FILES) : []),
-    ...(withDetector ? hubJobs(OWLV2, OWLV2_FILES) : []),
-]
+const jobs = ORT_WEB_FILES.map((f) => ({
+    url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_WEB_VERSION}/dist/${f}`,
+    dest: `lib/ort-web/${f}`,
+}))
 
 const log = (msg) => console.log(`[download-models] ${msg}`)
-const mb = (n) => `${(n / 1024 / 1024).toFixed(2)} MB`
 
-const assertOrtPin = async () => {
-    const res = await fetch(`https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/package.json`)
-    if (!res.ok) throw new Error(`cannot read transformers package.json (HTTP ${res.status})`)
-    const pinned = (await res.json()).dependencies?.['onnxruntime-web']
-    if (pinned !== ORT_VERSION) {
-        throw new Error(`ORT pin drift: transformers@${TRANSFORMERS_VERSION} wants onnxruntime-web@${pinned}, `
-            + `this script vendors ${ORT_VERSION} — update ORT_VERSION and re-run`)
+// ORT-Web forwards only a fixed key list from a WebGPU EP options object to the
+// native EP, and the buffer cache modes are not on it — so the one setting that
+// keeps this app under its RAM ceiling is unreachable through public API.
+// (js/ort-loader.js webgpuEP: Bucket 1128 MB of GPU process vs 290 MB with
+// lazyRelease, identical logits.) Forward an `epConfig` bag instead.
+//
+// A one-line, anchored patch on a DERIVED artifact. It throws if the anchor is
+// gone, so an ORT bump fails here rather than silently costing ~840 MB;
+// verify.mjs gates the vendored copy carrying it.
+const ORT_EP_ANCHOR = 'S.validationMode&&ot(l,"validationMode",S.validationMode,s)'
+const ORT_EP_PATCH = ',S.epConfig&&Object.entries(S.epConfig).forEach(([Ck,Cv])=>ot(l,Ck,String(Cv),s))'
+const patchOrtBundle = (buf) => {
+    const src = buf.toString('utf8')
+    if (src.includes('S.epConfig')) return buf
+    if (!src.includes(ORT_EP_ANCHOR)) {
+        throw new Error(`ORT ${ORT_WEB_VERSION}: epConfig anchor missing — re-derive the patch in download-models.mjs`)
     }
-    log(`pin ok: transformers@${TRANSFORMERS_VERSION} ↔ onnxruntime-web@${ORT_VERSION}`)
+    return Buffer.from(src.replace(ORT_EP_ANCHOR, ORT_EP_ANCHOR + ORT_EP_PATCH), 'utf8')
 }
+const mb = (n) => `${(n / 1024 / 1024).toFixed(2)} MB`
 
 // Idempotency is manifest-based: CDN content-length reports the compressed
 // size when content-encoding is active, so it cannot be compared to disk.
@@ -144,33 +109,61 @@ const download = async ({ url, dest, optional }) => {
         if (optional) { log(`skip (optional, HTTP ${res.status}): ${dest}`); return null }
         throw new Error(`GET failed for ${url} (HTTP ${res.status})`)
     }
-    const buf = Buffer.from(await res.arrayBuffer())
+    let buf = Buffer.from(await res.arrayBuffer())
     const remoteBytes = Number(res.headers.get('content-length')) || null
     const encoded = !!res.headers.get('content-encoding')
     if (!encoded && remoteBytes && buf.length !== remoteBytes) {
         throw new Error(`size mismatch for ${dest}: got ${buf.length}, expected ${remoteBytes}`)
     }
     if (buf.length === 0) throw new Error(`empty download for ${dest}`)
+    if (dest.endsWith('ort.webgpu.bundle.min.mjs')) buf = patchOrtBundle(buf)
     await mkdir(path.dirname(target), { recursive: true })
     await writeFile(target, buf)
     log(`got  ${dest} (${mb(buf.length)})`)
     return { path: dest, bytes: buf.length }
 }
 
-await assertOrtPin()
+/** Verify built assets rather than fetching them, and say exactly how to
+ *  produce a missing one instead of failing with a bare path. */
+const verifyBuilt = async (assets, files) => {
+    const missing = []
+    for (const [rel, how] of assets) {
+        const local = await stat(path.join(ROOT, rel)).catch(() => null)
+        if (local?.size) { log(`have ${rel} (${mb(local.size)})`); files.push({ path: rel, bytes: local.size }) }
+        else missing.push([rel, how])
+    }
+    for (const [rel, how] of missing) log(`MISSING ${rel} — build it with: ${how}`)
+    return missing
+}
+
 const files = []
 for (const job of jobs) {
     const entry = await download(job)
     if (entry) files.push(entry)
 }
+
+// Also on the cache-hit path: a checked-out tree already has the bundle at the
+// manifest's size, so nothing would re-download it and the patch would be lost.
+{
+    const entry = files.find((f) => f.path.endsWith('ort.webgpu.bundle.min.mjs'))
+    const target = path.join(ROOT, entry.path)
+    const patched = patchOrtBundle(await readFile(target))
+    if (patched.length !== entry.bytes) {
+        await writeFile(target, patched)
+        entry.bytes = patched.length
+        log(`patched ${entry.path} (epConfig passthrough)`)
+    }
+}
+
+const missingCore = await verifyBuilt(CORE_ASSETS, files)
+let detectorReady = false
+if (withDetector) detectorReady = (await verifyBuilt(DETECTOR_ASSETS, files)).length === 0
+
 const manifest = {
-    transformers: TRANSFORMERS_VERSION,
-    onnxruntimeWeb: ORT_VERSION,
-    onnxruntimeWebYoloe: withDetector ? ORT_WEB_VERSION : null,
-    model: SLIMSAM,
-    models: withDetector ? [SLIMSAM, GDINO, OWLV2] : [SLIMSAM],
-    detector: withDetector ? OWLV2 : null,
-    detectors: withDetector ? [GDINO, OWLV2] : [],
+    onnxruntimeWeb: ORT_WEB_VERSION,
+    lane: 'sam2.1-small',
+    precision: 'fp16',
+    detector: detectorReady ? 'yoloe-26l-text + mobileclip2-b' : null,
     generatedAt: new Date().toISOString(),
     files,
 }
@@ -178,4 +171,9 @@ await mkdir(path.join(ROOT, 'models'), { recursive: true })
 await writeFile(path.join(ROOT, 'models', 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 const total = files.reduce((sum, f) => sum + f.bytes, 0)
 log(`done — ${files.length} files, ${mb(total)} total; wrote models/manifest.json`)
-if (!withDetector) log('text-select (Grounding DINO + OWLv2) not vendored — re-run with --detector to make it offline too')
+if (!withDetector) log('open-vocab text search not registered — re-run with --detector once the export scripts have run')
+// Loud, and last, so it is the thing left on screen: the app cannot segment
+// without these, and a silent manifest would let that surface as a runtime bug.
+if (missingCore.length) {
+    throw new Error(`mask lane incomplete — ${missingCore.length} core asset(s) missing; see MISSING lines above`)
+}
