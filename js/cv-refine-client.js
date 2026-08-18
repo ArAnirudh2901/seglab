@@ -59,7 +59,6 @@ const getWorker = () => {
 }
 
 export const cvRefineAvailable = () => !broken && simdSupported()
-export const cvRefineLoaded = () => !!worker
 
 /** Terminate the worker (memory pressure ≥ 2, new document, before export). */
 export const disposeCvRefine = () => {

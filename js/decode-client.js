@@ -8,7 +8,7 @@
 import { enqueueHeavy, STALE } from './heavy-job-queue.js'
 import { readImageMeta } from './image-io.js'
 import { decodeBoundedBitmap, decodeWithWorkingCopy, decodeOpaqueBounded } from './decode-core.js'
-import { interactionPlan } from './proxy-plan.js'
+import { interactionPlan, planBudget } from './proxy-plan.js'
 
 export { STALE }
 
@@ -50,27 +50,59 @@ const getWorker = () => {
     }
 }
 
+/** A worker the OS killed under memory pressure does NOT always fire `onerror`
+ *  — it simply stops answering, and an un-timed round-trip then never settles.
+ *  That wedged the whole heavy queue (one job at a time), so the next import sat
+ *  on its spinner forever. Bound every call and rebuild the worker on expiry;
+ *  the next decode gets a live one instead of piling onto a corpse. */
+const TIMEOUT_MS = { meta: 20_000, default: 90_000 }
+
+const killWorker = (why) => {
+    console.warn('[seglab][decode] worker unresponsive; rebuilding:', why)
+    const w = worker
+    worker = null
+    for (const [, entry] of pending) entry.reject(new Error('decode worker unresponsive'))
+    pending.clear()
+    try { w?.terminate() } catch { /* already dead */ }
+}
+
 const post = (msg, transfer = []) => {
     const w = getWorker()
     if (!w) return null
     seq += 1
     const requestId = `d${seq}`
     return new Promise((resolve, reject) => {
-        pending.set(requestId, { resolve, reject })
+        const ms = TIMEOUT_MS[msg.type] ?? TIMEOUT_MS.default
+        const timer = setTimeout(() => {
+            if (!pending.has(requestId)) return
+            pending.delete(requestId)
+            reject(new Error(`decode (${msg.type}) timed out after ${Math.round(ms / 1000)}s`))
+            killWorker(msg.type)
+        }, ms)
+        const done = (fn) => (v) => { clearTimeout(timer); fn(v) }
+        pending.set(requestId, { resolve: done(resolve), reject: done(reject) })
         try {
             w.postMessage({ ...msg, requestId }, transfer)
         } catch (err) {
+            clearTimeout(timer)
             pending.delete(requestId)
             reject(err)
         }
     })
 }
 
-/** Header meta (dims + EXIF orientation) — cheap, not queued. */
+/** Header meta (dims + EXIF orientation) — cheap, not queued. Falls back to the
+ *  inline parser when the worker is missing OR unresponsive: the same code path,
+ *  and an import must not die because a worker went away. */
 export const readMeta = async (blob) => {
     const roundtrip = post({ type: 'meta', blob })
-    if (roundtrip) return (await roundtrip).meta
-    return readImageMeta(blob)
+    if (!roundtrip) return readImageMeta(blob)
+    try {
+        return (await roundtrip).meta
+    } catch (err) {
+        console.warn('[seglab][decode] meta via worker failed; parsing inline:', err?.message)
+        return readImageMeta(blob)
+    }
 }
 
 /**
@@ -86,8 +118,15 @@ export const decodeProxy = ({
         type: 'decode-proxy', revision, blob, decodeW, decodeH, scale, orientation, wantWorking, workingMaxSide, displaySide,
     })
     if (roundtrip) {
-        const res = await roundtrip
-        return { bitmap: res.bitmap, working: res.working, display: res.display || null }
+        try {
+            const res = await roundtrip
+            return { bitmap: res.bitmap, working: res.working, display: res.display || null }
+        } catch (err) {
+            // Worker gone or unresponsive: decode inline rather than failing the
+            // import. Same bounds, so the memory ceiling is unchanged — it just
+            // costs this thread's time instead of the worker's.
+            console.warn('[seglab][decode] proxy via worker failed; decoding inline:', err?.message)
+        }
     }
     if (wantWorking) return decodeWithWorkingCopy(blob, { w: decodeW, h: decodeH }, scale, workingMaxSide, displaySide)
     return { bitmap: await decodeBoundedBitmap(blob, decodeW, decodeH, scale, orientation), working: null, display: null }
@@ -97,13 +136,10 @@ export const decodeProxy = ({
 export const decodeOpaque = ({ blob, budget, revision = null, isCurrent = null }) => enqueueHeavy(
     'decode-proxy',
     async () => {
-        const slim = {
-            proxyMax: budget.proxyMax,
-            proxyMode: budget.proxyMode,
-            directMaxMP: budget.directMaxMP,
-            directMaxSide: budget.directMaxSide,
-            safeProxyMax: budget.safeProxyMax,
-        }
+        // Owned by proxy-plan, next to the function that reads it — a
+        // hand-kept copy of this list drifted and sized opaque formats
+        // differently from every other import path.
+        const slim = planBudget(budget)
         const roundtrip = post({ type: 'decode-opaque', revision, blob, budget: slim })
         if (roundtrip) {
             const res = await roundtrip

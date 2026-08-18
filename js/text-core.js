@@ -24,6 +24,30 @@ const COLOR_WORDS = new Map([
 ])
 const COLOR_FILLERS = new Set(['color', 'colour', 'colored', 'coloured'])
 
+/**
+ * Words that start a post-modifier, i.e. everything after them describes the
+ * SETTING rather than the subject. The head noun is whatever sits in front.
+ *
+ * The normalizer below otherwise takes the LAST word as the head, which is right
+ * for "orange tulip" and badly wrong for "the dog sitting among the flowers" —
+ * it heads on "flowers", and the detector, which scores a phrase as a bag of
+ * words, then happily boxes flowers for a photo with no dog in it. Measured on
+ * the canonical NEF: that phrase returned 5 boxes and "snow covering the
+ * flowers" returned 6, all of them flowers.
+ *
+ * "of" is deliberately NOT here: "a cluster of blue florets" would head on
+ * "cluster" and lose the subject entirely.
+ */
+const POST_MODIFIER = new Set([
+    'in', 'on', 'at', 'among', 'amongst', 'behind', 'near', 'nearby', 'under',
+    'underneath', 'over', 'above', 'below', 'beneath', 'beside', 'between',
+    'against', 'inside', 'outside', 'atop', 'around', 'across', 'along',
+    'that', 'which', 'who',
+    'sitting', 'standing', 'lying', 'covering', 'covered', 'holding', 'held',
+    'wearing', 'worn', 'resting', 'hanging', 'growing', 'floating', 'leaning',
+    'walking', 'running', 'playing', 'parked', 'placed', 'surrounded',
+])
+
 // -ves and mutated plurals that strip-the-s mangles ("leaves" → "leave").
 const IRREGULAR_PLURALS = new Map([
     ['leaves', 'leaf'], ['wolves', 'wolf'], ['shelves', 'shelf'], ['halves', 'half'],
@@ -36,9 +60,9 @@ const IRREGULAR_PLURALS = new Map([
 const depluralize = (w) => IRREGULAR_PLURALS.get(w)
     || (w.length > 3 && w.endsWith('s') && !NEVER_PLURAL.test(w) ? w.slice(0, -1) : w)
 
-/** Raw phrase → detector label(s) + selection intent.
- * "all red zebras" sends both the exact phrase and the object-only fallback.
- * The latter finds boxes more reliably; a colour check ranks its results. */
+/** Raw phrase → detector cores + selection intent. Bare nouns only: YOLOE's text
+ *  tower was trained on class names, and a "a photo of a …" wrapper only dilutes
+ *  them. `objectCore` drops any colour word; a colour check ranks its results. */
 export const normalizePhrase = (raw) => {
     const clean = String(raw || '').trim().toLowerCase().replace(/\s+/g, ' ')
     if (!clean) return null
@@ -53,23 +77,23 @@ export const normalizePhrase = (raw) => {
     const objectCore = color
         ? words.filter((word) => !COLOR_WORDS.has(word) && !COLOR_FILLERS.has(word)).join(' ')
         : core
-    const labels = [`a photo of a ${core}`]
-    if (color && objectCore && objectCore !== core) labels.push(`a photo of a ${objectCore}`)
+    // The subject, with any "… sitting among the flowers" setting cut off. Null
+    // when the phrase has no post-modifier, so callers can tell "no subject to
+    // check separately" from "the subject IS the whole phrase".
+    const cut = (objectCore || core).split(' ')
+    const at = cut.findIndex((w, i) => i > 0 && POST_MODIFIER.has(w))
+    const headWords = at > 0 ? cut.slice(0, at) : null
+    if (headWords) headWords[headWords.length - 1] = depluralize(headWords[headWords.length - 1])
+    const headCore = headWords?.length ? headWords.join(' ') : null
     return {
         core,
         objectCore: objectCore || core,
+        headCore: headCore && headCore !== (objectCore || core) ? headCore : null,
         color,
-        labels,
         multi: COUNT_INTENT.test(clean) || words[words.length - 1] !== head,
         display: clean,
     }
 }
-
-/** CLIP-style templates help OWLv2 rank but hurt Grounding DINO: its grounded
- *  head scores boxes per token, so "a photo of" lets scene-sized boxes match.
- *  Strip back to the bare noun phrase for the grounding lane. */
-export const bareLabel = (label) => String(label).toLowerCase().trim()
-    .replace(/^a photo of (a|an|the) /, '').replace(/\.+$/, '')
 
 /** True when a baked-vocab `label` satisfies the phrase's object `core`
  *  (normalizePhrase.objectCore). Single-word core: whole-word match incl. plural
@@ -142,25 +166,44 @@ const sameObject = (a, b, gap) => {
     return false
 }
 
-/** Collapse detector fragments of ONE object into a single box. A singular
- *  phrase means one thing, so grow the top box with every fragment that
- *  belongs to it (transitively) and drop the rest; a distinct second object
- *  stays separate and loses to the top box. */
-export const collapseToObject = (dets, { gap = 1.5 } = {}) => {
+/** Group detector fragments into distinct objects. Fragments of one thing merge
+ *  transitively into a single box; a second object that stays apart is its own
+ *  cluster and is KEPT — several instances of the class the phrase named are all
+ *  answers, not rivals for one slot. Best score first. */
+export const clusterObjects = (dets, { gap = 1.5 } = {}) => {
     if (dets.length <= 1) return dets
     const order = [...dets].sort((p, q) => q.score - p.score)
-    let box = order[0].box.slice()
-    const used = new Set([0])
-    for (let grew = true; grew;) {
-        grew = false
-        for (let i = 1; i < order.length; i += 1) {
-            if (used.has(i) || !sameObject(box, order[i].box, gap)) continue
-            box = boxUnion(box, order[i].box)
-            used.add(i)
-            grew = true
+    const n = order.length
+    // Still-unclaimed detections as a linked list in score order. A growing box
+    // has to be re-tested against what is left, but not against what it already
+    // absorbed: the flag array made every sweep walk the full list and re-read
+    // members it had taken on the previous one. Unlinking is O(1) and keeps the
+    // order, so the head is always the best-scoring survivor — the seed rule.
+    const next = new Int32Array(n)
+    for (let i = 0; i < n - 1; i += 1) next[i] = i + 1
+    next[n - 1] = -1
+    let head = 0
+    const out = []
+    while (head >= 0) {
+        const seed = head
+        head = next[seed]
+        let box = order[seed].box.slice()
+        for (let grew = true; grew;) {
+            grew = false
+            let prev = -1
+            for (let i = head; i >= 0;) {
+                if (!sameObject(box, order[i].box, gap)) { prev = i; i = next[i]; continue }
+                box = boxUnion(box, order[i].box)
+                const skip = next[i]
+                if (prev < 0) head = skip
+                else next[prev] = skip
+                grew = true
+                i = skip
+            }
         }
+        out.push({ ...order[seed], box })
     }
-    return [{ ...order[0], box }]
+    return out
 }
 
 /** Where a w×h frame sits inside the padded square: scaled by `k` to dw×dh at
@@ -168,6 +211,49 @@ export const collapseToObject = (dets, { gap = 1.5 } = {}) => {
 export const letterboxPlan = (w, h, side = DETECTOR_INPUT) => {
     const k = side / Math.max(w, h)
     return { side, k, dw: Math.max(1, Math.round(w * k)), dh: Math.max(1, Math.round(h * k)) }
+}
+
+/** How far the full-frame pass shrinks the photo to reach the detector's square.
+ *  A 45 MP DSLR frame at 640 is ~13x, so anything under ~200 px in the original
+ *  lands below 16 px and is effectively invisible to the detector. */
+export const shrinkFactor = (w, h, side = YOLOE_INPUT) => Math.max(w, h) / side
+
+/**
+ * Overlapping detector tiles, in ORIGINAL pixel coordinates.
+ *
+ * The detector input is a fixed square, so a big photo is squeezed into it and
+ * small subjects fall below the resolution floor — the reason a dense field of
+ * muscari scored 0.09 while a tulip in the same frame scored 0.60. Each tile is
+ * letterboxed into its own square, multiplying linear resolution by `grid`.
+ *
+ * Tiles overlap by `overlap` of a step so a subject on a seam is whole in at
+ * least one tile; the caller de-duplicates with NMS after mapping back.
+ * Returns [{ ox, oy, ow, oh, plan }] where plan is the cell's own letterbox.
+ */
+/** Tile overlap as a fraction of a step. Shared with proxy-plan's detectorPlan,
+ *  which derives the source resolution from the SMALLEST (corner) cell — the
+ *  two must agree or the cap starves the tiles it is sizing for. */
+export const TILE_OVERLAP = 0.15
+
+export const tilePlans = (w, h, side = YOLOE_INPUT, { grid = 2, overlap = TILE_OVERLAP } = {}) => {
+    const out = []
+    const stepX = w / grid
+    const stepY = h / grid
+    const padX = stepX * overlap
+    const padY = stepY * overlap
+    for (let gy = 0; gy < grid; gy += 1) {
+        for (let gx = 0; gx < grid; gx += 1) {
+            const x0 = Math.max(0, gx * stepX - padX)
+            const y0 = Math.max(0, gy * stepY - padY)
+            const x1 = Math.min(w, (gx + 1) * stepX + padX)
+            const y1 = Math.min(h, (gy + 1) * stepY + padY)
+            const ow = x1 - x0
+            const oh = y1 - y0
+            if (ow < 1 || oh < 1) continue
+            out.push({ ox: x0, oy: y0, ow, oh, plan: letterboxPlan(ow, oh, side) })
+        }
+    }
+    return out
 }
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v)
@@ -382,12 +468,101 @@ const containment = (outer, inner) => {
     return area > 0 ? (ix * iy) / area : 0
 }
 
+/** Which edges of `box` sit on an interior edge of the tile `cell` it came from
+ *  — i.e. the subject was cut by the tile, not by its own silhouette. An edge
+ *  that coincides with the IMAGE border is not clipping: nothing continues past
+ *  it. `tol` is in original px; letterbox rounding lands boxes a pixel or two
+ *  inside the cell, so an exact compare would miss every real clip. */
+export const clippedEdges = (box, cell, bounds, tol = 4) => {
+    const out = []
+    const at = (v, edge) => Math.abs(v - edge) <= tol
+    if (at(box[0], cell.ox) && cell.ox > tol) out.push('x0')
+    if (at(box[1], cell.oy) && cell.oy > tol) out.push('y0')
+    if (at(box[2], cell.ox + cell.ow) && cell.ox + cell.ow < bounds.w - tol) out.push('x1')
+    if (at(box[3], cell.oy + cell.oh) && cell.oy + cell.oh < bounds.h - tol) out.push('y1')
+    return out
+}
+
+/**
+ * Drop tile fragments that duplicate a whole-object detection.
+ *
+ * A tiled pass sees each subject once per tile it falls in, and every one of
+ * those views is cut off at the tile border — the box stops where the tile
+ * stops, not where the object does. Such a box is truncated EVIDENCE, not a
+ * detection, yet nothing distinguished it before: it carried a full score and
+ * competed on equal terms.
+ *
+ * Measured, both from the real detector:
+ *   · a streetcar spanning the seam — the full-frame pass boxed all of it (0.547)
+ *     and a tile fragment cut at two edges scored HIGHER (0.604), so plain NMS
+ *     deleted the complete box and kept the truncated one.
+ *   · a tulip — the top-scoring detection in the whole frame (0.702) was the
+ *     bottom half of the flower, cut exactly at the tile edge.
+ *
+ * Score cannot arbitrate this: a tight crop of half an object genuinely looks
+ * more like the phrase than the whole object does. Provenance can. So a clipped
+ * box that is mostly inside an unclipped one is the same object seen worse, and
+ * loses regardless of score. A clipped box with no unclipped rival survives
+ * untouched — that is the small-object case tiling exists for.
+ */
+export const dropClippedDuplicates = (dets, { cover = 0.7 } = {}) => {
+    const whole = dets.filter((d) => !d.clipped?.length)
+    if (!whole.length) return dets
+    return dets.filter((d) => !d.clipped?.length
+        || !whole.some((w) => w !== d && containment(w.box, d.box) >= cover))
+}
+
 /** Drop group boxes. Shown several instances, a detector also emits a box
  *  around the whole cluster; it survives NMS (low IoU against each member) but
  *  selects far more than the phrase asked for. A box that mostly contains 2+
  *  other kept detections is the cluster, not an instance — keep the members. */
-export const pruneContainers = (dets, { cover = 0.7 } = {}) => dets.filter((d) =>
-    dets.filter((m) => m !== d && containment(d.box, m.box) >= cover).length < 2)
+export const pruneContainers = (dets, { cover = 0.7 } = {}) => {
+    const n = dets.length
+    if (n < 3) return dets            // a cluster box needs 2 members to be one
+    // Areas up front, then stop at 2: the old form built a whole array of
+    // matches per detection just to read its length, so it did every pairwise
+    // containment even after the answer was settled. `cover` also bounds the
+    // pair geometrically — an inner box bigger than outer/cover cannot be
+    // covered — which rejects most pairs on a subtraction.
+    const area = new Float64Array(n)
+    for (let i = 0; i < n; i += 1) {
+        const b = dets[i].box
+        area[i] = (b[2] - b[0]) * (b[3] - b[1])
+    }
+    return dets.filter((d, i) => {
+        const cap = area[i] / cover     // no member bigger than this can be covered
+        const o = d.box
+        let held = 0
+        for (let j = 0; j < n; j += 1) {
+            if (area[j] > cap || j === i) continue
+            const m = dets[j].box
+            const ix = Math.min(o[2], m[2]) - Math.max(o[0], m[0])
+            if (ix <= 0) continue
+            const iy = Math.min(o[3], m[3]) - Math.max(o[1], m[1])
+            if (iy <= 0) continue
+            if (ix * iy >= cover * area[j] && (held += 1) === 2) return false
+        }
+        return true
+    })
+}
+
+/**
+ * Keep only what the phrase's SUBJECT matched; null when it matched nothing.
+ *
+ * The detector scores a phrase as a bag of words, so the setting keeps scoring
+ * on its own: "the dog sitting among the flowers" boxed 5 flowers in a photo
+ * with no dog. Answering "nothing" there is the gate. The other half is that a
+ * photo WITH a dog returned the dog AND the flowers — the setting exists to
+ * condition the score, and was never something the user asked to select.
+ *
+ * `subject` is null for a phrase with no post-modifier ("orange tulip"), where
+ * the subject IS the whole phrase and there is nothing to separate.
+ */
+export const filterToSubject = (dets, subject) => {
+    if (!subject) return dets
+    const hits = dets.filter((d) => subject.has(d.label))
+    return hits.length ? hits : null
+}
 
 /** Threshold → NMS → container prune → top-K, high score first. `relative`
  *  also drops boxes far below the best match: an open-vocabulary detector can

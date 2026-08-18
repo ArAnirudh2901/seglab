@@ -2,122 +2,322 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>SEGLAB — on-device segmentation</title>
 <style>
+    /* ══════════════════════════════════════════════════════════════════════
+       SEGLAB — Phosmith "Ink Depths" design language.
+
+       Pitch-black surfaces, 1.5px cream edges, hard offset shadows instead of
+       soft glows, 4px radii, JetBrains Mono uppercase labels with tabular
+       numerics. Nothing is fetched: the font stack falls back to the platform
+       monospace, because this app never touches the network.
+
+       Control sizing is driven by ONE variable (--tap), switched by the input
+       class the gesture layer detects — pointer devices get a 28px rail, a
+       finger gets 44px. Everything else inherits from that.
+       ══════════════════════════════════════════════════════════════════════ */
     :root {
-        --bg: #0b0d10;
-        --panel: #14171c;
-        --panel-2: #1a1e25;
-        --line: #262c35;
-        --text: #e8ecf1;
-        --dim: #8b94a1;
-        --accent: #35e0c2;
-        --accent-dim: rgba(53, 224, 194, 0.14);
-        --pos: #35e08a;
-        --neg: #ff5d6c;
-        --radius: 12px;
+        --void: #050505;
+        --shell: #05070B;
+        --chrome: #07090E;
+        --panel: rgba(14, 17, 24, 0.72);
+        --panel-solid: #0B0F16;
+        --elevated: rgba(14, 17, 24, 0.92);
+
+        --edge: rgba(244, 244, 245, 0.85);
+        --edge-soft: rgba(244, 244, 245, 0.42);
+        --edge-faint: rgba(244, 244, 245, 0.16);
+
+        --ink: #F4F4F5;
+        --ink-dim: #A1A8B4;
+        --ink-mute: #6B7280;
+        --on-accent: #03050A;
+
+        --cyan: #06B8D4;
+        --cyan-bright: #53D8FF;
+        --cyan-dim: rgba(6, 184, 212, 0.16);
+        --lime: #9BF95B;
+        --coral: #F43F5E;
+
+        --accent: var(--cyan);
+        --pos: var(--lime);
+        --neg: var(--coral);
+
+        --r: 4px;
+        --ease: cubic-bezier(0.16, 1, 0.3, 1);
+        --ease-slow: cubic-bezier(0.22, 1, 0.36, 1);
+        --tap: 28px;
+        --font: "JetBrains Mono", "SFMono-Regular", "Cascadia Code", ui-monospace, Menlo, monospace;
     }
+    /* A finger needs a target, not a rail. Set by js/gestures.js. */
+    body[data-input="touch"] { --tap: 44px; }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
     body {
-        background: var(--bg);
-        color: var(--text);
-        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--shell);
+        color: var(--ink);
+        font: 400 13px/1.45 var(--font);
+        letter-spacing: 0;
         display: flex;
         flex-direction: column;
         overflow: hidden;
         -webkit-tap-highlight-color: transparent;
+        overscroll-behavior: none;
+    }
+    /* Sparse grid, faded out downward — the Phosmith backdrop. Static: it must
+       never cost a frame while the canvas is doing real work. */
+    body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        background:
+            linear-gradient(rgba(244, 242, 232, 0.026) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(244, 242, 232, 0.026) 1px, transparent 1px);
+        background-size: 28px 28px;
+        mask-image: linear-gradient(180deg, black, transparent 78%);
+        -webkit-mask-image: linear-gradient(180deg, black, transparent 78%);
+    }
+    body > * { position: relative; z-index: 1; }
+
+    ::selection { background: rgba(155, 249, 91, 0.28); color: #f8ffe9; }
+
+    button, a, [role="button"], input {
+        font-family: inherit;
+    }
+    button:focus-visible,
+    input:focus-visible,
+    [role="button"]:focus-visible {
+        outline: 2px solid rgba(155, 249, 91, 0.72);
+        outline-offset: 3px;
     }
 
+    /* ── Chrome ─────────────────────────────────────────────────────────── */
     header {
         display: flex;
         align-items: center;
-        gap: 14px;
-        padding: 10px 16px;
-        border-bottom: 1px solid var(--line);
-        background: var(--panel);
-        flex-wrap: wrap;
+        gap: 10px;
+        padding: 7px 10px;
+        border-bottom: 1.5px solid var(--edge);
+        background:
+            linear-gradient(105deg, rgba(6, 184, 212, 0.09) 0%, transparent 55%),
+            var(--chrome);
+        box-shadow: 0 1px 0 0 var(--edge-faint);
+        flex: 0 0 auto;
     }
-    .brand { font-weight: 700; letter-spacing: 0.14em; font-size: 15px; }
-    .brand em { color: var(--accent); font-style: normal; }
-    .badge {
-        font-size: 11px;
-        color: var(--accent);
-        background: var(--accent-dim);
-        border: 1px solid rgba(53, 224, 194, 0.35);
-        padding: 2px 8px;
-        border-radius: 999px;
+    .brand {
+        display: inline-flex;
+        align-items: center;
+        height: var(--tap);
+        padding: 0 9px;
+        border: 1.5px solid var(--edge);
+        border-radius: var(--r);
+        background: #000;
+        box-shadow: 3px 3px 0 0 var(--cyan);
+        font-weight: 800;
+        font-size: 12px;
+        letter-spacing: 0.16em;
         white-space: nowrap;
+        flex: 0 0 auto;
     }
-    .spacer { flex: 1; }
+    .brand em { color: var(--cyan); font-style: normal; }
+    .spacer { flex: 1; min-width: 0; }
 
-    .modes { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-    .modes button { min-height: 36px; }
+    /* Tool rail — icon-only until there is genuine room for the words. It
+       scrolls sideways rather than hiding tools, so nothing becomes
+       undiscoverable on a small laptop. */
+    .modes {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        min-width: 0;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+        mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+        -webkit-mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+        padding-right: 12px;
+    }
+    .modes::-webkit-scrollbar { display: none; }
+    .modes .rule {
+        flex: 0 0 auto;
+        width: 1px;
+        height: calc(var(--tap) - 10px);
+        background: var(--edge-faint);
+        margin: 0 3px;
+    }
+
     button {
         appearance: none;
-        border: 1px solid var(--line);
-        background: var(--panel-2);
-        color: var(--text);
-        border-radius: var(--radius);
-        padding: 7px 14px;
-        font: inherit;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        flex: 0 0 auto;
+        height: var(--tap);
+        min-width: var(--tap);
+        padding: 0 8px;
+        border: 1.5px solid var(--edge-soft);
+        border-radius: var(--r);
+        background: var(--panel);
+        color: var(--ink);
+        font: 700 10px/1 var(--font);
+        letter-spacing: 0.10em;
+        text-transform: uppercase;
         cursor: pointer;
-        transition: border-color 0.15s, background 0.15s, color 0.15s;
+        white-space: nowrap;
         touch-action: manipulation;
+        box-shadow: var(--edge-shadow, 0 0 0 0 transparent);
+        transition:
+            box-shadow 140ms var(--ease),
+            background 320ms var(--ease-slow),
+            border-color 320ms var(--ease-slow),
+            color 320ms var(--ease-slow);
     }
-    button:hover:not(:disabled) { border-color: var(--accent); }
-    button:disabled { opacity: 0.38; cursor: not-allowed; }
+    button svg { width: 15px; height: 15px; flex: 0 0 auto; }
+    button .lbl { display: none; }
+    button:hover:not(:disabled) {
+        --edge-shadow: 2px 2px 0 0 var(--cyan);
+        border-color: var(--edge);
+    }
+    button:active:not(:disabled) { --edge-shadow: 1px 1px 0 0 var(--cyan); transition-duration: 60ms; }
+    button:disabled { opacity: 0.34; cursor: not-allowed; }
     button.active {
-        background: var(--accent-dim);
-        border-color: var(--accent);
-        color: var(--accent);
+        --edge-shadow: 2px 2px 0 0 var(--edge);
+        background: var(--cyan);
+        border-color: var(--edge);
+        color: var(--on-accent);
     }
-    button.small { padding: 5px 10px; font-size: 12.5px; }
+    button.active:hover { --edge-shadow: 3px 3px 0 0 var(--ink); background: var(--cyan); }
 
-    .signtoggle.pos { color: var(--pos); border-color: var(--pos); }
-    .signtoggle.neg { color: var(--neg); border-color: var(--neg); }
+    /* Labels only where twelve of them plus the actions genuinely fit. */
+    @media (min-width: 1500px) {
+        button .lbl { display: inline; }
+        .modes button { padding: 0 10px; }
+    }
+
+    .actions { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+
+    /* ── Context row — only what the current tool needs ──────────────────── */
+    .context {
+        display: flex;
+        align-items: center;
+        gap: 8px 14px;
+        flex-wrap: wrap;
+        padding: 0 10px;
+        max-height: 0;
+        overflow: hidden;
+        border-bottom: 0 solid var(--edge-faint);
+        background: var(--chrome);
+        transition: max-height 220ms var(--ease), padding 220ms var(--ease);
+    }
+    .context.on {
+        max-height: 132px;
+        padding: 7px 10px;
+        border-bottom-width: 1.5px;
+    }
+
+    /* A pointer already has an exclude gesture (right-click, ⌥-click), so the
+       sign toggle is one control it does not need. setMode still owns the
+       inline display for the tools that have no sign at all. */
+    body[data-input="mouse"] #signtoggle,
+    body[data-input="trackpad"] #signtoggle { display: none; }
+
+    .signtoggle { min-width: 108px; }
+    .signtoggle.pos { color: var(--pos); border-color: var(--pos); --edge-shadow: 2px 2px 0 0 rgba(155, 249, 91, 0.5); }
+    .signtoggle.neg { color: var(--neg); border-color: var(--neg); --edge-shadow: 2px 2px 0 0 rgba(244, 63, 94, 0.5); }
+    .signtoggle.pos:hover { --edge-shadow: 3px 3px 0 0 var(--pos); }
+    .signtoggle.neg:hover { --edge-shadow: 3px 3px 0 0 var(--neg); }
+
+    .label {
+        color: var(--ink-dim);
+        font: 700 9.5px/1 var(--font);
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
 
     .textinput {
-        background: var(--panel-2);
-        border: 1px solid var(--line);
-        border-radius: var(--radius);
-        color: var(--text);
-        padding: 7px 12px;
-        font: inherit;
-        min-width: 260px;
+        height: var(--tap);
+        background: #000;
+        border: 1.5px solid var(--edge-soft);
+        border-radius: var(--r);
+        color: var(--ink);
+        padding: 0 10px;
+        font: 400 12px/1 var(--font);
+        min-width: 280px;
+        box-shadow: 2px 2px 0 0 rgba(6, 184, 212, 0.3);
+        transition: box-shadow 180ms var(--ease), border-color 180ms var(--ease);
     }
-    .textinput:focus { outline: none; border-color: var(--accent); }
-    .textinput::placeholder { color: var(--dim); }
+    .textinput:focus { outline: none; border-color: var(--edge); box-shadow: 2px 2px 0 0 var(--cyan); }
+    .textinput::placeholder { color: var(--ink-mute); }
+
     .tolerance {
         display: inline-flex;
         align-items: center;
-        gap: 7px;
-        color: var(--dim);
-        font-size: 12px;
+        gap: 8px;
+        color: var(--ink-dim);
+        font: 700 9.5px/1 var(--font);
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
         white-space: nowrap;
     }
     /* The class sets a display mode, so explicitly preserve the platform's
        hidden contract when Text (or another non-colour mode) hides it. */
     .tolerance[hidden] { display: none; }
-    .tolerance input { accent-color: var(--accent); width: 84px; }
-    .tolerance output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 20px; }
+    .tolerance input {
+        appearance: none;
+        width: 108px;
+        height: 14px;
+        background: transparent;
+        cursor: pointer;
+    }
+    .tolerance input::-webkit-slider-runnable-track {
+        height: 4px;
+        background: #000;
+        border: 1.5px solid var(--edge-soft);
+    }
+    .tolerance input::-webkit-slider-thumb {
+        appearance: none;
+        width: 12px;
+        height: 14px;
+        margin-top: -7px;
+        background: var(--cyan);
+        border: 1.5px solid var(--edge);
+        box-shadow: 1.5px 1.5px 0 0 var(--edge-soft);
+    }
+    .tolerance input::-moz-range-track { height: 4px; background: #000; border: 1.5px solid var(--edge-soft); }
+    .tolerance input::-moz-range-thumb {
+        width: 10px; height: 14px; border-radius: 0;
+        background: var(--cyan); border: 1.5px solid var(--edge);
+    }
+    .tolerance output {
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+        min-width: 26px;
+        text-align: right;
+    }
 
     /* Text search: input wrapper anchors the autocomplete dropdown. */
     .textwrap { position: relative; display: inline-flex; }
     .textwrap[hidden] { display: none; }
     .autocomplete {
         position: absolute;
-        top: calc(100% + 5px);
+        top: calc(100% + 6px);
         left: 0;
         z-index: 60;
         min-width: 100%;
         max-height: 320px;
         overflow-y: auto;
-        background: var(--panel-2);
-        border: 1px solid var(--line);
-        border-radius: var(--radius);
-        box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+        background: #000;
+        border: 1.5px solid var(--edge);
+        border-radius: var(--r);
+        box-shadow: 5px 5px 0 0 var(--cyan), inset 0 1px 0 rgba(255, 255, 255, 0.06);
         padding: 4px;
     }
     .autocomplete[hidden] { display: none; }
@@ -125,20 +325,22 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 12px;
-        padding: 7px 10px;
-        border-radius: 8px;
+        gap: 14px;
+        padding: 8px 9px;
+        border: 1.5px solid transparent;
+        border-radius: 3px;
         cursor: pointer;
-        font-size: 13px;
+        font-size: 12px;
         white-space: nowrap;
     }
-    .ac-row.on, .ac-row:hover { background: var(--accent-dim); }
-    .ac-row .ac-text { display: flex; align-items: center; gap: 7px; }
+    .ac-row.on, .ac-row:hover { background: var(--cyan-dim); border-color: rgba(6, 184, 212, 0.55); }
+    .ac-row .ac-text { display: flex; align-items: center; gap: 8px; }
     .ac-row .ac-detail {
-        color: var(--dim);
-        font-size: 10.5px;
+        color: var(--ink-mute);
+        font-size: 9.5px;
+        font-weight: 700;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.14em;
     }
 
     /* Sub-class refine bar — sits under the header once a search has facets. */
@@ -147,75 +349,94 @@
         flex-wrap: wrap;
         align-items: center;
         gap: 6px 16px;
-        padding: 8px 16px;
-        border-bottom: 1px solid var(--line);
-        background: var(--panel);
+        padding: 7px 10px;
+        border-bottom: 1.5px solid var(--edge-faint);
+        background: var(--chrome);
     }
     .refine[hidden] { display: none; }
-    .refine .axis { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .refine .axis { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
     .refine .axis-label {
-        color: var(--dim);
-        font-size: 10.5px;
+        color: var(--ink-mute);
+        font: 700 9.5px/1 var(--font);
         text-transform: uppercase;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.16em;
     }
     .refine-chip {
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        border: 1px solid var(--line);
-        background: var(--panel-2);
-        color: var(--text);
-        border-radius: 999px;
-        padding: 3px 11px;
-        font-size: 12.5px;
+        height: calc(var(--tap) - 4px);
+        border: 1.5px solid var(--edge-soft);
+        background: var(--panel);
+        color: var(--ink);
+        border-radius: var(--r);
+        padding: 0 9px;
+        font: 700 10px/1 var(--font);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
         cursor: pointer;
-        transition: border-color 0.15s, background 0.15s, color 0.15s;
+        box-shadow: var(--edge-shadow, 0 0 0 0 transparent);
+        transition: box-shadow 140ms var(--ease), background 220ms var(--ease-slow), border-color 220ms var(--ease-slow), color 220ms var(--ease-slow);
     }
-    .refine-chip:hover { border-color: var(--accent); }
-    .refine-chip.on { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
-    .refine-chip .count { color: var(--dim); font-variant-numeric: tabular-nums; }
-    .refine-chip.on .count { color: var(--accent); }
+    .refine-chip:hover { --edge-shadow: 2px 2px 0 0 var(--cyan); border-color: var(--edge); }
+    .refine-chip.on { background: var(--cyan); border-color: var(--edge); color: var(--on-accent); --edge-shadow: 2px 2px 0 0 var(--edge); }
+    .refine-chip .count { color: var(--ink-mute); font-variant-numeric: tabular-nums; }
+    .refine-chip.on .count { color: var(--on-accent); }
     .refine-chip .swatch {
-        width: 11px; height: 11px; border-radius: 50%;
-        border: 1px solid rgba(255, 255, 255, 0.3);
+        width: 10px; height: 10px; border-radius: 1px;
+        border: 1.5px solid var(--edge);
     }
-    .refine .refine-clear { color: var(--dim); }
+    .refine .refine-clear { color: var(--ink-dim); }
 
+    /* ── Stage ──────────────────────────────────────────────────────────── */
     main {
         flex: 1;
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 18px;
+        padding: 16px;
         min-height: 0;
         position: relative;
+        overflow: hidden;
     }
     #stage {
         position: relative;
         max-width: 100%;
         max-height: 100%;
-        border-radius: var(--radius);
+        border: 1.5px solid var(--edge);
+        border-radius: var(--r);
         overflow: hidden;
-        box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+        box-shadow: 6px 6px 0 0 var(--cyan), inset 0 1px 0 rgba(255, 255, 255, 0.06);
         /* checkerboard peeks through when a cutout preview is shown */
         background:
-            repeating-conic-gradient(#191d23 0% 25%, #12151a 0% 50%) 0 0 / 24px 24px;
+            repeating-conic-gradient(#141414 0% 25%, #0A0A0A 0% 50%) 0 0 / 24px 24px;
         display: none;
+        touch-action: none;
     }
     #stage.visible { display: block; }
+    /* The zoom/pan frame. Only this element is transformed — the scope control
+       and the zoom readout are siblings, so they never scale with the photo. */
+    #frame {
+        position: relative;
+        display: block;
+        transform-origin: 0 0;
+        will-change: transform;
+    }
     #stage canvas {
         display: block;
-        max-width: 100%;
-        max-height: calc(100vh - 170px);
+        /* Against the VIEWPORT, not the parent: #frame is shrink-to-fit around
+           this canvas, so a percentage max-width here would be cyclic and the
+           photo would render at its intrinsic size and overflow the stage. */
+        max-width: calc(100vw - 38px);
+        max-height: calc(100vh - 190px);
         width: auto;
         height: auto;
         user-select: none;
         -webkit-user-select: none;
     }
     /* #view (the ≤1024 buffer the model/magic/color/brush read from) drives the
-       stage layout as before, but is fully covered by #photo — the crisp display
-       frame — which is layered over it and under #overlay in the same box. */
+       frame layout as before, but is fully covered by #photo — the crisp
+       display frame — layered over it and under #overlay in the same box. */
     #photo {
         position: absolute;
         inset: 0;
@@ -230,6 +451,81 @@
         cursor: crosshair;
         touch-action: none;
     }
+    #stage[data-pan="ready"] #overlay { cursor: grab; }
+    #stage[data-pan="active"] #overlay { cursor: grabbing; }
+
+    /* Zoom readout — only present while zoomed, and it is the way back. */
+    #zoomreset {
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        z-index: 4;
+        height: var(--tap);
+        background: #000;
+        border-color: var(--edge);
+        box-shadow: 3px 3px 0 0 var(--cyan);
+        font-variant-numeric: tabular-nums;
+    }
+    #zoomreset[hidden] { display: none; }
+
+    /* Scope control — how much of the thing the click selected, anchored near
+       it. Positioned in JS from the click point, clamped inside the stage. */
+    #scope {
+        position: absolute;
+        z-index: 5;
+        display: flex;
+        align-items: stretch;
+        gap: 3px;
+        padding: 3px;
+        border: 1.5px solid var(--edge);
+        border-radius: var(--r);
+        background: rgba(6, 8, 12, 0.86);
+        backdrop-filter: blur(14px) saturate(1.4);
+        -webkit-backdrop-filter: blur(14px) saturate(1.4);
+        box-shadow: 3px 3px 0 0 var(--cyan), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        transform: translate(-50%, 0);
+        white-space: nowrap;
+    }
+    #scope[hidden] { display: none; }
+    /* One swatch per reading, painted from that candidate's own mask in its own
+       crop — size carries the order, not the true area, so a 20x spread stays
+       legible instead of collapsing into two specks. `color` IS the silhouette:
+       the control paints with the button's own computed colour, which keeps the
+       palette here. */
+    #scope .scope-shape {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: var(--tap);
+        height: var(--tap);
+        padding: 0 4px;
+        color: var(--ink-dim);
+        background: transparent;
+        border: 1.5px solid var(--edge-faint);
+        border-radius: 3px;
+        box-shadow: none;
+        cursor: pointer;
+        transition: border-color 140ms var(--ease), background 140ms var(--ease);
+    }
+    #scope .scope-shape:hover {
+        color: var(--ink);
+        border-color: var(--edge-soft);
+        background: rgba(255, 255, 255, 0.05);
+    }
+    #scope .scope-shape[aria-pressed="true"] {
+        color: var(--lime);
+        border-color: var(--edge);
+        background: rgba(155, 249, 91, 0.08);
+    }
+    #scope .scope-shape canvas { display: block; }
+    /* Fallback when no mask is available to draw. */
+    #scope .scope-shape.bare::before {
+        content: '';
+        width: 8px;
+        height: 8px;
+        border-radius: 1px;
+        background: currentColor;
+    }
 
     /* Import overlay. The spinner animates transform only, so it keeps
        spinning on the compositor even while the main thread is busy. */
@@ -239,93 +535,169 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        background: rgba(10, 12, 16, 0.62);
+        background: rgba(3, 5, 10, 0.66);
         backdrop-filter: blur(3px);
-        z-index: 5;
+        z-index: 6;
         /* Progress must not lock the editor. A new drop, a replacement image,
            and the header controls remain available while the worker prepares. */
         pointer-events: none;
     }
     #prep[hidden] { display: none; }
-    .prep-card { text-align: center; color: var(--text); }
+    .prep-card {
+        text-align: left;
+        color: var(--ink);
+        min-width: min(320px, 82vw);
+        padding: 14px 16px;
+        background: #000;
+        border: 1.5px solid var(--edge);
+        border-radius: var(--r);
+        box-shadow: 6px 6px 0 0 var(--cyan), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
     .prep-spinner {
-        width: 34px;
-        height: 34px;
-        margin: 0 auto 14px;
-        border-radius: 50%;
-        border: 3px solid var(--line);
-        border-top-color: var(--accent);
+        width: 22px;
+        height: 22px;
+        margin: 0 0 12px;
+        border: 2px solid var(--edge-faint);
+        border-top-color: var(--cyan);
         animation: prep-spin 0.9s linear infinite;
     }
     @keyframes prep-spin { to { transform: rotate(360deg); } }
-    #prep-text { font-size: 14.5px; font-weight: 600; }
-    .prep-sub { font-size: 12px; color: var(--dim); margin-top: 6px; }
+    #prep-text {
+        font: 800 12px/1.2 var(--font);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        text-shadow: 2px 2px 0 rgba(6, 184, 212, 0.35);
+    }
+    .prep-sub {
+        font: 700 9.5px/1.4 var(--font);
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--ink-mute);
+        margin-top: 8px;
+    }
 
     #dropzone {
-        border: 1.5px dashed var(--line);
-        border-radius: 18px;
-        padding: 56px 64px;
-        text-align: center;
-        color: var(--dim);
-        transition: border-color 0.2s, background 0.2s;
-        max-width: 520px;
+        border: 1.5px solid var(--edge);
+        border-radius: var(--r);
+        background: #000;
+        box-shadow: 7px 7px 0 0 var(--cyan), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+        padding: 34px 34px 30px;
+        color: var(--ink-dim);
+        transition: box-shadow 180ms var(--ease), border-color 180ms var(--ease);
+        max-width: 560px;
     }
-    #dropzone.drag { border-color: var(--accent); background: var(--accent-dim); }
-    #dropzone h2 { color: var(--text); font-size: 19px; margin-bottom: 8px; font-weight: 600; }
-    #dropzone p { margin-bottom: 18px; }
-    #dropzone .actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    #dropzone.drag { box-shadow: 10px 10px 0 0 var(--lime); border-color: var(--ink); }
+    #dropzone h2 {
+        color: var(--ink);
+        font: 900 17px/1.15 var(--font);
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        margin-bottom: 12px;
+        text-shadow: 2px 2px 0 rgba(6, 184, 212, 0.35);
+    }
+    #dropzone p { margin-bottom: 20px; font-size: 12px; line-height: 1.6; }
+    #dropzone .actions { display: flex; gap: 10px; }
+    #dropzone .actions button { height: calc(var(--tap) + 6px); padding: 0 14px; font-size: 11px; }
+    #dropzone .kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 14px;
+        padding: 4px 7px;
+        border: 1.5px solid rgba(155, 249, 91, 0.6);
+        border-radius: 3px;
+        background: rgba(155, 249, 91, 0.1);
+        color: var(--lime);
+        font: 800 9px/1 var(--font);
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+    }
+    #dropzone .kicker::before {
+        content: '';
+        width: 7px;
+        height: 7px;
+        border-radius: 1px;
+        background: var(--lime);
+        box-shadow: 0 0 8px rgba(155, 249, 91, 0.85);
+        animation: dot-blink 1.4s steps(2, end) infinite;
+    }
+    @keyframes dot-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0.25; } }
 
+    /* ── Footer ─────────────────────────────────────────────────────────── */
     footer {
         display: flex;
         align-items: center;
-        gap: 14px;
-        padding: 8px 16px;
-        border-top: 1px solid var(--line);
-        background: var(--panel);
-        font-size: 12.5px;
-        color: var(--dim);
+        gap: 10px;
+        padding: 6px 10px;
+        border-top: 1.5px solid var(--edge);
+        background: linear-gradient(180deg, transparent, rgba(244, 244, 245, 0.02)), var(--chrome);
+        font: 700 9.5px/1.4 var(--font);
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--ink-mute);
         flex-wrap: wrap;
-        min-height: 38px;
+        min-height: 34px;
+        flex: 0 0 auto;
+        font-variant-numeric: tabular-nums;
     }
-    #status { flex: 1; min-width: 160px; }
-    .chip {
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        padding: 2px 10px;
+    #status {
+        flex: 1 1 340px;
+        min-width: 0;
+        color: var(--ink-dim);
+        text-transform: none;
+        letter-spacing: 0.02em;
+        font-weight: 400;
+        font-size: 11px;
+        /* One line of running commentary, not a paragraph that reflows the
+           whole bar every time a click reports its cost. */
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
-    .chip.on { color: var(--accent); border-color: rgba(53, 224, 194, 0.4); }
-    #profile-select, #yoloe-select {
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        padding: 2px 22px 2px 10px;
-        background: var(--panel) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6"><path d="M0 0l4 6 4-6z" fill="%23888"/></svg>') no-repeat right 8px center;
-        color: var(--dim);
-        font: inherit;
-        font-size: 12.5px;
-        appearance: none;
-        -webkit-appearance: none;
-        cursor: pointer;
+    .chip {
+        border: 1.5px solid var(--edge-faint);
+        border-radius: 3px;
+        padding: 3px 7px;
+        white-space: nowrap;
+        background: rgba(0, 0, 0, 0.4);
     }
-    #profile-select:hover, #yoloe-select:hover { color: var(--text); }
+    .chip.on { color: var(--cyan); border-color: rgba(6, 184, 212, 0.5); }
     #loadbar {
         position: absolute;
         left: 0;
         top: 0;
         height: 2px;
-        background: var(--accent);
+        background: var(--cyan);
         width: 0%;
         transition: width 0.25s;
-        z-index: 5;
+        z-index: 9;
     }
-    .hint { font-size: 12px; color: var(--dim); }
+    .hint { color: var(--ink-mute); display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+    .hint .sep { opacity: 0.4; }
     kbd {
-        background: var(--panel-2);
-        border: 1px solid var(--line);
-        border-bottom-width: 2px;
-        border-radius: 4px;
-        padding: 0 5px;
-        font: 11px/1.6 ui-monospace, monospace;
+        background: #000;
+        border: 1.5px solid var(--edge-soft);
+        border-radius: 2px;
+        padding: 1px 4px;
+        font: 700 9px/1.5 var(--font);
+        color: var(--ink);
+    }
+
+    /* The footer is one line or it is noise. The gesture legend is the first
+       thing to go, then the diagnostic chips — status always survives. */
+    @media (max-width: 1560px) {
+        #chip-mode, #chip-model { display: none; }
+    }
+    @media (max-width: 1180px) {
+        .chip { display: none; }
+    }
+    @media (max-width: 820px) {
+        .hint { display: none; }
+        .textinput { min-width: 180px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
     }
 </style>
 </head>
@@ -333,50 +705,93 @@
 <div id="loadbar"></div>
 <header>
     <div class="brand">SEG<em>LAB</em></div>
-    <span class="badge">100% on-device · zero cloud</span>
+    <nav class="modes" aria-label="Selection tools">
+        <button id="mode-click" class="active" title="Click to select — left/tap = include, right/Alt = exclude">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 6 17.5l3.6-3.4 2.1 5.2 2.6-1.1-2.1-5 4.8-.2z"/></svg><span class="lbl">Click</span>
+        </button>
+        <button id="mode-box" title="Drag a box around the object">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="4" y="5.5" width="16" height="13" rx="1" stroke-dasharray="3.2 2.6"/></svg><span class="lbl">Box</span>
+        </button>
+        <button id="mode-lasso" title="Draw a rough lasso — it snaps to the object">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><ellipse cx="12" cy="9.5" rx="8" ry="5.5"/><path d="M7 14.4c-.9 1-1.4 1.9-1.4 2.7a1.7 1.7 0 0 0 3.4 0"/></svg><span class="lbl">Lasso</span>
+        </button>
+        <span class="rule" aria-hidden="true"></span>
+        <button id="mode-region" title="Draw a region — the enclosed area itself becomes the mask">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-dasharray="3.2 2.6" aria-hidden="true"><path d="M4.5 12.5c0-4.4 3.2-8 7.5-8s8 3.1 8 7-3.4 8.5-7.7 8.5-7.8-3.1-7.8-7.5z"/></svg><span class="lbl">Region</span>
+        </button>
+        <button id="mode-rect" title="Draw a rectangular marquee mask">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="4" y="6.5" width="16" height="11" rx="1"/></svg><span class="lbl">Rect</span>
+        </button>
+        <button id="mode-ellipse" title="Draw an elliptical marquee mask">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg><span class="lbl">Ellipse</span>
+        </button>
+        <button id="mode-polygon" title="Click vertices; double-click or press Enter to close a polygon mask">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="m12 4 8 5.6-3 9.4H7l-3-9.4z"/></svg><span class="lbl">Polygon</span>
+        </button>
+        <span class="rule" aria-hidden="true"></span>
+        <button id="mode-magic" title="Click a contiguous colour region to mask it — left/tap adds, right/Alt subtracts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4.5 19.5 9-9"/><path d="m15.2 4.2 1.2-2.4 1.2 2.4 2.4 1.2-2.4 1.2-1.2 2.4-1.2-2.4L12.8 5.4z"/></svg><span class="lbl">Magic</span>
+        </button>
+        <button id="mode-color" title="Click a colour to select matching pixels across the image — left/tap adds, right/Alt subtracts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5c3 3.7 5.5 6.5 5.5 9.3A5.5 5.5 0 0 1 12 18.3a5.5 5.5 0 0 1-5.5-5.5c0-2.8 2.5-5.6 5.5-9.3z"/></svg><span class="lbl">Color</span>
+        </button>
+        <button id="mode-brush" title="Paint the mask; right-click or Alt erases">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M15.6 4.4 19.6 8.4l-7.8 7.8-4-4z"/><path d="m7.4 12.6-2.5 7.5 7.5-2.5"/></svg><span class="lbl">Brush</span>
+        </button>
+        <span class="rule" aria-hidden="true"></span>
+        <button id="mode-text" title="Describe the object in words — runs a local detector">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.2"/><path d="m15.2 15.2 4.6 4.6"/><path d="M8 9h5M8 12h3"/></svg><span class="lbl">Text</span>
+        </button>
+    </nav>
     <div class="spacer"></div>
-    <div class="modes">
-        <button id="mode-click" class="active" title="Click to select — left/tap = include, right/Alt = exclude">Click</button>
-        <button id="mode-box" title="Drag a box around the object">Box</button>
-        <button id="mode-lasso" title="Draw a rough lasso — it snaps to the object">Lasso</button>
-        <button id="mode-region" title="Draw a region — the enclosed area itself becomes the mask">Region</button>
-        <button id="mode-rect" title="Draw a rectangular marquee mask">Rect</button>
-        <button id="mode-ellipse" title="Draw an elliptical marquee mask">Ellipse</button>
-        <button id="mode-polygon" title="Click vertices; double-click or press Enter to close a polygon mask">Polygon</button>
-        <button id="mode-magic" title="Click a contiguous colour region to mask it — left/tap adds, right/Alt subtracts">Magic</button>
-        <button id="mode-color" title="Click a colour to select matching pixels across the image — left/tap adds, right/Alt subtracts">Color</button>
-        <button id="mode-brush" title="Paint the mask; right-click or Alt erases">Brush</button>
-        <button id="mode-text" title="Describe the object in words — runs a local detector">Text</button>
+    <div class="actions">
+        <button id="undo" disabled title="Undo last prompt (Z)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6.5 4.5 11 9 15.5"/><path d="M4.5 11h9.5a5.5 5.5 0 0 1 0 11h-2.5"/></svg><span class="lbl">Undo</span>
+        </button>
+        <button id="reset" disabled title="Clear all prompts (R)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg><span class="lbl">Reset</span>
+        </button>
+        <button id="cutout" disabled title="Download the cutout as transparent PNG">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5v10.5"/><path d="m7.8 10.3 4.2 4.2 4.2-4.2"/><path d="M4.5 19.5h15"/></svg><span class="lbl">Cutout PNG</span>
+        </button>
+        <button id="newimg" title="Import another photo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="1.5"/><path d="m4 16.5 4.6-4.6 4 4L15 13.4l5 5"/><circle cx="9" cy="9.4" r="1.3"/></svg><span class="lbl">New image</span>
+        </button>
     </div>
-    <button id="signtoggle" class="small signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
+</header>
+
+<div id="context" class="context">
+    <button id="signtoggle" class="signtoggle pos" title="Tap sign for touch devices — desktop can right/Alt-click">＋ include</button>
     <label id="tolerance-wrap" class="tolerance" hidden title="Colour distance for Magic and Color only — it does not change Text detection">Tolerance <input id="tolerance" type="range" min="8" max="160" value="36"><output id="tolerance-value">36</output></label>
     <span id="textwrap" class="textwrap" hidden>
         <input id="textinput" class="textinput" type="text" autocomplete="off" spellcheck="false" placeholder="describe an object — e.g. “flower”, “the red car”, “all bottles”">
         <div id="autocomplete" class="autocomplete" hidden role="listbox"></div>
     </span>
-    <button id="selectall" class="small" hidden title="Select every match">Select all</button>
-    <div class="spacer"></div>
-    <button id="undo" class="small" disabled title="Undo last prompt (Z)">Undo</button>
-    <button id="reset" class="small" disabled title="Clear all prompts (R)">Reset</button>
-    <button id="cutout" class="small" disabled title="Download the cutout as transparent PNG">Cutout PNG</button>
-    <button id="newimg" class="small">New image</button>
-</header>
+    <button id="selectall" hidden title="Select every match"><span class="lbl-always">Select all</span></button>
+</div>
 
 <div id="refine" class="refine" hidden></div>
 
 <main id="main">
     <div id="dropzone">
+        <span class="kicker">100% on-device · zero cloud</span>
         <h2>Drop a photo anywhere</h2>
         <p>Click any object — person, product, a minute thing — and get a precise mask.<br>
         Everything runs in your browser. Nothing is uploaded, to anyone, ever.</p>
         <div class="actions">
-            <button id="pick">Choose a photo</button>
+            <button id="pick"><span class="lbl-always">Choose a photo</span></button>
         </div>
     </div>
     <div id="stage">
-        <canvas id="view"></canvas>
-        <canvas id="photo"></canvas>
-        <canvas id="overlay"></canvas>
+        <div id="frame">
+            <canvas id="view"></canvas>
+            <canvas id="photo"></canvas>
+            <canvas id="overlay"></canvas>
+        </div>
+        <!-- SAM returns several readings of one click (a part, the object, the
+             group it belongs to). Showing them beats hiding them behind C. -->
+        <div id="scope" role="group" aria-label="How much to select" hidden></div>
+        <button id="zoomreset" hidden title="Reset zoom (0)">100%</button>
     </div>
     <div id="prep" hidden>
         <div class="prep-card">
@@ -390,25 +805,10 @@
 
 <footer>
     <span id="status">Idle — import a photo to begin</span>
-    <span class="hint"><kbd>Z</kbd> undo · <kbd>R</kbd> reset · <kbd>E</kbd> raw/refined · right/Alt = exclude · polygon <kbd>Enter</kbd> close</span>
+    <span id="hint" class="hint"></span>
     <span id="chip-mode" class="chip">engine: —</span>
     <span id="chip-device" class="chip">device: —</span>
     <span id="chip-model" class="chip">models: —</span>
-    <select id="profile-select" title="Resource profile — Auto picks the highest tier this device can safely run; force a tier if you know it can take more">
-        <option value="auto">Profile: Auto</option>
-        <option value="lite">Profile: Lite</option>
-        <option value="standard8">Profile: Standard-8</option>
-        <option value="standard">Profile: Standard</option>
-        <option value="pro">Profile: Pro</option>
-        <option value="ultra">Profile: Ultra</option>
-    </select>
-    <select id="yoloe-select" title="Text-search model — Auto picks a size by device tier; force Small/Medium/Large, or turn the fast YOLOE lane off (falls back to the YOLO-World open-vocab lane)">
-        <option value="auto">Text: Auto</option>
-        <option value="s">Text: Small</option>
-        <option value="m">Text: Medium</option>
-        <option value="l">Text: Large</option>
-        <option value="off">Text: Off</option>
-    </select>
     <span id="chip-timing" class="chip">— ms</span>
 </footer>
 

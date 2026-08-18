@@ -13,86 +13,39 @@
  * store decodes straight to the proxy and re-decodes bounded regions on demand).
  */
 
-const PRESETS = {
-    lite: {
-        profile: 'lite',
-        samIdleMs: 300_000,      // idle → release the ORT session arena (the real resident, ~0.5 GB GPU / ~3 GB WASM); next click rebuilds. App shortens to 45 s under pressure ≥ 2.
-        detectorScale: 's', // YOLOE text-lane scale (auto by tier; user-overridable)
-        // Soft ceiling (MB) the memory-governor watches measured agent-cluster
-        // bytes against (measureUserAgentSpecificMemory: main + workers + WASM).
-        // Normal WebGPU work measures well under this; a runaway WASM heap or an
-        // oversized export crosses it and sheds. GPU-side memory is a separate
-        // process the API can't see, so timer-drift is the paired swap signal.
-        memBudgetMB: 1800,
-        proxyMax: 1024,          // = SlimSAM's own internal encode edge; below it
-                                 // the model upscales (softer input) for no memory
-                                 // saving. The pressure floor drops it.
-        proxyMode: 'auto',
-        // On-screen preview frame, decoupled from the model proxy: a GPU-resident
-        // display bitmap (not RGBA/tensor) so the photo looks crisp while the
-        // model keeps its bounded ≤proxyMax buffer. Sized bounded-safe per host.
-        displayMax: 2048,
-        displayMode: 'auto',     // 'auto' safe | 'native' opts into a full-res decode
-        directMaxMP: 2,
-        directMaxSide: 2048,
-        cropMaxSide: 1280,
-        exportMaxSide: 4096,
-        exportMaxMP: 8,
-        exportFullRes: false,    // safety floor: tight cutout, but crop stays cropMaxSide-bounded
-        escalateMaxMP: 8,
-        draftCacheMax: 1,        // exactly one resident embedding
-        flagshipCacheMax: 0,
-        maxResidentHeavy: 1,
-        flagship: false,
-        // Only enables the 151 MB Grounding DINO q4f16 attempt after the
-        // accelerator/f16 gate in sam-engine. OWLv2 still stays on WASM.
-        detectorWebGPU: true,
-        // Detector session stays warm across searches, evicted before the next
-        // SAM encode: dispose:'now''s memory ceiling without its per-search
-        // WebGPU rebuild (~13 s here).
-        detectorEvictOnEncode: true,
-        // Reclaim the warm session's (unified) GPU memory after this much
-        // quiet time — an idle 151 MB model must not pin an 8 GB host into
-        // swap. A later search pays one rebuild.
-        detectorIdleMs: 45_000,
-        // Baseline default: WASM. resolveBudget() promotes this to WebGPU
-        // whenever a usable non-fallback adapter is probed (gpuTier != 'none'),
-        // since GPU accel is independent of the memory tier. This false is the
-        // no-GPU / no-probe floor. Memory pressure does NOT clear it: WASM SlimSAM
-        // pins ~3 GB vs the GPU's ~0.5 GB, so the GPU is the memory-safe lane to keep.
-        samWebGPU: false,
-        autoEscalate: false,
-        hdExportDecode: false,
-        detectorDispose: 'idle',
-        eagerEncode: true,       // bounded: one embedding, calm-gated, wasm lane
-        cvRefine: true,          // wasm mask cleanup (skipped at pressure ≥ 2)
-        rawDevelop: true,        // LibRaw develop for preview-less RAW; lazy,
-                                 // disposed after use, off at pressure ≥ 2
-        rawDevelopMaxMP: 40,     // refuse larger sensors here (bounds the peak)
-        embedPersist: false,     // OPFS embedding persistence off (packing peaks)
-        workingMaxSide: 1280,    // bounded re-decode copy cap (Safari-shaped hosts)
-        pressureLevel: 0,
-    },
-    // The one memory-safe tier an UNVERIFIED device may auto-reach from boot
-    // signals (capability autoTier). Above it there is exactly one automatic
-    // step: the governor's measured-headroom climb to `standard` (climbBudget,
-    // below) — pro/ultra stay trusted-host or manual-override only.
-    // Deliberately MEMORY-CLOSE to lite:
-    // its whole design is to be safe on the worst device that reaches it (an
-    // 8-core / 8 GB laptop that may be heavily loaded). It takes only the CHEAP
-    // quality wins — a crisper preview and a bigger, HD-decoded EXPORT (a
-    // transient, export-time cost) — and deliberately leaves OFF the expensive
-    // interaction-time native re-decode (`autoEscalate`), which pushed the NEF
-    // import+click peak to ~2.1 GB / ~1.15 GB resident (measured). Escalation and
-    // a larger export come only with a manual override to standard+ (the user
-    // vouching for a device with real headroom), still governor-guarded.
-    standard8: {
+import {
+    estimatePostMsPerMP, loadPostFit, clearPostFit,
+    estimateDetectMsPerCell, loadDetectMsPerCell, affordableCells,
+} from './hardware-fit.js'
+
+// ONE configuration (DESIGN-MASK-LANE §11). Five presets plus a capability
+// ladder plus a manual override plus four pressure levels were untestable in
+// combination, and a preset guaranteed nothing anyway: it picked numbers, and
+// nothing enforced them at allocation time. Memory is bounded instead by the
+// single shared SAM 2.1 instance (js/sam21-host.js) plus the governor.
+// The numbers are standard8's — built for "the worst device that reaches it",
+// which is now simply the device contract.
+const CONFIG = {
         profile: 'standard8',
         samIdleMs: 300_000,
-        detectorScale: 's',
-        memBudgetMB: 1900,
-        proxyMax: 1024,          // SlimSAM's native edge; higher only aids precision
+        memBudgetMB: 2200,   // ceiling, not a working set: the lane rests at ~1980
+        proxyMax: 1024,          // floor on the LONG edge; see proxyShortMax
+        // The encoder consumes a 1024x1024 SQUARE (sam21-lane drawImage), so the
+        // detail it can use is capped PER AXIS. Sizing only by the long edge
+        // starves the short one — a 3:2 frame at 1024x683 hands the encoder 683
+        // real rows stretched to 1024, wasting a third of its vertical capacity.
+        // Measured on the canonical NEF: reaching 1024 on the SHORT edge is
+        // worth +8.2 pt boundary IoU, ~10x what the whole refinement stage buys.
+        proxyShortMax: 1024,
+        proxyLongMax: 2048,      // hard stop for panoramas
+        proxyPixelMax: 2_100_000, // ~2:1 fully saturated; bounds proxy RGBA at 8.4 MB
         proxyMode: 'auto',
+        // Latency the CPU post-processing stage may spend on one click. Encode
+        // and decode are flat in proxy size (the encoder squashes to 1024², the
+        // decoder emits 256²), so this is the only cost the proxy controls — and
+        // it is 60-70% of a warm click. hardware-fit spends it; a device with no
+        // throughput figure yet ignores it entirely.
+        postBudgetMs: 220,
         displayMax: 2560,        // crisper preview (decoupled from the model proxy)
         displayMode: 'auto',
         directMaxMP: 3,
@@ -102,13 +55,29 @@ const PRESETS = {
         exportMaxMP: 12,         // the visible win: 8 → 12 MP cutouts (bounded peak)
         exportFullRes: false,    // deliberately bounded (memory-close to lite)
         escalateMaxMP: 12,
+        escalateMinIoU: 0.5,     // crop re-decode must agree with the proxy mask, or it is a different object
         draftCacheMax: 1,        // still exactly one resident embedding
         flagshipCacheMax: 0,
         maxResidentHeavy: 1,
         flagship: false,
-        detectorWebGPU: true,
         detectorEvictOnEncode: true,
         detectorIdleMs: 120_000,
+        // Text lane ceiling (proxy-plan detectorPlan). Cells are 640² detector
+        // inferences in one pass; 10 = full frame + 3x3, the depth §6 of
+        // DESIGN-TEXT-LANE measured small subjects need. The source decode is
+        // derived from the grid these buy (~1670 px at 3x3), so detectorMaxSide
+        // is a guardrail rather than the working limit — it binds only if the
+        // grid is ever raised. maxMP bounds a square/panorama, where a long-edge
+        // cap alone says nothing about the raster.
+        detectorMaxCells: 10,
+        // Inference latency one search may spend, spent by hardware-fit the same
+        // way postBudgetMs is. 2500 ms reproduces today's rungs on the measured
+        // ~140 ms/cell reference (10 cells), demotes to 5 around 420 ms/cell and
+        // to full-frame-only past ~900. Cells cost memory too, and that cap
+        // (above) still comes from class signals — an ORT arena cannot be timed.
+        detectorBudgetMs: 2500,
+        detectorMaxSide: 2048,
+        detectorMaxMP: 3,
         samWebGPU: true,
         autoEscalate: false,     // interaction-time native re-decode → manual tiers only
         hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
@@ -117,118 +86,17 @@ const PRESETS = {
         cvRefine: true,
         rawDevelop: true,
         rawDevelopMaxMP: 50,
-        embedPersist: false,     // packing peak avoided on an unverified device
-        workingMaxSide: 2560,
-        pressureLevel: 0,
-    },
-    standard: {
-        profile: 'standard',
-        samIdleMs: 0,            // manual tier = user vouched headroom; no hibernate
-        detectorScale: 's',
-        memBudgetMB: 2800,
-        proxyMax: 1024,
-        proxyMode: 'auto',
-        displayMax: 2560,
-        displayMode: 'auto',
-        directMaxMP: 4,
-        directMaxSide: 4096,
-        cropMaxSide: 2048,
-        exportMaxSide: 8192,
-        exportMaxMP: 24,
-        exportFullRes: true,     // native-res tight cutout (export-time transient, crop-sized)
-        escalateMaxMP: 24,
-        draftCacheMax: 3,
-        flagshipCacheMax: 2,
-        maxResidentHeavy: 1,
-        flagship: false,
-        detectorWebGPU: true,
-        samWebGPU: true,
-        autoEscalate: true,
-        hdExportDecode: true,
-        detectorDispose: 'idle',
-        // 'standard' is now reachable by an unverified-memory device (the
-        // profile estimate's ceiling), not only a trusted Phosmith host — so
-        // it gets the same encode-time detector eviction lite has, not just
-        // pro/ultra's assumption of ample headroom.
-        detectorEvictOnEncode: true,
-        detectorIdleMs: 120_000,
-        eagerEncode: true,
-        cvRefine: true,
-        rawDevelop: true,
-        rawDevelopMaxMP: 60,
-        embedPersist: true,
+        embedPersist: true,      // SAM 2.1 embeddings are 8 MB; OPFS turns a
+                                 //   revisit into a decode-only interaction
+        // The working copy is the re-decode SOURCE for escalation and export.
+        // 2560 capped it below its own consumers (exportMaxSide 5120,
+        // escalateMaxMP 12), so a bounded host got a worse export than an
+        // unbounded one for no reason. 4096² RGBA is ~67 MB — comfortably
+        // inside the measured ~1.8 GB total.
         workingMaxSide: 4096,
         pressureLevel: 0,
-    },
-    pro: {
-        profile: 'pro',
-        samIdleMs: 0,            // trusted big host — no hibernate
-        detectorScale: 'm',
-        memBudgetMB: 3600,
-        proxyMax: 1280,
-        proxyMode: 'auto',
-        displayMax: 3200,
-        displayMode: 'auto',
-        directMaxMP: 6,
-        directMaxSide: 6144,
-        cropMaxSide: 3072,
-        exportMaxSide: 10000,
-        exportMaxMP: 36,
-        exportFullRes: true,
-        escalateMaxMP: 36,
-        draftCacheMax: 4,
-        flagshipCacheMax: 3,
-        maxResidentHeavy: 2,
-        flagship: false,         // retired: SlimSAM is the only segmentation lane
-        detectorWebGPU: true,
-        samWebGPU: true,
-        autoEscalate: true,
-        hdExportDecode: true,
-        detectorDispose: 'idle',
-        detectorIdleMs: 180_000,
-        eagerEncode: true,
-        cvRefine: true,
-        rawDevelop: true,
-        rawDevelopMaxMP: 80,
-        embedPersist: true,
-        workingMaxSide: 4096,
-        pressureLevel: 0,
-    },
-    ultra: {
-        profile: 'ultra',
-        samIdleMs: 0,
-        detectorScale: 'l',
-        memBudgetMB: 4600,
-        proxyMax: 1536,
-        proxyMode: 'auto',
-        displayMax: 4096,
-        displayMode: 'auto',
-        directMaxMP: 8,
-        directMaxSide: 8192,
-        cropMaxSide: 4096,
-        exportMaxSide: 12000,
-        exportMaxMP: 64,
-        exportFullRes: true,
-        escalateMaxMP: 64,
-        draftCacheMax: 6,
-        flagshipCacheMax: 4,
-        maxResidentHeavy: 2,
-        flagship: false,
-        detectorWebGPU: true,
-        samWebGPU: true,
-        autoEscalate: true,
-        hdExportDecode: true,
-        detectorDispose: 'idle',
-        detectorIdleMs: 180_000,
-        eagerEncode: true,
-        cvRefine: true,
-        rawDevelop: true,
-        rawDevelopMaxMP: 100,
-        embedPersist: true,
-        workingMaxSide: 4096,
-        pressureLevel: 0,
-    },
 }
+const PRESETS = { standard8: CONFIG }
 
 /** True when nothing above `lite` can be proven: no capability yet, or the
  *  memory evidence is browser-reported/unknown (both unverifiable). */
@@ -254,28 +122,15 @@ export const isMemoryLocked = (probed = null) => {
  * `?profile=ultra`, `?working=1` are all refused there.
  * `probed` is the boot capability object or a bare profile string (tests).
  */
-export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null, override = null, scaleOverride = null) => {
+export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null, override = null) => {
     const params = new URLSearchParams(search)
     const cap = (probed && typeof probed === 'object') ? probed : null
     const locked = isMemoryLocked(probed)
-    const requestedProfile = locked ? null : params.get('profile')
-    const manualOverride = locked && override && PRESETS[override] ? override : null
-    // Adaptive tiering: on a locked (unverified) budget the default is the
-    // capability probe's autoTier (capability.js) — a capped, GPU/core-gated
-    // guess, never above standard8 — instead of a flat lite. It comes from
-    // hardware signals, not a URL param, so the unsafe-flag lockout still holds.
-    // Precedence: manual override (the user vouching, may exceed the ceiling) >
-    // autoTier > lite.
-    const autoTier = locked && cap && PRESETS[cap.autoTier] ? cap.autoTier : null
-    const name = locked
-        ? (manualOverride || autoTier || 'lite')
-        : (requestedProfile || (cap ? cap.profile : probed))
-    const budget = { ...(PRESETS[name] || PRESETS.lite) }
-    // Adaptive proxy: the probe sizes it to the device. An explicit profile is
-    // a developer override and gets that profile's normal proxy instead.
-    if (cap && cap.proxyMax && !requestedProfile) {
-        budget.proxyMax = locked ? Math.min(cap.proxyMax, budget.proxyMax) : cap.proxyMax
-    }
+    // One config — no tier to pick, no override to honour, no ?profile= to read.
+    const budget = { ...CONFIG }
+    // The capability probe may still LOWER the proxy for a weak GPU; it can
+    // never raise it, because 1024 is the model's native encode edge anyway.
+    if (cap && cap.proxyMax) budget.proxyMax = Math.min(cap.proxyMax, budget.proxyMax)
     if (cap) {
         budget.memoryGB = cap.memoryGB || 0
         budget.memorySource = cap.memorySource || 'unknown'
@@ -286,21 +141,73 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.flagshipEligible = !!cap.flagshipEligible
         budget.textureLimit = cap.textureLimit || 0
         // GPU acceleration is independent of the memory tier (see capability.js):
-        // any usable, non-fallback WebGPU adapter runs SlimSAM on the GPU, even
-        // on the memory-locked lite baseline. SlimSAM is ~14 MB and the proxy is
+        // any usable, non-fallback WebGPU adapter runs the mask lane on the GPU,
+        // even on the memory-locked lite baseline. The proxy is
         // bounded, so the upload burst is small; segment() still falls back to
         // WASM on any runtime failure, and ?force=wasm / memory pressure override.
         budget.samWebGPU = cap.gpuTier !== 'none'
+        budget.mobile = !!cap.mobile
+        // Text-lane depth, from signals that cannot be spoofed upward (the same
+        // rule capability.js uses: deviceMemory counts DOWNWARD only — a genuine
+        // sub-8 reading demotes, an 8 is the privacy cap and never promotes).
+        // Tiling is what makes small subjects findable, so this is the last
+        // thing to go, not the first: a weak device keeps the 2x2 pass and gives
+        // up only the 3x3 escalation.
+        // memoryGB 0 = the browser would not even guess (WebKit and Gecko ship no
+        // navigator.deviceMemory). That is the same engine where the governor has
+        // no byte API to read, so nothing downstream can catch this lane climbing
+        // either — the shallower pass is the only bound left. Chrome reports a
+        // figure and keeps the full depth.
+        const unmeasurable = cap.memorySource !== 'phosmith' && !cap.memoryGB
+        // integratedGPU: an iGPU shares system RAM, so the detector's tiles are
+        // charged against the same budget the proxy and RAW decode sit in, and
+        // there is no VRAM headroom to absorb the 3x3 escalation. Apple silicon
+        // is deliberately NOT flagged integrated (see gpu-adapter) — unified
+        // memory there comes with the bandwidth to use it.
+        const weak = cap.mobile || cap.gpuTier === 'basic' || cap.integratedGPU
+            || (cap.memoryGB > 0 && cap.memoryGB <= 4)
+        if (weak || unmeasurable) budget.detectorMaxCells = Math.min(budget.detectorMaxCells, 5)
+        // Do NOT also switch this rung to detectorDispose 'now'. It looks like
+        // the obvious companion — terminating the worker is the only true free
+        // of its ORT arena — and measured on this image it does drop the settled
+        // floor 1894 -> 1407 MB. But it makes every later search rebuild the
+        // YOLOE session, which raised the PEAK (1956 -> 2069, then 2284 MB) and
+        // took 2.9 s -> 6.2 s. The failure being defended against is an OOM
+        // kill, and a kill is decided by the peak, not the floor.
+        // No usable WebGPU adapter means the detector falls back to WASM, whose
+        // ORT arena only ever grows and is freed only by terminating the worker.
+        // Every extra cell there is permanent for the life of that worker.
+        if (cap.gpuTier === 'none' || (cap.memoryGB > 0 && cap.memoryGB <= 2)) budget.detectorMaxCells = 1
+        // Post-processing throughput (hardware-fit). A measurement stored by an
+        // earlier session on THIS device always beats the class estimate — the
+        // estimate exists only for a device that has never clicked. It expires
+        // (FIT_TTL_MS): the figure describes the machine as it was that day, and
+        // the fit only ratchets downward, so a throttled reading would otherwise
+        // follow a laptop back onto AC power for weeks.
+        if (params.get('post') === 'reset') clearPostFit()
+        const measured = loadPostFit()
+        const estimate = estimatePostMsPerMP(cap)
+        budget.postMsPerMP = measured?.msPerMP || estimate.msPerMP
+        // Band fraction is the SCENE half of the cost model: postMs scales with
+        // the refined band, not the proxy. Unknown means worst case (1), so a
+        // first click is never sized on a cheap selection this device has not
+        // made yet.
+        budget.postBandFraction = measured?.bandFraction || 1
+        budget.postMsPerMPSource = measured ? 'measured' : 'estimated'
+        budget.postFitReasons = estimate.reasons
+
+        // Same judgement for the text lane's tile grid, on the axis a stopwatch
+        // can actually see. Latency only — it clamps the memory cap above, never
+        // raises it.
+        const measuredCell = loadDetectMsPerCell()
+        budget.detectorMsPerCell = measuredCell || estimateDetectMsPerCell(cap).msPerCell
+        budget.detectorMsPerCellSource = measuredCell ? 'measured' : 'estimated'
+        if (params.get('detect') !== '0') {
+            budget.detectorMaxCells = Math.min(budget.detectorMaxCells, affordableCells(budget))
+        }
     }
     budget.memoryLocked = locked
-    // How `name` was picked — the profile toggle reads this to label its
-    // "Auto" option and to know whether the user has already overridden it.
-    // 'auto' only when the capability auto-tier actually RAISED above the lite
-    // floor; an autoTier that resolves to lite (no signal, or capped down) is
-    // just the default floor.
-    budget.profileSource = locked
-        ? (manualOverride ? 'manual' : (autoTier && autoTier !== 'lite' ? 'auto' : 'default'))
-        : (cap ? 'trusted' : 'preset')
+    budget.profileSource = 'single' // kept for telemetry; there is nothing to pick
     if (cap?.memorySource === 'unknown') budget.memoryUncertain = true
 
     const adaptiveProxyMax = budget.proxyMax
@@ -323,14 +230,25 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.proxyMax = Math.min(4096, Math.round(Number(pq)))
     }
 
+    // ?post=0 turns the hardware judgement off (A/B and bug reports), ?post=reset
+    // forgets this device's stored measurement (handled above, before it is
+    // loaded); a number is a click-latency budget in ms. Never raises any other
+    // cap. ?detect=0 is the same escape hatch for the text lane's grid.
+    const postq = params.get('post')
+    if (postq === '0') budget.postMsPerMP = 0
+    else if (postq && Number(postq) >= 40) budget.postBudgetMs = Math.min(2000, Math.round(Number(postq)))
+
     // SAM3/flagship is retired from the editor's interactive architecture.
     // Keep this explicit value for integrations and diagnostics, but never
     // accept a query parameter or host hint that would allocate a second
-    // segmentation model alongside SlimSAM.
+    // second segmentation model alongside the mask lane.
     budget.flagship = false
 
     if (params.get('force') === 'wasm') { budget.forceWasm = true; budget.flagship = false }
-    if (params.get('escalate') === '0') budget.autoEscalate = false
+    // ?escalate=0 is a user opt-OUT, not merely "don't do it automatically".
+    // It must also refuse the explicit action, or the flag silently means
+    // nothing now that automatic escalation is off by default anyway.
+    if (params.get('escalate') === '0') { budget.autoEscalate = false; budget.escalateDisabled = true }
     // Bounded "working" re-decode copy for hosts whose image decode is
     // unbounded (Safari). auto = feature-detect; ?working=1 forces it only on
     // trusted budgets (verify uses it); ?working=0 disables anywhere.
@@ -355,56 +273,7 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     if (xq === 'bounded') budget.exportFullRes = false
     else if (!locked && xq === 'full') budget.exportFullRes = true
 
-    // YOLOE text-lane scale: preset detectorScale is the auto pick; a deliberate
-    // user choice (scaleOverride, persisted) or ?yoloe= forces it. 'off' disables
-    // the lane. Safe on a locked budget — every scale's WebGPU footprint is tens
-    // of MB, not a memory tier.
-    const yoloeChoice = scaleOverride || params.get('yoloe')
-    if (yoloeChoice === 'off') budget.yoloe = false
-    else if (['n', 's', 'm', 'l', 'x'].includes(yoloeChoice)) budget.detectorScale = yoloeChoice
     return budget
-}
-
-/**
- * Measured-headroom climb: standard8 → standard, ONE step, for a memory-locked
- * device whose auto-tier is live and whose governor has PROVEN sustained
- * headroom (real measured bytes well under budget, no drift — see
- * memory-governor.js onHeadroom). This is the only path an unverified browser
- * has above standard8; pro/ultra stay trusted-host or manual.
- *
- * Fields the proof cannot vouch for are masked back to the standard8 stance:
- * headroom is a point-in-time RESIDENCY reading, not proof that a bigger
- * arena, cache, or OPFS packing peak fits —
- *   - samIdleMs stays 300 s (an unverified device must not pin the ORT arena
- *     indefinitely),
- *   - embedPersist stays false / draftCacheMax stays 1 (engine-resident copies
- *     — warmUp is memoized, so they could not be pushed anyway),
- *   - memBudgetMB stays 1900 (the climb must never raise the governor ceiling
- *     that authorized it).
- * What actually lands is the export/decode-time quality delta (exportFullRes,
- * export/crop/escalate caps, direct + working sizes, detector idle) — all
- * read-at-call-time main-thread fields. autoEscalate lands too but the app
- * additionally gates it on FRESH headroom for climbed budgets.
- *
- * Pure: eligibility from `current`, result via resolveBudget (so every URL
- * lowering and capability clamp still applies). Latch/poison state lives in
- * the app. Returns null when ineligible.
- */
-export const climbBudget = (search, capability, scaleOverride, current) => {
-    if (!current || current.memoryLocked !== true) return null
-    if (current.profileSource !== 'auto') return null
-    if (current.profile !== 'standard8') return null
-    if ((current.pressureLevel || 0) !== 0) return null
-    if (current.forceWasm) return null
-    const next = resolveBudget(search, capability, 'standard', scaleOverride)
-    if (next.profile !== 'standard') return null // override lost (e.g. trust flipped)
-    next.profileSource = 'auto-climb'
-    next.samIdleMs = PRESETS.standard8.samIdleMs
-    next.embedPersist = false
-    next.draftCacheMax = 1
-    next.memBudgetMB = PRESETS.standard8.memBudgetMB
-    next.flagship = false
-    return next
 }
 
 /**
@@ -422,12 +291,19 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.maxResidentHeavy = 1
         next.draftCacheMax = Math.min(next.draftCacheMax || 1, 1)
         next.flagshipCacheMax = 0
-        next.detectorWebGPU = false
-        // NB: pressure does NOT demote SlimSAM to WASM. Measured, WASM SlimSAM
-        // pins ~3 GB vs the GPU's ~0.5 GB, so forcing WASM under memory pressure
-        // makes swap WORSE — the GPU is the memory-safe lane and is kept. Device
-        // demotion stays failure-gated in sam-engine (WEBGPU_FAILURE_LIMIT / OOM).
+        // NB: pressure does NOT move ANY lane off the GPU. The mask lane can't —
+        // there is no wasm EP left to move it to (sam21-lane checkDevice). The
+        // detector won't: `detectorWebGPU` used to be set false here and was
+        // never read, and wiring it would be the wrong fix. Measured, the old
+        // WASM lane pinned ~3 GB against the GPU's ~0.5 GB, and a wasm arena is
+        // freed only by terminating the worker; the WebGPU detector peaks at
+        // 293 MB and gives 178 MB of it back on dispose. Demoting under pressure
+        // makes swap WORSE, which is the one thing pressure is trying to avoid.
         next.eagerEncode = false
+        // Give up the 3x3 escalation before anything the user can see. It is
+        // the deepest pass (10 inferences vs 5) and it only ever runs after the
+        // 2x2 pass already found nothing.
+        next.detectorMaxCells = Math.min(next.detectorMaxCells || 10, 5)
     }
     if (nextLevel >= 2) {
         next.cropMaxSide = Math.min(next.cropMaxSide || 1280, 1280)
@@ -439,11 +315,20 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.rawDevelop = false
     }
     if (nextLevel >= 3) {
-        const exportCap = next.profile === 'lite' ? 4 : (next.profile === 'standard' ? 16 : 24)
-        next.exportMaxMP = Math.min(next.exportMaxMP || exportCap, exportCap)
-        next.exportMaxSide = Math.min(next.exportMaxSide || 4096, next.profile === 'lite' ? 4096 : 6144)
+        // Flat, not profile-keyed (§11). The old ladder branched on the tier
+        // name, so collapsing to standard8 silently landed in the permissive
+        // branch and LOOSENED the export cap to 24 MP under maximum pressure —
+        // the opposite of what this rung is for. Pressure only ever tightens.
+        next.exportMaxMP = Math.min(next.exportMaxMP || 4, 4)
+        next.exportMaxSide = Math.min(next.exportMaxSide || 4096, 4096)
         next.proxyMax = Math.min(next.proxyMax || 768, 768)
+        next.proxyShortMax = 0 // give up the per-axis boost before anything visible
         next.displayMax = Math.min(next.displayMax || 1280, 1280)
+        // Full frame only: one 640² inference, and the re-decode that feeds it
+        // shrinks with it (detectorPlan derives the source from the grid).
+        next.detectorMaxCells = 1
+        next.detectorMaxSide = Math.min(next.detectorMaxSide || 768, 768)
+        next.detectorMaxMP = Math.min(next.detectorMaxMP || 1, 1)
         if (next.safeProxyMax) next.safeProxyMax = Math.min(next.safeProxyMax, 768)
     }
     return next

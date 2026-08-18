@@ -22,24 +22,20 @@ const getDir = () => {
     return dirPromise
 }
 
-// entry → ArrayBuffer: [u32 headerLen][JSON header][original bytes][mask chan?]
+// Layout: [u32 headerLen][JSON header][original bytes][mask chan?]
 //
 // The composed mask is stored, not the op stack: a single click's selection
 // lives in state.liveMask and never reaches baseOps, so persisting ops alone
 // loses the most common selection there is. Restore replays it as the base
 // floor — the selection returns exactly; per-op undo history does not.
-const pack = (entry, bytes) => {
-    const blobs = []
-    let offset = 0
-    const push = (data) => {
-        const view = new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength ?? data.length)
-        blobs.push(view)
-        const at = offset
-        offset += view.byteLength
-        return { at, length: view.byteLength }
-    }
-    const original = push(bytes)
-    const mask = entry.mask ? push(entry.mask) : null
+//
+// A sequence of writes, not one concatenated buffer: this runs on every commit,
+// and building the buffer held the original as bytes AND a second copy of the
+// whole record — up to 2 x MAX_BYTES transient, charged to the process a memory
+// reap decides against. blob.size gives the length without reading it, so the
+// header still goes first.
+const writeEntry = async (w, entry) => {
+    const maskLen = entry.mask?.byteLength || 0
     const header = {
         v: 1,
         assetKey: entry.assetKey,
@@ -48,16 +44,16 @@ const pack = (entry, bytes) => {
         mime: entry.mime,
         name: entry.name,
         savedAt: Date.now(),
-        original,
-        mask,
+        original: { at: 0, length: entry.blob.size },
+        mask: maskLen ? { at: entry.blob.size, length: maskLen } : null,
     }
     const headerBytes = new TextEncoder().encode(JSON.stringify(header))
-    const out = new Uint8Array(4 + headerBytes.byteLength + offset)
-    new DataView(out.buffer).setUint32(0, headerBytes.byteLength)
-    out.set(headerBytes, 4)
-    let p = 4 + headerBytes.byteLength
-    for (const b of blobs) { out.set(b, p); p += b.byteLength }
-    return out.buffer
+    const len = new Uint8Array(4)
+    new DataView(len.buffer).setUint32(0, headerBytes.byteLength)
+    await w.write(len)
+    await w.write(headerBytes)
+    await w.write(entry.blob)
+    if (maskLen) await w.write(entry.mask)
 }
 
 const unpack = (buf) => {
@@ -96,21 +92,19 @@ const saveOnce = async (getEntry) => {
     const entry = typeof getEntry === 'function' ? getEntry() : getEntry
     if (!opfsAvailable() || !entry?.blob) return false
     try {
-        const bytes = new Uint8Array(await entry.blob.arrayBuffer())
-        if (bytes.byteLength > MAX_BYTES) return false
+        if (entry.blob.size > MAX_BYTES) return false
         const dir = await getDir()
-        const buf = pack(entry, bytes)
         const tmp = `${FILE}.tmp`
         const tfh = await dir.getFileHandle(tmp, { create: true })
         const w = await tfh.createWritable()
-        await w.write(buf)
+        await writeEntry(w, entry)
         await w.close()
         if (tfh.move) {
             await tfh.move(FILE) // atomic swap — a cut mid-write leaves the old session intact
         } else {
             const fh = await dir.getFileHandle(FILE, { create: true })
             const w2 = await fh.createWritable()
-            await w2.write(buf)
+            await writeEntry(w2, entry)
             await w2.close()
             await dir.removeEntry(tmp).catch(() => {})
         }

@@ -16,6 +16,9 @@ build/
 /yoloe-26*.onnx
 /yoloe-26*.pt
 spikes/
+# TorchScript towers pulled for export-clip-text.py's correctness gate
+# (build/text-encoder/), hundreds of MB — refetched on demand.
+*.ts
 
 # Test media dropped in for debugging (screen recordings, sample RAW/photos)
 *.mp4
