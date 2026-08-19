@@ -960,6 +960,38 @@ of a finer field, so the threshold scales by area (171 px on a 1024×683 proxy)
 instead of being re-tuned per resolution, with 16 kept as the floor because on a
 coarser grid speckle still lands in single cells.
 
+### Cycling gets a tighter rule than a first click
+
+Every gate above is a proxy for one question — *is this subject legitimately
+fragmented?* — and a scattered-texture plane answers it the same way a shattered
+wire does. A click on one grape hyacinth returns every blue floret in the frame:
+hundreds of components, nothing near dominant, speckle far over the tiny budget.
+Dominance fails, the budget refuses the whole removal, the anchor is too lacey to
+pass `minSolidity`, and the mask ships covered in specks. That is what candidate
+cycling was shipping.
+
+Cycling carries a fact a first click does not: the user has already accepted the
+click and is now choosing its **scope**. The other planes answer *that* question
+at another level of the hierarchy, so a component that holds no include click and
+is clear of every one that does is not a scope — it is a different object.
+`cleanRegions({ tight: true })`, which only `sam21PickCandidate` passes, therefore
+drops dominance and the budget and lets shape decide:
+
+* anything at or under the speckle threshold goes, with no budget and no
+  dominance gate;
+* anything separated from every clicked component by `sepFrac` × the **smaller**
+  of the two extents goes — smaller, because a frame-spanning anchor would
+  otherwise demand a gap no neighbouring speck can reach;
+* a **wire-like** component is spared at any distance: bounding box at least 8×
+  longer than it is wide, `solidity` under `minSolidity`, and at least as large as
+  the speckle threshold. Aspect is what solidity alone cannot judge — a lacey
+  region and a wire both score low on area / long-side², but only the wire has an
+  extreme bounding box, so the streetlight's detached wires survive a rule that
+  clears the florets.
+
+The first-click path is byte-for-byte unchanged; every measurement in the table
+above still describes it.
+
 Running per click at proxy resolution is a cost, so the labeller is built for
 it. Cells are read once in address order as **runs** (scanline run-length +
 union-find), not per-pixel flood fill: no `Int32Array` label plane (2.8 MB at

@@ -335,7 +335,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
  * cycling has to produce a mask indistinguishable from a decoded one — same
  * band, same guided filter, same parked field.
  */
-const postProcess = (canvas, imageKey, logits, w, h, clicks = []) => {
+const postProcess = (canvas, imageKey, logits, w, h, clicks = [], tight = false) => {
     const { field, bbox, box } = upsampleLogits(logits, w, h)
     // Raw first: the refinement rewrites `field` in place, and the app's
     // raw/refined toggle needs both.
@@ -376,7 +376,7 @@ const postProcess = (canvas, imageKey, logits, w, h, clicks = []) => {
     // rivet click on d750-lossless.nef left exactly one, 3 px beyond the box.
     const scan = unionRect(box, paint)
     const regions = scan
-        ? cleanRegions(field, w, h, { clicks, rect: scan, fill: Math.max(2.5, 2 * BAND) })
+        ? cleanRegions(field, w, h, { clicks, rect: scan, fill: Math.max(2.5, 2 * BAND), tight })
         : { islands: 0, holes: 0, dirty: null }
     if (regions.dirty) paint = unionRect(paint, regions.dirty)
     if (paint) rgba = bandAlphaRect(field, w, paint, BAND, new Uint8ClampedArray(rawRgba))
@@ -455,7 +455,10 @@ export const sam21PickCandidate = (index, imageKey = null) => {
     candidates.index = index
     const row = candidates.rows[candidates.index]
     const { canvas, w, h, clicks } = candidates
-    const { rgba, rawRgba, bandPixels, maskRect } = postProcess(canvas, candidates.imageKey, row.p, w, h, clicks)
+    // Tight hygiene, which a first click does not get: cycling means "the thing
+    // I pointed at, at another scope", so a plane that answers with other
+    // objects is answering a question nobody asked (mask-select, tight mode).
+    const { rgba, rawRgba, bandPixels, maskRect } = postProcess(canvas, candidates.imageKey, row.p, w, h, clicks, true)
     return {
         rgba,
         rawRgba,

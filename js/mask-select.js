@@ -282,6 +282,10 @@ let parent = new Int32Array(4096)
 let csize = new Int32Array(4096)
 let cedge = new Uint8Array(4096)
 let cdrop = new Uint8Array(4096)
+// Anchor membership as a flag, not a list scan: the outlier rules ask "is this
+// component clicked" once per component, and an array `includes` made that
+// O(components x clicks) on exactly the shattered masks that have the most.
+let canchor = new Uint8Array(4096)
 // Per-component bounds, inclusive. Carried because separation and shape — not
 // size — are what tell a second object apart from a fragment of this one.
 let cbx0 = new Int32Array(4096); let cby0 = new Int32Array(4096)
@@ -311,6 +315,7 @@ const growLabels = (need) => {
     const b2 = new Int32Array(cap); b2.set(cbx1); cbx1 = b2
     const b3 = new Int32Array(cap); b3.set(cby1); cby1 = b3
     cdrop = new Uint8Array(cap)          // rewritten per pass, never carried
+    canchor = new Uint8Array(cap)
 }
 
 const growRows = (need) => {
@@ -453,6 +458,22 @@ const solidity = (i) => {
     return e > 0 ? csize[i] / (e * e) : 0
 }
 
+/**
+ * A severed thin structure — a wire, an antenna, a railing — rather than
+ * speckle or a second object. Aspect is what solidity alone cannot judge: a
+ * lacey region and a wire both score low on area / long-side², but only the
+ * wire has a bounding box tens of times longer than it is wide. The size floor
+ * keeps a 10-cell dash out; anything worth sparing is at least as large as the
+ * speckle threshold.
+ */
+const wireLike = (i, minCells, aspect, maxSolidity) => {
+    if (csize[i] < minCells) return false
+    const bw = cbx1[i] - cbx0[i] + 1
+    const bh = cby1[i] - cby0[i] + 1
+    const lo = bw < bh ? bw : bh
+    return (bw > bh ? bw : bh) >= aspect * lo && solidity(i) < maxSolidity
+}
+
 /** Chebyshev gap between two components' bounding boxes, in cells. 0 = touching
  *  or overlapping. */
 const boxGap = (i, j) => {
@@ -562,6 +583,7 @@ export const cleanRegions = (field, w, h, {
     clicks = [], scale = 1, rect = null, fill = FILL,
     islandCells = null, islandFrac = 0.02, holeFrac = 0.06, minDominance = 0.85,
     sepFrac = 0.15, minSolidity = 0.3, tinyFrac = 0.005,
+    tight = false, wireAspect = 8,
 } = {}) => {
     const box = rect || [0, 0, w, h]
     if (box[2] <= box[0] || box[3] <= box[1]) return { islands: 0, holes: 0, dirty: null }
@@ -598,12 +620,13 @@ export const cleanRegions = (field, w, h, {
     // delete the second blob of a deliberately two-click selection.
     const anchors = []
     if (fg.total > 0) {
+        canchor.fill(0, 0, fg.nLab)
         for (const c of clicks) {
             if ((c.label ?? 1) !== 1) continue
-            const cell = cellIndex(c, w, h, scale)
-            const r = rootAt(cell, fg.nRun)
-            if (r < 0) continue
-            if (!anchors.includes(r)) anchors.push(r)
+            const r = rootAt(cellIndex(c, w, h, scale), fg.nRun)
+            if (r < 0 || canchor[r]) continue
+            canchor[r] = 1
+            anchors.push(r)
         }
     }
     // Separation is off for a subject that is legitimately thin or fragmented —
@@ -614,7 +637,34 @@ export const cleanRegions = (field, w, h, {
         cdrop.fill(0, 0, fg.nLab)
         let max = 0
         for (let i = 0; i < fg.nLab; i += 1) if (find(i) === i && csize[i] > max) max = csize[i]
-        if (max / fg.total >= minDominance) {
+        // Tight mode — candidate cycling, where the click is the whole question
+        // and the other planes answer it at another SCOPE, not with other
+        // objects. Dominance and the tiny budget are both proxies for "the
+        // subject may be legitimately fragmented", and a scattered-texture
+        // plane defeats them the same way a shattered wire does: a click on one
+        // grape hyacinth comes back with every blue floret in the frame, no
+        // component near dominant and the speckle far over the budget, so every
+        // rule below switches off and the mask ships covered in specks.
+        //
+        // Here the anchor is known, so shape decides instead of dominance. A
+        // severed thin structure is spared on its own aspect — the property
+        // that made the streetlight rule necessary — and what remains, small or
+        // clear of the click, is not the thing the user is scoping.
+        if (tight && anchors.length) {
+            for (let i = 0; i < fg.nLab; i += 1) {
+                if (find(i) !== i || canchor[i]) continue
+                if (wireLike(i, minCells, wireAspect, minSolidity)) continue
+                if (csize[i] <= minCells) { cdrop[i] = 1; continue }
+                let far = true
+                for (const a of anchors) {
+                    // Against the SMALLER extent: a frame-spanning anchor would
+                    // otherwise demand a gap no neighbouring speck can reach.
+                    const reach = Math.max(2, sepFrac * Math.min(extentOf(a), extentOf(i)))
+                    if (boxGap(i, a) < reach) { far = false; break }
+                }
+                if (far) cdrop[i] = 1
+            }
+        } else if (max / fg.total >= minDominance) {
             const limit = islandFrac * fg.total
             for (let i = 0; i < fg.nLab; i += 1) {
                 if (find(i) === i && csize[i] <= minCells && csize[i] < limit) cdrop[i] = 1
@@ -650,9 +700,9 @@ export const cleanRegions = (field, w, h, {
         // A fragmented or thin subject disables the rule outright, and a thin
         // fragment is never taken by it. What remains is two solid blobs with
         // clear space between them, and that is two objects.
-        if (separable) {
+        if (separable && !tight) {
             for (let i = 0; i < fg.nLab; i += 1) {
-                if (find(i) !== i || cdrop[i] || anchors.includes(i)) continue
+                if (find(i) !== i || cdrop[i] || canchor[i]) continue
                 if (solidity(i) < minSolidity) continue
                 // Clear of EVERY anchor: a blob near any clicked one belongs to it.
                 let far = true

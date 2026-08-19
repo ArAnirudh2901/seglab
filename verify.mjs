@@ -769,6 +769,36 @@ try {
       JSON.stringify({ dropped: rf.islands, area: fieldArea(fragmented) }),
     )
 
+    // Candidate cycling asks a narrower question than a first click — the same
+    // thing, at another scope — so a plane that answers it with other objects
+    // is answering the wrong one. A scattered-texture plane defeats both gates
+    // above the way a shattered wire does (nothing dominant, speckle far over
+    // the budget), so tight mode drops them and lets shape decide instead.
+    const texture = new Float32Array(PW * PH).fill(-8)
+    plantOn(texture, 300, 200, 260, 240, 5)          // the cluster under the click
+    for (let k = 0; k < 200; k += 1) {               // 200 scattered florets, 16 px each
+      plantOn(texture, 620 + (k % 20) * 18, 60 + ((k / 20) | 0) * 40, 4, 4, 3)
+    }
+    plantOn(texture, 800, 520, 90, 80, 3)            // a whole neighbouring cluster
+    plantOn(texture, 120, 60, 3, 400, 3)             // a thin structure — must survive
+    const clicked = new Float32Array(texture)
+    const rq = cleanRegions(texture, PW, PH, {
+      clicks: [{ x: 430, y: 320, label: 1 }], fill: 2.5, tight: true,
+    })
+    const rqc = cleanRegions(clicked, PW, PH, {
+      clicks: [{ x: 430, y: 320, label: 1 }, { x: 840, y: 560, label: 1 }], fill: 2.5, tight: true,
+    })
+    check(
+      'hygiene: tight mode clears a scattered plane, spares a thin structure, and still obeys a click',
+      rq.islands === 201 && texture[200 * PW + 121] > 0 && texture[560 * PW + 840] < 0
+        && fieldArea(texture) === 260 * 240 + 3 * 400
+        && rqc.islands === 200 && clicked[560 * PW + 840] > 0,
+      JSON.stringify({
+        dropped: rq.islands, thin: texture[200 * PW + 121], neighbour: texture[560 * PW + 840],
+        area: fieldArea(texture), want: 260 * 240 + 3 * 400, clickedDropped: rqc.islands,
+      }),
+    )
+
     /* ── Scope control: the words and the steps behind the gestures ────── */
 
     check(
@@ -1954,11 +1984,11 @@ try {
     lost.length ? JSON.stringify(lost) : coexist.map((r) => `${r.tool} ${r.before}→${r.after}`).join(', '),
   )
 
-  // …and the mirror: a live object opened by box / lasso / text survives a
-  // click on something else. The commit has to be on the way IN, not on the way
-  // out, or it depends on which tool happens to run next.
+  // …and the mirror: a live object opened by box or lasso survives a click on
+  // something else. The commit has to be on the way IN, not on the way out, or
+  // it depends on which tool happens to run next.
   const producers = []
-  for (const tool of ['box', 'lasso', 'text']) {
+  for (const tool of ['box', 'lasso']) {
     await page.evaluate(() => window.__seglab.reset())
     const first = await applyTool(tool, target('disc'))
     const after = await applyTool('click', target('square'))
@@ -1966,7 +1996,7 @@ try {
   }
   const dropped = producers.filter((r) => !(r.before > 0 && r.after > r.before && r.baseOps >= 1))
   check(
-    'coexistence: a box / lasso / text object survives a later click',
+    'coexistence: a box / lasso object survives a later click',
     dropped.length === 0,
     dropped.length ? JSON.stringify(dropped) : producers.map((r) => `${r.tool} ${r.before}→${r.after}`).join(', '),
   )
@@ -2335,7 +2365,9 @@ try {
   const geoW = await pageW.evaluate(() => window.__seglab.demoGeometry())
   const pW = geoW.proxyScale
   const wClick = await pageW.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoW.disc.x * pW, y: geoW.disc.y * pW })
-  await pageW.evaluate(() => window.__seglab.reset())
+  // No reset() here: it used to clear the click so the text search could be
+  // measured on its own, and the text search is what re-made the mask export
+  // then read. Without it, reset left export nothing to cut.
   const wExport = await pageW.evaluate(() => window.__seglab.exportCutout())
   check(
     // §4: WebGPU is a HARD requirement for the mask lane, so ?force=wasm no
@@ -2687,19 +2719,14 @@ try {
     await context.setOffline(true)
     pageO.on('request', () => { attempted += 1 })
     pageO.on('requestfinished', () => { succeeded += 1 })
-    log('phase O (offline) — network cut; fresh import + click + text + export…')
+    log('phase O (offline) — network cut; fresh import + click + export…')
     // A NEW document offline forces a fresh encode with zero network.
     await pageO.evaluate(() => window.__seglab.loadDemo(1400))
     const gOff = await pageO.evaluate(() => window.__seglab.demoGeometry())
     const pOff = gOff.proxyScale
     const oClick = await pageO.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: gOff.disc.x * pOff, y: gOff.disc.y * pOff })
-    await pageO.evaluate(() => window.__seglab.reset())
-    const dbox = [
-      (gOff.disc.x - gOff.disc.r * 1.2) * pOff,
-      (gOff.disc.y - gOff.disc.r * 1.2) * pOff,
-      (gOff.disc.x + gOff.disc.r * 1.2) * pOff,
-      (gOff.disc.y + gOff.disc.r * 1.2) * pOff,
-    ]
+    // Same as A7: the reset() and the box below belonged to the text step that
+    // re-made the mask. Export reads the click's mask now.
     const oEx = await pageO.evaluate(() => window.__seglab.exportCutout())
     const oDiag = oEx ? null : await pageO.evaluate(() => window.__seglab.exportDiag())
     check(

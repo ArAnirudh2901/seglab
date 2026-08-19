@@ -305,13 +305,17 @@ export const encodeImage = async (canvas, { revision } = {}) => {
     if (!canvas?.width || !canvas?.height) return null
     const imageKey = contentKey(canvas)
     return enqueueHeavy('encode-prewarm', async () => {
-        disposeDetectWorker() // the encoder is the app's largest allocation
         const { encodeImage: enc, hello } = await import('./sam21-client.js')
         await hello('seglab')
         const bitmap = await createImageBitmap(canvas)
         const r = await enc(bitmap, imageKey)
         return { encoded: !r.cached, imageKey, device: 'webgpu', lane: LANE }
-    }, { priority: 'idle', revision: revision ?? null }).catch(() => null)
+    }, { priority: 'idle', revision: revision ?? null }).catch((err) => {
+        // Swallowing this silently is what hid a prewarm that never ran: the
+        // caller cannot tell "no embedding, by design" from "the encode threw".
+        console.warn('[seglab] encode-prewarm failed:', err?.message || err)
+        return null
+    })
 }
 
 /**
