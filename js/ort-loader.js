@@ -46,11 +46,12 @@ export const autoThreads = () => (globalThis.crossOriginIsolated
  * keeps more than the isolated lane because the RAW decode, display frame and
  * proxy are live alongside the encoder.
  *
- * MASK LANE ONLY. Measured on the detector/text worker it goes the other way —
- * that lane builds, runs once and terminates per phrase, so the churn costs more
- * in renderer staging than the cache retains: worker renderer 1945/1957/2138 MB
- * on Bucket vs 2930/2775/2782 MB on lazyRelease, over three runs each. One long
- * held encode and a short repeated one want opposite policies.
+ * MASK LANE ONLY, and it has to stay that way if another lane is ever added:
+ * measured on the short-lived worker of the (since removed) text lane the
+ * result inverted — a session that builds, runs once and terminates pays more
+ * in renderer staging than the cache retains (1945/1957/2138 MB on Bucket vs
+ * 2930/2775/2782 MB on lazyRelease, three runs each). One long-held encode and
+ * a short repeated one want opposite policies.
  *
  * The two session options that ARE on the forwarded key list were both tried on
  * this lane and both rejected. `enableGraphCapture: true` fails session

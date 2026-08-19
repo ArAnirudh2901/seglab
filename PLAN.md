@@ -1,5 +1,11 @@
 # SEGLAB — Full Plan (merged with Phosmith Offline Pro)
 
+> **2026-08-18 — the open-vocabulary text lane was removed.** "AI Text" (the
+> YOLOE text-prompt detector + MobileCLIP2 text tower, its taxonomy /
+> autocomplete / refine-chip UI, the disposable detect worker, and every budget
+> knob that sized it) is gone from the app, the gate and the model downloader.
+> Everything below that describes it is history, kept for what it measured.
+
 ## 2026-07-23 — measured-headroom climb: high-end devices auto-reach `standard` (SHIPPED)
 
 The auto-tier ceiling was standard8 for every plain browser — a 64 GB gaming

@@ -13,7 +13,7 @@
 
 import { countMaskComponents, maskRegions, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, channelBounds, pointInMask, dilateChannel, bridgeGaps, smoothBoundary } from './sam-core.js'
 import {
-    cancelBefore, candidateShape, clientState, detectorResidentMB, disposeDetectorIfIdle,
+    cancelBefore, candidateShape, clientState,
     encodeImage, encoderReady, engineState, forgetEncoder, pickCandidate, releaseDocument,
     releaseEmbeddings, segment, subscribe, warmEncoder, warmUp, relievePressure,
 } from './sam-client.js'
@@ -22,20 +22,16 @@ import { createGestures } from './gestures.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import {
     observePost, observeBandFraction, savePostFit, explainFit,
-    observeDetect, saveDetectMsPerCell, affordableCells,
 } from './hardware-fit.js'
 import { createMemoryGovernor } from './memory-governor.js'
-import { probeCapability, probeTextLane, readPhosmithResources, withPhosmithResources } from './capability.js'
+import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset, getOriginalBlob, getAssetKey } from './asset-store.js'
 import { saveSession, loadSession, clearSession } from './session-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
-import { detectCandidates, lastDetectCost } from './text-ui.js'
-import { suggest, buildFacets } from './search-taxonomy.js'
 import { modelRegistry, noteModel, isModelNoted, laneOfModel } from './model-registry.js'
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
-import { prefetchTextLane } from './model-prefetch.js'
 import { refineAlpha, disposeCvRefine, cvRefineAvailable } from './cv-refine-client.js'
 
 // The user's own persisted profile choice — a deliberate decision, so it is
@@ -90,24 +86,6 @@ const noteClickCost = (res) => {
     savePostFit({ msPerMP: next, bandFraction: BUDGET.postBandFraction })
 }
 
-/**
- * The same benchmark for the text lane: a search reports its own inference time
- * and the number of cells it ran, so the grid a device gets is sized on what
- * that device measured rather than on class flags. Takes effect on the NEXT
- * search (the plan for this one is already spent). Memory still caps cells from
- * policy — this only ever lowers the ceiling further.
- */
-const noteDetectCost = () => {
-    const cost = lastDetectCost()
-    if (!cost) return
-    const next = observeDetect(BUDGET.detectorMsPerCell, cost.inferMs, cost.cells)
-    if (!next) return
-    BUDGET.detectorMsPerCell = next
-    BUDGET.detectorMsPerCellSource = 'measured'
-    saveDetectMsPerCell(next)
-    BUDGET.detectorMaxCells = Math.min(BUDGET.detectorMaxCells, affordableCells(BUDGET))
-}
-
 // The mask lane warms at PAGE LOAD (see Boot), not at import. warmUp memoises,
 // so the import path calling it again is free.
 let warmStarted = false
@@ -130,14 +108,13 @@ const els = {
     prep: $('prep'), prepText: $('prep-text'),
     chipMode: $('chip-mode'), chipDevice: $('chip-device'), chipModel: $('chip-model'), chipTiming: $('chip-timing'),
     undo: $('undo'), reset: $('reset'), cutout: $('cutout'),
-    signtoggle: $('signtoggle'), textwrap: $('textwrap'), textinput: $('textinput'), selectall: $('selectall'),
-    autocomplete: $('autocomplete'), refine: $('refine'), scope: $('scope'),
+    signtoggle: $('signtoggle'), scope: $('scope'),
     toleranceWrap: $('tolerance-wrap'), tolerance: $('tolerance'), toleranceValue: $('tolerance-value'),
     modes: {
         click: $('mode-click'), box: $('mode-box'),
         lasso: $('mode-lasso'), region: $('mode-region'), rect: $('mode-rect'),
         ellipse: $('mode-ellipse'), polygon: $('mode-polygon'), magic: $('mode-magic'), color: $('mode-color'),
-        brush: $('mode-brush'), text: $('mode-text'),
+        brush: $('mode-brush'),
     },
 }
 
@@ -155,13 +132,6 @@ const state = {
     // Per-channel RGB distance used only by Magic and Color. 36 is a useful
     // middle ground for photos; 72 was broad enough to merge unrelated hues.
     wandTolerance: 36,
-    textCandidates: [],       // [{ box, score, label, color }] proxy coords, the visible (facet-filtered) set
-    textAllCandidates: [],    // unfiltered detections behind the refine chips
-    textFacets: null,         // { colour, kind, size, position } sub-class axes (search-taxonomy)
-    textFacetSel: null,       // { axis → Set(value) } chips the user has toggled on
-    textMulti: false,         // phrase implied "all/every"
-    textBackend: null,        // 'detector:device:dtype' that actually ran the last search
-    textDriven: false,        // this selection came from a detector box, not a pointer
     boxDrawn: false,          // state.box came from a drag — only then is it drawn
     mask: null,               // DERIVED: baseMask ∪ liveMask — the composed selection
     maskRaw: null,            // baseMask ∪ live raw decoder mask (E toggle)
@@ -224,10 +194,7 @@ const setStatus = (msg) => { els.status.textContent = msg }
 
 const refreshChips = () => {
     const lane = clientState.lane ? ` · ${clientState.lane}` : ''
-    // 'grounding:webgpu:q4f16' → 'text: grounding/webgpu'; drop the dtype,
-    // it's noise here. Only shown once a text search has actually run.
-    const textLane = state.textBackend ? ` · text: ${state.textBackend.split(':').slice(0, 2).join('/')}` : ''
-    els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}${textLane}`
+    els.chipMode.textContent = `engine: ${clientState.mode || '—'}${lane}`
     const gpu = capability?.gpuTier || 'probing'
     // Only a trusted host budget is shown as a memory figure; a browser's
     // deviceMemory report is unverifiable, so it never appears as a number.
@@ -245,7 +212,7 @@ const refreshChips = () => {
     // touching Cache Storage — ✓ means no download will happen on next use.
     if (els.chipModel) {
         const noted = modelRegistry()
-        const have = ['sam21', 'yoloe', 'clip'].filter((id) => noted[id])
+        const have = ['sam21'].filter((id) => noted[id])
         els.chipModel.textContent = state.modelPull
             ? `models: ${state.modelPull}`
             : (have.length ? `models: ${have.map((id) => `${id} ✓`).join(' · ')}` : 'models: none cached yet')
@@ -295,11 +262,8 @@ subscribe((event) => {
         if (d.status === 'progress' && d.total) {
             const pct = Math.round((d.loaded / d.total) * 100)
             els.loadbar.style.width = `${pct}%`
-            // Progress can be the mask lane or a text detector — name what's pulling.
-            const model = /clip/i.test(d.name) ? 'CLIP text'
-                : /yoloe/i.test(d.name) ? 'YOLOE' : 'SAM 2.1'
             const mb = Math.max(1, Math.round(d.total / 1e6))
-            setStatus(`Downloading ${model} — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~${mb} MB)`)
+            setStatus(`Downloading SAM 2.1 — ${String(d.file || '').split('/').pop()} ${pct}% (one-time, ~${mb} MB)`)
         } else if (d.status === 'done') {
             els.loadbar.style.width = '0%'
             // Weights landed → note them in the registry so every later visit
@@ -733,11 +697,6 @@ const shedMemory = (level, { announce = true } = {}) => {
     const previous = BUDGET.pressureLevel || 0
     BUDGET = applyMemoryPressure(BUDGET, level)
     if ((BUDGET.pressureLevel || 0) >= 2) disposeCvRefine() // idle wasm worker goes first
-    // The policy change above only governs the NEXT search; a worker already
-    // resident keeps its arena until it is terminated, and on WebKit that arena
-    // is the largest thing the app is holding. Skipped while a search is in
-    // flight — see disposeDetectorIfIdle.
-    if (level >= 1) disposeDetectorIfIdle()
     if (announce && BUDGET.pressureLevel > previous) {
         if (BUDGET.pressureLevel >= 3) {
             setStatus('Memory pressure detected — running in safe mode.')
@@ -817,12 +776,6 @@ const estimateFootprintMB = () => {
         if (lane?.encoder || lane?.decoder) mb += LEDGER_MB.devicePool
         if (lane?.encoder) mb += LEDGER_MB.encoderSession
     }
-    // The text lane is a SEPARATE worker with its own ORT arena, and it was
-    // missing from the ledger entirely — on WebKit, where the ledger is the only
-    // input, the lane that peaks near a gigabyte was the one thing the governor
-    // could not see. Freed only by terminating the worker, so residency tracks
-    // the worker (sam-client §DETECT_RESIDENT_MB).
-    mb += detectorResidentMB()
     // Buffers the app sizes itself, so these are exact rather than anchored.
     const px = (w, h) => ((w || 0) * (h || 0) * 4) / (1024 * 1024)
     mb += px(els.view?.width, els.view?.height)
@@ -897,15 +850,7 @@ for (const ev of ['pointerdown', 'pointerup', 'keydown', 'wheel']) {
 // Modes where include/exclude applies — via the sign toggle or right/Alt-click.
 const SIGN_MODES = new Set(['click', 'magic', 'color', 'region', 'rect', 'ellipse', 'polygon'])
 
-const TEXT_LANE = probeTextLane()
-const TEXT_LANE_REFUSAL = 'Text search is switched off for this session (?text=0).'
-if (!TEXT_LANE.ok) {
-    els.modes.text.disabled = true
-    els.modes.text.title = TEXT_LANE_REFUSAL
-}
-
 const setMode = (mode) => {
-    if (mode === 'text' && !TEXT_LANE.ok) { setStatus(TEXT_LANE_REFUSAL); return }
     if (mode !== 'polygon') state.polygonDraft = []
     state.mode = mode
     for (const [name, btn] of Object.entries(els.modes)) {
@@ -913,17 +858,7 @@ const setMode = (mode) => {
     }
     els.signtoggle.style.display = SIGN_MODES.has(mode) ? '' : 'none'
     els.toleranceWrap.hidden = mode !== 'magic' && mode !== 'color'
-    els.textwrap.hidden = mode !== 'text'
-    els.selectall.hidden = mode !== 'text' || state.textCandidates.length === 0
     syncContextRow()
-    if (mode !== 'text') { hideAutocomplete(); clearRefine() }
-    if (mode === 'text') {
-        els.textinput.focus()
-        void hintTextSearch()
-        // Intent signal: pull the detector's weights while the phrase is typed,
-        // rather than at boot (a session that never searches must not pay).
-        prefetchTextLane()
-    }
     renderOverlay() // each tool shows only its own marks (ownTool)
 }
 els.modes.click.addEventListener('click', () => setMode('click'))
@@ -936,7 +871,6 @@ els.modes.polygon.addEventListener('click', () => setMode('polygon'))
 els.modes.magic.addEventListener('click', () => setMode('magic'))
 els.modes.color.addEventListener('click', () => setMode('color'))
 els.modes.brush.addEventListener('click', () => setMode('brush'))
-els.modes.text.addEventListener('click', () => setMode('text'))
 
 els.tolerance.addEventListener('input', () => {
     state.wandTolerance = Number(els.tolerance.value)
@@ -966,9 +900,6 @@ function clearPrompts() {
     state.lasso = null
     state.manual = null
     state.polygonDraft = []
-    state.textCandidates = []
-    state.textDriven = false
-    clearRefine()
     state.mask = null
     state.maskRaw = null
     state.maskSummary = null
@@ -981,7 +912,6 @@ function clearPrompts() {
     state.score = 0
     state.drag = null
     state.brush = null
-    els.selectall.hidden = true
     layerCache = { mask: null, fill: null } // release the committed overlay cache
     bumpRevision() // orphan + cancel any in-flight result
     renderOverlay()
@@ -1167,7 +1097,7 @@ const wantsSign = () => SIGN_MODES.has(state.mode) && document.body.dataset.inpu
 const syncContextRow = () => {
     els.context.classList.toggle(
         'on',
-        wantsSign() || state.mode === 'magic' || state.mode === 'color' || state.mode === 'text',
+        wantsSign() || state.mode === 'magic' || state.mode === 'color',
     )
 }
 syncContextRow()
@@ -1491,8 +1421,6 @@ const commitManualMask = (kind, imageData, geometry = {}, negative = false) => {
     const hadMask = !!(state.maskSummary && state.maskSummary.bbox)
     beginNewObject()                       // the live SAM object commits with it
     pushBaseOp(negative ? 'sub' : 'add', imageData, kind)
-    state.textCandidates = []
-    clearRefine()
     state.manual = state.baseMask ? { kind, ...geometry } : null
     recomposeMask()
     state.score = 0
@@ -1563,8 +1491,6 @@ const startBrush = (point, erase) => {
     state.clicks = []
     state.box = null
     state.lasso = null
-    state.textCandidates = []
-    clearRefine()
     state.maskRaw = null
     state.showRaw = false
     state.manual = { kind: 'brush' }
@@ -1584,8 +1510,6 @@ const commitBrushMask = () => {
     state.clicks = []
     state.box = null
     state.lasso = null
-    state.textCandidates = []
-    clearRefine()
     // The stroke canvas was seeded from the composed mask, so it already IS
     // the final whole-selection result: flatten the stack to this one op.
     state.baseOps = []
@@ -1700,9 +1624,6 @@ els.overlay.addEventListener('pointerdown', (e) => {
     e.preventDefault()
     els.overlay.setPointerCapture(e.pointerId)
     const [x, y] = toCanvas(e)
-    // Any pointer prompt ends the text-driven selection; the text branch below
-    // re-arms it when the tap lands on a detected box.
-    state.textDriven = false
     if (state.mode === 'click') {
         state.drag = { kind: 'tap', start: [x, y], moved: false, negative: e.button === 2 || e.altKey, pointerType: e.pointerType }
         if (e.pointerType === 'touch' && !state.drag.negative) armLongPress()
@@ -1725,9 +1646,6 @@ els.overlay.addEventListener('pointerdown', (e) => {
         const erase = e.button === 2 || e.altKey
         startBrush([x, y], erase)
         state.drag = { kind: 'brush', last: [x, y], erase }
-    } else if (state.mode === 'text') {
-        const i = candidateAt(x, y) // tap a detected box to select it
-        if (i >= 0) selectCandidate(i)
     }
     renderOverlay()
 })
@@ -1840,8 +1758,8 @@ function applyClickPrompt(x, y, label) {
     setStatus('Nothing to exclude here — click an object first')
 }
 
-/** A box prompt, from a drag or from a text candidate. `drawn` is false when
- *  the user typed a phrase instead of dragging: still a prompt, never a mark. */
+/** A box prompt from a drag. `drawn` marks it as a visible box rather than a
+ *  bare prompt. */
 function applyBoxPrompt(box, { drawn = true } = {}) {
     state.manual = null
     beginNewObject()
@@ -2103,7 +2021,7 @@ const shouldEscalate = (summary, force = false) => {
     // proxy mask loses whole parts of it — measured on the canonical NEF, a
     // tulip's right petal and lower petals were simply absent from the 1024
     // proxy mask and came back once the crop was decoded at native resolution.
-    const wanted = force || BUDGET.autoEscalate || state.textDriven
+    const wanted = force || BUDGET.autoEscalate
     if (!wanted || !hasOriginal() || !summary?.bbox) return false
     const tf = getTransform()
     if (!tf) return false
@@ -2192,321 +2110,6 @@ function mergeCropIntoProxy({ alpha, width, height, proxySubrect }) {
     state.liveSummary = summarizeMaskRGBA(merged, W, H)
     recomposeMask()
 }
-
-/* ─── Text select ────────────────────────────────────────────────────────── */
-
-let detectTimer = null
-
-/** Set expectations before the user types: the detector is a one-time download
- *  and the first search is the slow one. Local state only — no network. */
-function hintTextSearch() {
-    if (!state.hasImage || state.mode !== 'text') return
-    // One open-vocabulary lane, downloaded once then cached. Encoded phrases are
-    // persisted too, so a repeated search never rebuilds the text encoder.
-    setStatus('Text search ready — describe anything, e.g. “orange tulip”, “a rusty bicycle”')
-}
-
-async function runDetect(phrase) {
-    if (!TEXT_LANE.ok) { setStatus(TEXT_LANE_REFUSAL); return }
-    if (!state.hasImage || !phrase.trim()) {
-        state.textCandidates = []
-        clearRefine()
-        els.selectall.hidden = true
-        renderOverlay()
-        return
-    }
-    bumpRevision()
-    const revision = state.revision
-    const idleMs = BUDGET.detectorDispose === 'now' ? 0 : (BUDGET.detectorIdleMs || 0)
-    const evict = BUDGET.detectorEvictOnEncode === true
-    setStatus(`Looking for “${phrase.trim()}”… (first search downloads the detector, then it's cached)`)
-    if (revision !== state.revision) return // superseded while checking
-    try {
-        // One open-vocabulary lane: the phrase conditions the detector directly,
-        // so there is no vocabulary to miss and nothing to fall back to.
-        const res = await detectCandidates(phrase, { idleMs, evict, budget: BUDGET })
-        noteDetectCost()
-        if (revision !== state.revision) return // superseded by newer input
-        state.textBackend = res?.backend || null
-        refreshChips()
-        if (!res || res.candidates.length === 0) {
-            state.textCandidates = []
-            clearRefine()
-            els.selectall.hidden = true
-            setStatus(`No matches for “${phrase.trim()}”. Try different words.`)
-            renderOverlay()
-            return
-        }
-        state.textMulti = res.multi
-        // Every match is the SAME class: the phrase named that class, so all of
-        // them are the answer — take them without asking. Only a mixed-label
-        // result is a real choice, and that falls through to the chips below.
-        const oneClass = new Set(res.candidates.map((c) => c.label)).size === 1
-        if (oneClass) {
-            state.textCandidates = res.candidates
-            clearRefine()
-            els.selectall.hidden = true
-            if (res.candidates.length === 1) {
-                setStatus(`Selecting “${phrase.trim()}”…`)
-                selectCandidate(0)
-            } else {
-                await selectAll(`“${phrase.trim()}”`)
-            }
-            return
-        }
-        // Mixed labels: group them into sub-class refine chips (one detection
-        // pass, filtering is free) and show every match to start.
-        setupFacets(res.candidates)
-        els.selectall.hidden = state.textCandidates.length < 2
-        const n = state.textCandidates.length
-        setStatus(`${n} match${n > 1 ? 'es — tap one, refine below, or Select all' : ' — tap it'}`)
-        renderOverlay()
-    } catch (err) {
-        if (revision !== state.revision) return
-        console.error('[seglab] detect failed:', err)
-        // A worker killed for memory surfaces as its own death (watchdog) or as
-        // whatever fetch was in flight when the process went — on WebKit that is
-        // the bare string "Load failed", which names neither the cause nor a way
-        // out. Both mean the same thing to the user, so say that instead.
-        const outOfMemory = err?.code === 'detect-worker-died'
-            || /load failed|out of memory|memory|alloc|abort/i.test(String(err?.message))
-        setStatus(outOfMemory
-            ? (BUDGET.profile === 'lite'
-                ? 'Text selection is unavailable on this device’s safe memory profile.'
-                : 'This browser ran out of memory for text search — click the object instead, or try Chrome.')
-            : `Text detection failed: ${err?.message}`)
-    }
-}
-
-/** A detector box → a box prompt through the normal pipeline (mask + HD export). */
-const selectCandidate = (i) => {
-    const c = state.textCandidates[i]
-    if (!c) return
-    // Kept as a prompt so a later click refines INSIDE the detected object, but
-    // never drawn: the user typed a phrase, they did not drag a box.
-    applyBoxPrompt(c.box.slice(), { drawn: false })
-    state.textDriven = true // earns the native-crop sharpen (shouldEscalate)
-    state.textCandidates = []
-    clearRefine()
-    els.selectall.hidden = true
-}
-
-/** Union every candidate into one mask (multi-instance: "all bottles").
- *  Never bind straight to an event — arg 1 would be the Event. */
-async function selectAll(noun = 'objects') {
-    const boxes = state.textCandidates.map((c) => c.box.slice())
-    if (boxes.length === 0 || state.running) return
-    beginNewObject()   // whatever was live stays selected; these boxes are new
-    bumpRevision()
-    const revision = state.revision
-    state.running = true
-    state.textCandidates = []
-    clearRefine()
-    state.manual = null
-    els.selectall.hidden = true
-    setStatus(`Selecting ${boxes.length} ${noun}…`)
-    try {
-        let union = null
-        for (const box of boxes) {
-            const res = await segment(els.view, { box, revision })
-            if (res.stale || revision !== state.revision) return
-            if (!res.usable) continue
-            if (!union) {
-                union = new ImageData(new Uint8ClampedArray(res.imageData.data), res.width, res.height)
-            } else {
-                const u = union.data
-                const m = res.imageData.data
-                for (let k = 0; k < u.length; k += 4) if (m[k] > u[k]) { u[k] = m[k]; u[k + 1] = m[k + 1]; u[k + 2] = m[k + 2] }
-            }
-        }
-        if (!union) { setStatus('No objects selected'); return }
-        // The multi-instance union commits as one op; Z removes it whole.
-        pushBaseOp('add', union, 'text')
-        recomposeMask()
-        setStatus(`Selected ${boxes.length} ${noun}`)
-        renderOverlay()
-        refreshButtons()
-    } finally {
-        state.running = false
-    }
-}
-
-/* ─── Autocomplete (main class → kind browsing) ──────────────────────────── */
-
-let acItems = []
-let acActive = -1
-
-function hideAutocomplete() {
-    if (els.autocomplete.hidden) return
-    els.autocomplete.hidden = true
-    els.autocomplete.replaceChildren()
-    acItems = []
-    acActive = -1
-}
-
-const applySuggestion = (text) => {
-    els.textinput.value = text
-    hideAutocomplete()
-    clearTimeout(detectTimer)
-    runDetect(text)
-}
-
-const renderAutocomplete = () => {
-    const rows = suggest(els.textinput.value, { limit: 8 })
-    acItems = rows
-    acActive = -1
-    if (rows.length === 0) { hideAutocomplete(); return }
-    const frag = document.createDocumentFragment()
-    rows.forEach((row) => {
-        const el = document.createElement('div')
-        el.className = 'ac-row'
-        el.setAttribute('role', 'option')
-        const text = document.createElement('span')
-        text.className = 'ac-text'
-        text.textContent = row.text
-        const detail = document.createElement('span')
-        detail.className = 'ac-detail'
-        detail.textContent = row.group === 'category' ? row.detail : row.group
-        el.append(text, detail)
-        // mousedown (not click) so the input's blur doesn't close the list first.
-        el.addEventListener('mousedown', (e) => { e.preventDefault(); applySuggestion(row.text) })
-        frag.append(el)
-    })
-    els.autocomplete.replaceChildren(frag)
-    els.autocomplete.hidden = false
-}
-
-/** Arrow-key move through the open list; returns false when there's nothing open. */
-const moveAutocomplete = (delta) => {
-    if (els.autocomplete.hidden || acItems.length === 0) return false
-    acActive = (acActive + delta + acItems.length) % acItems.length
-    ;[...els.autocomplete.children].forEach((el, i) => el.classList.toggle('on', i === acActive))
-    return true
-}
-
-/* ─── Sub-class refine chips (colour · kind · size · position) ────────────── */
-
-const REFINE_AXES = [['colour', 'Colour'], ['kind', 'Kind'], ['size', 'Size'], ['position', 'Where']]
-const SWATCH = {
-    red: '#e0403a', orange: '#e07a1e', yellow: '#e0c020', green: '#3fa54a',
-    blue: '#3f7ad0', purple: '#8a4fd0', pink: '#e06aa8', brown: '#8a5a34',
-    white: '#f0f0f0', gray: '#9098a0', black: '#20242a',
-}
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1)
-
-function clearRefine() {
-    state.textFacets = null
-    state.textFacetSel = null
-    state.textAllCandidates = []
-    if (!els.refine.hidden) { els.refine.hidden = true; els.refine.replaceChildren() }
-}
-
-// AND across axes, OR within an axis: a candidate shows when, for every axis
-// that has a chip selected, it belongs to at least one selected chip.
-const applyFacetFilter = () => {
-    const { textFacets: facets, textFacetSel: sel, textAllCandidates: all } = state
-    if (!facets || !sel) { state.textCandidates = all.slice(); return }
-    const keep = all.map(() => true)
-    for (const [axis] of REFINE_AXES) {
-        const chosen = sel[axis]
-        if (!chosen || chosen.size === 0) continue
-        const allowed = new Set()
-        for (const f of facets[axis]) if (chosen.has(f.value)) for (const idx of f.idx) allowed.add(idx)
-        for (let i = 0; i < all.length; i += 1) if (!allowed.has(i)) keep[i] = false
-    }
-    state.textCandidates = all.filter((_, i) => keep[i])
-}
-
-const renderRefine = () => {
-    const facets = state.textFacets
-    const axes = REFINE_AXES.filter(([axis]) => facets?.[axis]?.length)
-    if (!facets || axes.length === 0) { clearRefine(); return }
-    const frag = document.createDocumentFragment()
-    for (const [axis, title] of axes) {
-        const group = document.createElement('div')
-        group.className = 'axis'
-        const label = document.createElement('span')
-        label.className = 'axis-label'
-        label.textContent = title
-        group.append(label)
-        for (const f of facets[axis]) {
-            const chip = document.createElement('button')
-            chip.className = 'refine-chip'
-            if (state.textFacetSel[axis]?.has(f.value)) chip.classList.add('on')
-            if (axis === 'colour' && SWATCH[f.value]) {
-                const sw = document.createElement('span')
-                sw.className = 'swatch'
-                sw.style.background = SWATCH[f.value]
-                chip.append(sw)
-            }
-            const name = document.createElement('span')
-            name.textContent = axis === 'kind' ? f.label : cap(f.label)
-            const count = document.createElement('span')
-            count.className = 'count'
-            count.textContent = String(f.count)
-            chip.append(name, count)
-            chip.addEventListener('click', () => toggleFacet(axis, f.value))
-            group.append(chip)
-        }
-        frag.append(group)
-    }
-    els.refine.replaceChildren(frag)
-    els.refine.hidden = false
-}
-
-const toggleFacet = (axis, value) => {
-    const sel = state.textFacetSel
-    if (!sel[axis]) sel[axis] = new Set()
-    if (sel[axis].has(value)) sel[axis].delete(value)
-    else sel[axis].add(value)
-    applyFacetFilter()
-    els.selectall.hidden = state.textCandidates.length < 2
-    renderRefine()
-    renderOverlay()
-    const n = state.textCandidates.length
-    setStatus(n === 0
-        ? 'No matches with those filters — tap the chips to widen'
-        : `${n} match${n > 1 ? 'es — tap one or Select all' : ' — tap it'}`)
-}
-
-/** Populate the refine bar from a fresh detection and show all candidates. */
-const setupFacets = (candidates) => {
-    state.textAllCandidates = candidates
-    state.textFacets = buildFacets(candidates, { width: els.overlay.width, height: els.overlay.height })
-    state.textFacetSel = {}
-    applyFacetFilter()
-    renderRefine()
-}
-
-/** Candidate index under a proxy-space point, or -1. */
-const candidateAt = (x, y) => {
-    for (let i = 0; i < state.textCandidates.length; i += 1) {
-        const [x0, y0, x1, y1] = state.textCandidates[i].box
-        if (x >= x0 && x <= x1 && y >= y0 && y <= y1) return i
-    }
-    return -1
-}
-
-els.textinput.addEventListener('input', () => {
-    clearTimeout(detectTimer)
-    renderAutocomplete()
-    detectTimer = setTimeout(() => runDetect(els.textinput.value), 400)
-})
-els.textinput.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowDown' && moveAutocomplete(1)) { e.preventDefault(); return }
-    if (e.key === 'ArrowUp' && moveAutocomplete(-1)) { e.preventDefault(); return }
-    if (e.key === 'Escape') { hideAutocomplete(); return }
-    if (e.key === 'Enter') {
-        // A highlighted suggestion wins; otherwise search the typed text.
-        if (acActive >= 0 && acItems[acActive]) { e.preventDefault(); applySuggestion(acItems[acActive].text); return }
-        clearTimeout(detectTimer)
-        hideAutocomplete()
-        runDetect(els.textinput.value)
-    }
-})
-els.textinput.addEventListener('focus', renderAutocomplete)
-els.textinput.addEventListener('blur', () => setTimeout(hideAutocomplete, 120))
-els.selectall.addEventListener('click', () => selectAll())
 
 /* ─── Overlay rendering ──────────────────────────────────────────────────── */
 
@@ -2672,23 +2275,6 @@ function paintOverlay() {
         ctx.setLineDash([])
     }
 
-    // Text candidates: numbered boxes to tap.
-    for (let i = 0; ownTool('text') && i < state.textCandidates.length; i += 1) {
-        const [x0, y0, x1, y1] = state.textCandidates[i].box
-        ctx.setLineDash([6, 4])
-        ctx.strokeStyle = 'rgba(90,160,255,0.95)'
-        ctx.lineWidth = 2
-        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
-        ctx.setLineDash([])
-        const tag = String(i + 1)
-        ctx.font = '600 13px -apple-system, sans-serif'
-        const tw = ctx.measureText(tag).width + 10
-        ctx.fillStyle = 'rgba(90,160,255,0.95)'
-        ctx.fillRect(x0, Math.max(0, y0 - 18), tw, 18)
-        ctx.fillStyle = '#fff'
-        ctx.fillText(tag, x0 + 5, Math.max(13, y0 - 5))
-    }
-
     // Lasso region (kept faint once the mask lands, so the clamp is visible).
     if (state.lasso && ownTool('lasso')) {
         ctx.beginPath()
@@ -2834,11 +2420,8 @@ els.cutout.addEventListener('click', async () => {
     // in the app, and the user is waiting on a file, not the canvas.
     const epoch = showPrep(wasNative ? 'Rebuilding the cutout at full resolution…' : 'Building the cutout…')
     try {
-        // Detector, encoder and wasm-refine all hold memory an export does not
-        // need. relievePressure covers only the mask lane, so the detect worker
-        // (up to 1030 MB) needs its own call.
+        // The encoder and wasm-refine both hold memory an export does not need.
         await relievePressure(1)
-        disposeDetectorIfIdle()
         disposeCvRefine()
         let out = null
         if (wasNative) {
@@ -2997,7 +2580,6 @@ window.__seglab = {
         clicks: state.clicks.length,
         baseOps: state.baseOps.length,
         revision: state.revision,
-        candidates: state.textCandidates.length,
         manual: state.manual?.kind || null,
         escalated: !!getHdPatch(state.revision),
     }),
@@ -3258,71 +2840,6 @@ window.__seglab = {
         commitBrushMask()
         await new Promise((resolve) => requestAnimationFrame(resolve))
         return { ...window.__seglab.state(), ...(window.__seglab.maskStats() || {}) }
-    },
-    // Run the resource-gated text detector; returns candidate boxes (for the
-    // WARN-level detector gate — headless model quality is not asserted hard).
-    detect: async (phrase) => {
-        await runDetect(phrase)
-        return { candidates: state.textCandidates.length, boxes: state.textCandidates.map((c) => c.box), multi: state.textMulti }
-    },
-    // Deterministic text-select PLUMBING (no detector): drive given proxy
-    // boxes through the box→mask→union path exactly as a real pick would.
-    selectBoxes: async (boxes) => {
-        state.textCandidates = boxes.map((box) => ({ box, score: 1, label: 'test' }))
-        if (boxes.length === 1) { selectCandidate(0); await waitForRun() } else { await selectAll() }
-        const s = window.__seglab.state()
-        return { ...s, ...(window.__seglab.maskStats() || {}) }
-    },
-    // Direct detector probe (bypasses runDetect revision/evict churn) — returns
-    // raw candidate count + backend for scripted validation.
-    testDetect: async (phrase) => {
-        try {
-            const res = await detectCandidates(phrase, { idleMs: 0, evict: false, budget: BUDGET })
-            return res
-                ? { n: res.candidates.length, backend: res.backend, labels: res.candidates.map((c) => c.label).slice(0, 6) }
-                : { n: 0, backend: null }
-        } catch (err) { return { error: String(err?.message || err) } }
-    },
-    // Every ranking stage in ORIGINAL px — says which stage dropped, merged or
-    // truncated the box the detector actually saw.
-    testDetectStages: async (phrase) => {
-        try {
-            const { detectStages } = await import('./text-ui.js')
-            return await detectStages(phrase, { budget: BUDGET })
-        } catch (err) { return { error: String(err?.message || err) } }
-    },
-    // Raw detector scores before ranking — separates "phrase unknown" from
-    // "object below the 640² resolution floor".
-    testDetectRaw: async (phrase, threshold = 0.001, slots = null, grid = undefined) => {
-        try {
-            const { detectRaw } = await import('./text-ui.js')
-            return await detectRaw(phrase, { threshold, slots, budget: BUDGET, ...(grid ? { grid } : {}) })
-        } catch (err) { return { error: String(err?.message || err) } }
-    },
-    // Phrase → 512-d MobileCLIP2 vector, for asserting the open-vocab path
-    // end to end (an arbitrary phrase must produce a finite unit vector).
-    testEncodePhrase: async (phrase) => {
-        try {
-            const { encodePhrases } = await import('./text-encode.js')
-            const { vectors, backend } = await encodePhrases([phrase])
-            let norm = 0
-            for (const v of vectors) norm += v * v
-            return { dim: vectors.length, norm: Math.sqrt(norm), backend, finite: vectors.every(Number.isFinite) }
-        } catch (err) { return { error: String(err?.message || err) } }
-    },
-    // Deterministic REFINE-CHIP plumbing (no detector): feed pre-tagged
-    // candidates [{ box, score, label, color }] through the real facet build +
-    // render path, so scripted checks can assert the sub-class bar without the
-    // slow open-vocab lane. Returns the facet axes that rendered.
-    previewCandidates: (cands) => {
-        setupFacets(cands)
-        els.selectall.hidden = state.textCandidates.length < 2
-        renderOverlay()
-        return {
-            visible: state.textCandidates.length,
-            axes: Object.fromEntries(['colour', 'kind', 'size', 'position']
-                .map((a) => [a, (state.textFacets?.[a] || []).map((f) => `${f.label}:${f.count}`)])),
-        }
     },
     // Crash/power-cut persistence (verify.mjs): a real cut fires no unload, so
     // the gate reloads without one and asserts the work came back.

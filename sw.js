@@ -25,11 +25,14 @@
 // the v3 copy fails every search with "Got: 1 Expected: 32". Bumping the name
 // drops the old generation; the `cache: 'reload'` below is what stops the
 // refetch being answered by the immutable HTTP cache instead of the network.
+// v6: the open-vocabulary text lane is gone. Returning visitors hold ~110 MB
+// of YOLOE + MobileCLIP2 weights that nothing can reach any more, and the only
+// way to reclaim them is to drop the bucket they live in.
 // v5: SlimSAM and transformers.js are gone. Returning visitors hold ~90 MB of
 // weights for a model the app can no longer load, and nothing would ever evict
 // them — the entries are keyed by URLs nobody requests any more. The bump is
 // the eviction.
-const CACHE_NAME = 'seglab-models-v5'
+const CACHE_NAME = 'seglab-models-v6'
 
 /**
  * URL prefixes that should be intercepted and cached. Only the ORT runtime

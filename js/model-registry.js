@@ -15,7 +15,7 @@ const read = () => {
     try { return JSON.parse(localStorage.getItem(KEY)) || {} } catch { return {} }
 }
 
-/** { sam21: {device, notedAt, …}, yoloe: {…}, clip: {…} } */
+/** { sam21: {device, notedAt, …} } */
 export const modelRegistry = () => (cache ??= read())
 
 /** Record (or update) a model the browser now holds. Merges meta. */
@@ -32,8 +32,6 @@ export const isModelNoted = (id) => Boolean(modelRegistry()[id])
 
 /** Lane id from a download-progress event's model name. */
 export const laneOfModel = (name = '') => {
-    if (/clip/i.test(name)) return 'clip' // text encoder + its BPE/table assets
-    if (/yoloe/i.test(name)) return 'yoloe'
     if (/sam/i.test(name)) return 'sam21' // one mask lane, so any SAM is that one
     return null
 }

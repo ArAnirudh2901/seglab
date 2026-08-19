@@ -10,8 +10,7 @@
  *   nested objects   a confident sub-cluster of petals outscores a whole bloom,
  *                    so the top score IS the mask that leaves parts out
  *   negative clicks  a candidate that still covers an exclude point can win
- *   box prompts      a candidate that spills far outside the detector's box can
- *                    win, and text search prompts exclusively by box
+ *   box prompts      a candidate that spills far outside the drawn box can win
  *   mushy fields     a candidate with no real boundary can score high; low
  *                    stability is what exposes it
  *   hierarchy drift  the level can change between click 1 and click 2, so

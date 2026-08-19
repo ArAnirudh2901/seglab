@@ -212,19 +212,3 @@ export const probeCapability = async ({ hostResources = readPhosmithResources() 
     } catch { /* WebGPU is optional here; the lane gates on it separately. */ }
     return classifyCapability(raw)
 }
-
-/**
- * Text lane availability. Previously refused on WebKit (`navigator.vendor ===
- * "Apple Computer, Inc."`) on the theory that the lane hit a ~1 GB per-process
- * ceiling and took the tab with it. Re-measured 2026-08-09: it completes fine
- * on Safari (peaks ~6.3 GB, tab survives) — see the corrected memory. The
- * ceiling doesn't exist, so WebKit is no longer refused; `?text=0` still
- * disables the lane anywhere it isn't wanted.
- */
-export const probeTextLane = (
-    search = typeof location !== 'undefined' ? location.search : '',
-) => {
-    const q = new URLSearchParams(search).get('text')
-    if (q === '0') return { ok: false, reason: 'disabled' }
-    return { ok: true, reason: 'ok' }
-}

@@ -262,21 +262,6 @@ check('space-drag: pans instead of drawing',
     `Δtx ${((await geom()).tx - beforeSpace.tx).toFixed(0)}, clicks ${clicksBefore} → ${(await st()).clicks}`)
 
 await resetZoom()
-await page.locator('#mode-text').click()
-await page.waitForTimeout(150)
-if (await page.locator('#textinput').isVisible()) {
-    await page.locator('#textinput').click()
-    await page.keyboard.type('a b c')
-    await page.waitForTimeout(100)
-    const typed = await geom()
-    check('typing: a space in the search box is a space, not a pan grab',
-        typed.zoom === 1 && typed.tx === 0 && typed.ty === 0
-        && (await page.locator('#textinput').inputValue()) === 'a b c',
-        `${typed.zoom}× at (${typed.tx}, ${typed.ty}), value "${await page.locator('#textinput').inputValue()}"`)
-    await page.locator('#textinput').fill('')
-} else {
-    console.log('    (text lane unavailable — space-in-field check skipped)')
-}
 await page.locator('#mode-click').click()
 await page.waitForTimeout(100)
 

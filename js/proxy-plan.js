@@ -95,41 +95,6 @@ export const planBudget = (budget = {}) => {
 }
 
 /**
- * Detector-lane source sizing for open-vocabulary text search.
- *
- * The text lane has its own proxy, separate from the interaction frame: it
- * re-decodes the ORIGINAL so each tile reaches the detector square at real
- * resolution. That decode used to be sized from tile geometry alone — no
- * budget, no ceiling, no response to pressure — so the one lane that scales
- * with image size was the one lane nothing capped.
- *
- * ONE knob: `detectorMaxCells`, the number of side² inferences a search may
- * run. Cells are what cost memory (each is a full pass through the detector
- * graph, and ORT's pool grows with them), so the grid comes from that budget
- * and the source resolution is DERIVED from the grid it bought. Two
- * independent numbers could disagree and starve an axis; these cannot.
- *
- * Returns { grid, cells, maxSide, maxMP }. `grid` 1 means full frame only.
- */
-export const detectorPlan = (srcW, srcH, budget = {}, { side = 640, overlap = 0.15, grid = 2 } = {}) => {
-    const maxCells = Math.max(1, Math.floor(budget.detectorMaxCells || 10))
-    // A pass is the full frame plus grid² tiles — the full frame is the only
-    // cell that can see a subject larger than one tile, so it is never dropped.
-    let g = Math.max(1, Math.floor(grid))
-    while (g > 1 && 1 + g * g > maxCells) g -= 1
-    // Corner tiles carry padding on one side only, so they are the smallest
-    // cell and they set the source resolution: below this a tile is UPSCALED
-    // into its square, which is the resolution floor tiling exists to lift.
-    const derived = g > 1 ? Math.ceil((side * g) / (1 + overlap)) : side
-    return {
-        grid: g,
-        cells: g > 1 ? 1 + g * g : 1,
-        maxSide: Math.min(derived, budget.detectorMaxSide || 2048, Math.max(srcW, srcH) || derived),
-        maxMP: budget.detectorMaxMP || 0,
-    }
-}
-
-/**
  * Ceiling (in megapixels) on the one-shot full-raster decode an unbounded
  * host (no ImageDecoder — Safari) may pay for the display frame. Reuses the
  * budget's already-trusted one-shot crop size; the pressure ratchet lowers

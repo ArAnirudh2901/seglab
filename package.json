@@ -8,7 +8,6 @@
     "verify:queue": "bun verify.mjs --wait=20m",
     "verify:plan": "bun verify.mjs --list",
     "models": "node scripts/download-models.mjs",
-    "models:all": "node scripts/download-models.mjs --detector",
     "build:wasm": "./scripts/build-cv-wasm.sh"
   },
   "devDependencies": {

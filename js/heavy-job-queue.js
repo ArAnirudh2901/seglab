@@ -1,6 +1,6 @@
 /**
  * heavy-job-queue — ONE memory-heavy operation at a time (pure, main thread).
- * Image decode, model warm/encode/decode, detector runs, wasm CV refinement
+ * Image decode, model warm/encode/decode, wasm CV refinement
  * and export re-decodes all pass through here, so their peak allocations can
  * never stack. Priorities (lower runs first): import 0 · interactive 1 ·
  * normal 2 · idle 3; FIFO within a priority. A queued job re-checks currency
@@ -32,7 +32,6 @@ const TIMEOUT_MS = {
     'encode-prewarm': 240_000,
     segment: 240_000,
     'export-refine': 300_000,
-    detect: 420_000,           // backstop behind sam-client's own 6-minute limit
     default: 120_000,
 }
 
