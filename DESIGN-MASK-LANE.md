@@ -1012,6 +1012,18 @@ one identical. On the planted case, 25/9/4 px speckle goes, a 600 px detached
 wire survives, a 36 px pinhole is filled, and a speckle the user clicked is
 never removed (`verify.mjs` phase T).
 
+Phase **A** drives the control itself, which no source scan and no planted field
+can reach: after one click the row carries three readings ordered small→large
+(6.17 / 6.19 / 7.05 % of frame) with the argmax pressed, and pressing another
+pill moves the selection with the revision unchanged and `decodeMs` 0 — the
+repaint, proven rather than asserted. It also fixes what tight hygiene does and
+does not promise. It promises the clicked component survives and nothing
+crumb-sized ships; it does **not** promise fewer pieces than the first click.
+Separation is measured on bounding **boxes**, so the demo's second object —
+0.089 of the mask, no include click on it — overlaps the anchor's box and stays.
+A rule that cut it would have to judge distance between regions, not boxes, and
+that is the same cost the run-length labeller exists to avoid.
+
 ### What real DSLR frames found that planted fields could not
 
 Planted cases prove the rules; they cannot find the places the rules are never
@@ -1442,9 +1454,9 @@ drive on its own. Run them through the dev-browser harness against
 `scripts/dev-server.mjs` on :8788 — COI headers and model caching both depend on
 that server, so a plain static server will not reproduce the conditions.
 
-`verify.mjs` now carries 227 `check()` calls across 3574 lines (231 assertions
+`verify.mjs` now carries 194 `check()` calls across 3362 lines (198 assertions
 in a full run), including both RAW fixture phases. `--fast` runs the three that
-need no browser (pure logic, heavy-job queue, static source scans — 134
+need no browser (pure logic, heavy-job queue, static source scans — 102
 assertions) and stops before the browser phases; those need Playwright and the
 dev server on :8788. The profile-related assertions phase 0 was meant to rewrite
 are gone with the presets — what is left refers to the single config.

@@ -1881,6 +1881,60 @@ try {
   check('hygiene: single component, no crumbs', statsA && statsA.components === 1, `components=${statsA?.components}`)
   check('edge refinement: soft boundary band present', statsA && statsA.softPixels > 100, `softPixels=${statsA?.softPixels}`)
 
+  // Candidate cycling had static source scans and planted-field logic checks,
+  // but nothing drove it in a browser. Two invariants the sources cannot show:
+  // the row is ordered small→large (the one promise the control makes), and
+  // picking costs no decode. Both branch on the lane — candidates come from SAM
+  // 2.1, so a wasm device must offer no control at all rather than an empty one.
+  const gpuLane = engEager.device === 'webgpu'
+  const sc0 = await page.evaluate(() => window.__seglab.scope())
+  check(
+    'scope: the mask lane offers its readings small→large, argmax pressed',
+    gpuLane
+      ? !!sc0 && sc0.count >= 2 && sc0.items?.length === sc0.count && !sc0.hidden
+        && sc0.items.every((it, i) => i === 0 || it.coverage >= sc0.items[i - 1].coverage)
+        && sc0.shapes === sc0.count && sc0.drawn === sc0.shapes && sc0.pressed === sc0.index
+      : sc0 === null,
+    JSON.stringify({
+      device: engEager.device,
+      count: sc0?.count, index: sc0?.index, pressed: sc0?.pressed, drawn: sc0?.drawn,
+      coverage: sc0?.items?.map((it) => +(it.coverage * 100).toFixed(2)),
+    }),
+  )
+  // One evaluate, so before/after are read either side of the pick with nothing
+  // else in between — a second round-trip could let a queued job move them.
+  const cyc = await page.evaluate(() => {
+    const s0 = window.__seglab.scope()
+    if (!s0 || s0.count < 2) return null
+    const read = () => ({ revision: window.__seglab.revision(), decodeMs: window.__seglab.state().lastRun?.decodeMs })
+    const before = read()
+    const want = (s0.index + 1) % s0.count
+    document.querySelectorAll('.scope-shape')[want]?.click()
+    return { want, before, after: read(), scope: window.__seglab.scope(), stats: window.__seglab.maskStats() }
+  })
+  check(
+    'scope: picking a reading is a repaint — no decode, and it ships no crumbs',
+    gpuLane
+      ? !!cyc && cyc.scope?.index === cyc.want && cyc.scope?.pressed === cyc.want
+        // The parked field is repainted, so the revision cannot move and the
+        // run reports no decode time at all.
+        && cyc.after.revision === cyc.before.revision && cyc.after.decodeMs === 0
+        && cyc.stats?.softPixels > 100
+        // What tight hygiene promises: the clicked component always survives,
+        // and nothing crumb-sized ships with it — the grape-hyacinth failure
+        // was hundreds of specks. It does NOT promise fewer pieces than the
+        // first click: a second object whose BOX overlaps the anchor's is not
+        // "clear of" it, and separation is measured on boxes.
+        && cyc.stats.regions.some((r) => r.clicked)
+        && cyc.stats.regions.every((r) => r.share >= 0.02)
+      : cyc === null,
+    JSON.stringify({
+      device: engEager.device, want: cyc?.want, index: cyc?.scope?.index,
+      revision: [cyc?.before.revision, cyc?.after.revision], decodeMs: cyc?.after.decodeMs,
+      regions: cyc?.stats?.regions?.map((r) => ({ share: +r.share.toFixed(3), clicked: r.clicked })),
+    }),
+  )
+
   const sA2 = await page.evaluate(() => window.__seglab.clickAt(50, 50, true))
   check(
     'repeat click skips the encoder (cache hit)',

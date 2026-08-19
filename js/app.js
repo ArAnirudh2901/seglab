@@ -2588,6 +2588,10 @@ window.__seglab = {
     scope: () => (state.scope ? {
         count: state.scope.count,
         index: state.scope.index,
+        // The readings themselves. Without them a check can see that a pill was
+        // pressed but not that the row is ordered small→large, which is the one
+        // promise the control makes to the user.
+        items: (state.scope.items || []).map((it) => ({ coverage: it.coverage, score: it.score })),
         hidden: !!els.scope?.hidden,
         shapes: (els.scope?.querySelectorAll('.scope-shape') || []).length,
         // A swatch with no canvas means the mask behind it was gone at paint
