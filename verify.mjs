@@ -6,7 +6,7 @@
  * via CDN) with Playwright Chromium through the window.__seglab test hooks.
  *
  * Suites:
- *   T  — pure logic (text-core, capability, policy, sizing)
+ *   T  — pure logic (capability, policy, sizing)
  *   Q  — heavy-job queue contracts (node-side, no browser)
  *   S  — memory-contract static source scans
  *   A  — lite (memory-locked) browser phases: 1024 proxy, unsafe-flag lockout,
@@ -52,13 +52,7 @@ import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
-import {
-  classifyPixelColor, clusterObjects, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, filterToSubject, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, shrinkFactor, tilePlans, unletterboxBox, YOLOE_INPUT,
-} from './js/text-core.js'
-import {
-  buildFacets, expandQuery, labelMatchesQuery, regionOf, suggest,
-} from './js/search-taxonomy.js'
-import { classifyCapability, probeTextLane } from './js/capability.js'
+import { classifyCapability } from './js/capability.js'
 import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
 import { decidePressure } from './js/memory-governor.js'
 import { boxFraction, chooseCandidate, cleanRegions, fieldArea, promptFit, stabilityScore } from './js/mask-select.js'
@@ -69,7 +63,6 @@ import {
   SHORT_EDGE_LADDER, affordableShortEdge, estimatePostMsPerMP, explainFit, fitLevel, observePost,
   bandShape, FIXED_SHARE, planMsPerMP, observeBandFraction,
   savePostFit, loadPostFit, clearPostFit, FIT_TTL_MS,
-  affordableCells, observeDetect, saveDetectMsPerCell, loadDetectMsPerCell,
 } from './js/hardware-fit.js'
 import {
   bridgeGaps, composeChannels, maskChannelCoverages, maskToChannel, pickBestMask, pointInMask,
@@ -299,332 +292,6 @@ try {
       && !('channel' in withChannel({ headless: true }, '')),
     `this run: ${channelLabel(OPTS.channel)}`,
   )
-  const np = normalizePhrase('all red cars')
-  check(
-    'text-core: phrase → bare cores + multi intent',
-    np && np.multi === true && np.color === 'red' && np.core === 'red car' && np.objectCore === 'car',
-    `${JSON.stringify(np)}`,
-  )
-  const colorFrame = { data: new Uint8ClampedArray(12), width: 4, height: 1, contentWidth: 4, contentHeight: 1 }
-  // Two red pixels at left; the broad candidate includes two blue pixels too.
-  colorFrame.data.set([230, 35, 30, 240, 45, 35, 30, 70, 220, 20, 60, 210])
-  const tightRed = colorEvidenceForBox(colorFrame, [0, 0, 0.5, 1], 'red')
-  const broadScene = colorEvidenceForBox(colorFrame, [0, 0, 1, 1], 'red')
-  check(
-    'text-core: requested-colour evidence favours a tight matching box',
-    tightRed === 1 && broadScene > 0 && broadScene < tightRed,
-    `tight=${tightRed.toFixed(2)} broad=${broadScene.toFixed(2)}`,
-  )
-  const irregular = normalizePhrase('leaves')
-  check(
-    'text-core: irregular plurals depluralize to the real noun ("leaves" → leaf)',
-    irregular.core === 'leaf' && irregular.multi === true
-      && normalizePhrase('all people').core === 'person',
-    `${irregular.core} multi=${irregular.multi}`,
-  )
-  // The detector scores a phrase as a bag of words, so a phrase whose SETTING is
-  // present matches even with its subject absent — measured on the canonical NEF,
-  // "the dog sitting among the flowers" returned 5 boxes and "snow covering the
-  // flowers" 6, every one of them a flower. headCore is what the subject gate in
-  // detectCandidates checks, so these assert where the subject ends.
-  {
-    const head = (p) => normalizePhrase(p).headCore
-    check(
-      'text-core: a post-modifier ends the subject ("dog sitting among the flowers" → dog)',
-      head('the dog sitting among the flowers') === 'dog'
-        && head('snow covering the flowers') === 'snow'
-        && head('a red sports car parked on grass') === 'sports car'
-        && head('green leaves in the background') === 'leaf',
-      'setting stripped, head depluralized',
-    )
-    check(
-      // A gate that fires on ordinary phrases would reject every real search,
-      // and "of" must not split or "a cluster of blue florets" loses its subject.
-      'text-core: no post-modifier means no subject gate (null, not the whole phrase)',
-      head('orange tulip') === null && head('flower') === null
-        && head('muscari') === null
-        && head('a cluster of tightly packed blue florets') === null,
-      'plain phrases unchanged',
-    )
-    // Absent subject → nothing. Present subject → the subject ALONE: the five
-    // flowers were false positives in both photos, not only in the one without
-    // a dog, and returning them alongside the dog is the same bug half-fixed.
-    const subject = new Set(['dog', 'beagle'])
-    const scene = [
-      { box: [0, 0, 10, 10], score: 0.4, label: 'the dog sitting among the flowers' },
-      { box: [20, 0, 30, 10], score: 0.3, label: 'flower' },
-      { box: [40, 0, 50, 10], score: 0.3, label: 'flower' },
-    ]
-    check(
-      'text-core: setting-only match returns nothing (no dog → no boxes)',
-      filterToSubject(scene, subject) === null,
-      `${scene.length} setting boxes dropped`,
-    )
-    const withDog = [{ box: [0, 0, 9, 9], score: 0.5, label: 'beagle' }, ...scene]
-    const kept = filterToSubject(withDog, subject)
-    check(
-      'text-core: with the subject present, only the subject is selected',
-      kept?.length === 1 && kept[0].label === 'beagle',
-      `kept ${kept?.map((d) => d.label).join(',')}`,
-    )
-    check(
-      'text-core: a phrase with no subject to separate passes through untouched',
-      filterToSubject(scene, null) === scene,
-      'null subject is identity',
-    )
-  }
-  // A cluster-sized box around two real instances is a group guess, not a
-  // match; a box containing only one other stays (could be the real object).
-  const grouped = rankDetections([
-    { box: [0, 0, 500, 500], score: 0.5 }, // container around both leaves
-    { box: [40, 40, 200, 200], score: 0.45 },
-    { box: [260, 260, 460, 460], score: 0.4 },
-  ], { threshold: 0.15, iou: 0.5, topK: 8 })
-  const lone = pruneContainers([
-    { box: [0, 0, 500, 500], score: 0.5 },
-    { box: [40, 40, 200, 200], score: 0.45 },
-  ])
-  check(
-    'text-core: group box around several matches is pruned, members kept',
-    grouped.length === 2 && grouped.every((d) => d.box[2] <= 460) && lone.length === 2,
-    `grouped kept ${grouped.length}, single containment kept ${lone.length}`,
-  )
-  // A collapsed q4f16 head fills top_k with a flat ~0.6 band; a healthy result
-  // has spread (or few boxes) and must never be flagged.
-  const flatBand = Array.from({ length: 64 }, (_, i) => ({ box: [i, 0, i + 1, 1], score: 0.59 + (i % 10) * 0.002 }))
-  const healthy = Array.from({ length: 64 }, (_, i) => ({ box: [i, 0, i + 1, 1], score: 0.05 + i * 0.01 }))
-  check(
-    'text-core: flat top-k score band is degenerate; spread or sparse output is not',
-    degenerateScores(flatBand) === true && degenerateScores(healthy) === false
-      && degenerateScores(flatBand.slice(0, 8)) === false,
-    `flat=${degenerateScores(flatBand)} healthy=${degenerateScores(healthy)}`,
-  )
-  const deduped = nms([
-    { box: [0, 0, 100, 100], score: 0.9 },
-    { box: [5, 5, 105, 105], score: 0.8 },
-    { box: [400, 400, 500, 500], score: 0.7 },
-  ], 0.5)
-  check('text-core: NMS drops overlaps, keeps distinct', deduped.length === 2, `kept ${deduped.length}`)
-  const ranked = rankDetections(
-    [{ box: [0, 0, 10, 10], score: 0.05 }, { box: [20, 20, 30, 30], score: 0.4 }],
-    { threshold: 0.15, topK: 8 },
-  )
-  const sb = scaleBox([10, 20, 30, 40], 2, 3)
-  check(
-    'text-core: rank filters by threshold; scaleBox maps coords',
-    ranked.length === 1 && ranked[0].score === 0.4 && sb[0] === 20 && sb[3] === 120,
-    `ranked=${ranked.length} scaled=[${sb}]`,
-  )
-  const plan = letterboxPlan(1200, 800, DETECTOR_INPUT)
-  const full = unletterboxBox([0, 0, 1, 640 / 960], plan)
-  check(
-    'text-core: letterbox plan preserves aspect; boxes map back to source px',
-    plan.dw === 960 && plan.dh === 640 && full[2] === 1200 && Math.round(full[3]) === 800,
-    `plan=${plan.dw}x${plan.dh} full=[${full}]`,
-  )
-
-  // Singular phrase: a train split front/rear collapses to one box; a distinct
-  // far object and a small sign stay out of it.
-  const fragments = [
-    { box: [560, 635, 815, 920], score: 0.42, label: 'train' }, // front
-    { box: [1105, 690, 1420, 900], score: 0.31, label: 'train' }, // rear (gap)
-    { box: [1780, 800, 1840, 880], score: 0.2, label: 'train' }, // far small object
-  ]
-  const [merged] = clusterObjects(fragments)
-  const twoTrains = clusterObjects([
-    { box: [0, 0, 300, 300], score: 0.5 }, { box: [1400, 0, 1700, 300], score: 0.4 },
-  ])
-  check(
-    'text-core: fragments of one object merge; distinct instances are both kept',
-    merged.box[0] === 560 && merged.box[2] === 1420 && merged.box[3] === 920
-      && twoTrains.length === 2 && twoTrains[0].box[2] === 300 && twoTrains[1].box[0] === 1400,
-    `merged=[${merged.box}] distinct kept ${twoTrains.length}`,
-  )
-
-  // Search taxonomy: main class → kind recall expansion.
-  const flowerExp = expandQuery('flower')
-  const roseExp = expandQuery('rose')
-  check(
-    'taxonomy: main class expands to its kinds; a kind stays specific; unknown → null',
-    flowerExp?.main === 'flower' && flowerExp.labels.includes('rose') && flowerExp.labels.includes('tulip')
-      && roseExp?.main === 'flower' && roseExp.labels.length === 1 && roseExp.labels[0] === 'rose'
-      && expandQuery('spaceship') === null,
-    `flower=${flowerExp?.labels.length} rose=[${roseExp?.labels}]`,
-  )
-  check(
-    'taxonomy: label match is class-aware, else falls back to flat whole-word',
-    labelMatchesQuery('flower', 'rose') && labelMatchesQuery('flower', 'tulip') && !labelMatchesQuery('flower', 'car')
-      && labelMatchesQuery('rose', 'rose') && !labelMatchesQuery('rose', 'tulip')
-      && labelMatchesQuery('bottle', 'water bottle') && !labelMatchesQuery('bottle', 'bottleneck'),
-    'expansion + fallback',
-  )
-
-  /* CLIP BPE — the open-vocabulary path's silent-failure surface. A wrong token
-   * id still yields a confident vector, just for a different string, so these
-   * are known-answer tests against the reference tokenizer (openai/CLIP), not
-   * self-consistency checks. The last case covers punctuation and a contraction,
-   * which is where the byte-symbol ordering bug showed up. */
-  {
-    const mergesPath = path.join(ROOT, 'models', 'clip-text', 'merges.txt')
-    if (!existsSync(mergesPath)) {
-      check('clip-tokenizer: merges.txt present', false, 'run scripts/export-clip-text.py')
-    } else {
-      const merges = readFileSync(mergesPath, 'utf8')
-      const prevFetch = globalThis.fetch
-      globalThis.fetch = async () => ({ text: async () => merges })
-      const { loadTokenizer, tokenize, CONTEXT, VOCAB } = await import('./js/clip-tokenizer.js')
-      await loadTokenizer()
-      globalThis.fetch = prevFetch
-      const golden = [
-        ['orange tulip', [49406, 4287, 28389, 49407]],
-        ['muscari', [49406, 5696, 3681, 49407]],
-        ["a weathered wooden fence post, don't you think?",
-          [49406, 320, 598, 34091, 9057, 12679, 1549, 267, 847, 713, 592, 1331, 286, 49407]],
-      ]
-      const out = tokenize(golden.map(([p]) => p))
-      const ok = golden.every(([, want], i) => want.every((v, k) => out[i * CONTEXT + k] === v))
-      check('clip-tokenizer: matches the reference BPE on known phrases', ok, `vocab ${VOCAB}`)
-      // Padding must be zeros AFTER the EOT, and the EOT must survive truncation
-      // — the tower reads its output from the EOT slot.
-      const long = tokenize([`${'word '.repeat(120)}`])
-      check(
-        'clip-tokenizer: over-long phrase truncates with EOT kept last',
-        long[CONTEXT - 1] === 49407 && long.length === CONTEXT,
-        `last=${long[CONTEXT - 1]}`,
-      )
-    }
-  }
-
-  /* Detector tiling. A 45 MP frame squeezed into 640² puts a 200 px subject
-   * under 16 px — measured as muscari scoring 0.09 while a tulip in the SAME
-   * frame scored 0.60. Tiles raise linear resolution; these pin the geometry
-   * that maps a tile-local box back to the original. */
-  {
-    const W = 8256; const H = 5504 // the canonical NEF
-    check(
-      'tiling: shrink factor decides whether a second pass can help',
-      Math.round(shrinkFactor(W, H, YOLOE_INPUT)) === 13 && shrinkFactor(1200, 800, YOLOE_INPUT) < 2.5,
-      `${shrinkFactor(W, H, YOLOE_INPUT).toFixed(1)}x on the NEF`,
-    )
-    const cells = tilePlans(W, H, YOLOE_INPUT, { grid: 2, overlap: 0.15 })
-    const covers = Math.min(...cells.map((c) => c.ox)) === 0
-      && Math.min(...cells.map((c) => c.oy)) === 0
-      && Math.max(...cells.map((c) => c.ox + c.ow)) === W
-      && Math.max(...cells.map((c) => c.oy + c.oh)) === H
-    check('tiling: a 2x2 grid covers the whole frame with no gap', cells.length === 4 && covers,
-      `${cells.length} cells`)
-    // Seam overlap is what stops a subject on a tile edge being cut in half.
-    const [a, b] = cells
-    check('tiling: adjacent tiles overlap', (a.ox + a.ow) - b.ox > 0,
-      `${Math.round((a.ox + a.ow) - b.ox)} px`)
-    check(
-      'tiling: each tile sees the subject larger than the full-frame pass does',
-      cells.every((c) => Math.max(c.ow, c.oh) / YOLOE_INPUT < shrinkFactor(W, H, YOLOE_INPUT)),
-      `${(Math.max(cells[0].ow, cells[0].oh) / YOLOE_INPUT).toFixed(1)}x vs ${shrinkFactor(W, H, YOLOE_INPUT).toFixed(1)}x`,
-    )
-    // A box found in a tile must land back on the same pixels in the original.
-    const cell = cells[3]
-    const local = unletterboxBox([0.25, 0.25, 0.75, 0.75], cell.plan)
-    const raw = [local[0] + cell.ox, local[1] + cell.oy, local[2] + cell.ox, local[3] + cell.oy]
-    const mapped = [Math.min(Math.max(raw[0], 0), W), Math.min(Math.max(raw[1], 0), H),
-      Math.min(Math.max(raw[2], 0), W), Math.min(Math.max(raw[3], 0), H)]
-    check(
-      'tiling: a tile-local box maps back inside the original frame',
-      mapped[0] >= 0 && mapped[1] >= 0 && mapped[2] <= W && mapped[3] <= H && mapped[2] > mapped[0],
-      `[${mapped.map((v) => Math.round(v))}] (raw y1 ${raw[3].toFixed(1)} needed the clamp)`,
-    )
-  }
-
-  /* Class slots. The axis is DYNAMIC and exactly one slot is fed per phrase:
-   * the head emits each anchor once per class into a fixed top-300, so padding a
-   * short list by repetition spent the budget on duplicates (measured: 10 unique
-   * boxes out of 300 for a one-phrase query). These assert the list that decides
-   * nc — deduped, user's words first, capped. */
-  {
-    const { MAX_SLOTS, DIM } = await import('./js/yoloe-detect.js')
-    const { slotPhrases } = await import('./js/text-ui.js')
-    // 48, not the 32 the graph was traced at: the class axis is dynamic and a
-    // live sweep ran nc up to 128 for +14% latency, so the cap only has to clear
-    // the largest taxonomy expansion ("animal" → 45 labels + phrase + object form).
-    check('yoloe: class-slot contract', MAX_SLOTS === 48 && DIM === 512, `${MAX_SLOTS}x${DIM}`)
-    const animal = slotPhrases(normalizePhrase('animal'))
-    check(
-      'yoloe: the widest taxonomy expansion is no longer truncated',
-      animal.length === new Set(animal).size && animal.length <= MAX_SLOTS && animal.length >= 45,
-      `${animal.length} slots`,
-    )
-
-    const one = slotPhrases(normalizePhrase('muscari'))
-    check(
-      'yoloe: an unknown phrase feeds exactly ONE class slot, not a padded 32',
-      one.length === 1 && one[0] === 'muscari',
-      `[${one}]`,
-    )
-    const many = slotPhrases(normalizePhrase('flower'))
-    check(
-      'yoloe: taxonomy expansion is deduped, user-phrase first, capped at MAX_SLOTS',
-      many[0] === 'flower' && many.length <= MAX_SLOTS && new Set(many).size === many.length,
-      `${many.length} slots`,
-    )
-    const colored = slotPhrases(normalizePhrase('the red car'))
-    check(
-      'yoloe: a colour phrase keeps the full wording in slot 0',
-      colored[0] === 'red car' && colored.includes('car'),
-      `[${colored.slice(0, 3)}]`,
-    )
-  }
-
-  // Region axis (size/position) from a proxy box in a 1000×1000 image.
-  const big = regionOf([100, 100, 700, 700], 1000, 1000) // 36% area, centered
-  const tiny = regionOf([10, 10, 90, 90], 1000, 1000) // 0.6% area, top-left
-  const low = regionOf([300, 650, 800, 980], 1000, 1000) // large & low → foreground
-  check(
-    'taxonomy: regionOf buckets size + position, flags large-and-low as foreground',
-    big.size === 'large' && big.where === 'center' && tiny.size === 'small' && tiny.where === 'left'
-      && low.foreground === true,
-    `${big.size}/${big.where} ${tiny.size}/${tiny.where} fg=${low.foreground}`,
-  )
-
-  // Facets from ranked candidates (colour tagged by caller, region derived here).
-  const cands = [
-    { box: [0, 0, 400, 400], label: 'rose', color: 'red' },
-    { box: [500, 0, 900, 400], label: 'rose', color: 'red' },
-    { box: [0, 500, 400, 900], label: 'tulip', color: 'purple' },
-  ]
-  const facets = buildFacets(cands, { width: 1000, height: 1000 })
-  const redFacet = facets.colour.find((f) => f.value === 'red')
-  check(
-    'taxonomy: buildFacets groups colour + kind axes with correct member indices',
-    facets.colour.length === 2 && redFacet.count === 2 && redFacet.idx.join() === '0,1'
-      && facets.kind.length === 2 && facets.kind.find((f) => f.value === 'tulip').idx.join() === '2'
-      && buildFacets([cands[0]]).colour.length === 0,
-    `colour=${facets.colour.length} kind=${facets.kind.length}`,
-  )
-
-  // Autocomplete: main classes, kinds, colour combos; colour prefix carries.
-  const acFlo = suggest('flo')
-  const acRedFlo = suggest('red flo')
-  const acRose = suggest('ros')
-  check(
-    'taxonomy: suggest surfaces categories, kinds, and colour combos; empty → []',
-    acFlo.some((r) => r.text === 'flower' && r.group === 'category')
-      && acRedFlo.some((r) => r.text === 'red flower')
-      && acRose.some((r) => r.text === 'rose' && r.group === 'kind')
-      && suggest('').length === 0,
-    `flo=${acFlo.length} redflo=${acRedFlo.length} ros=${acRose.length}`,
-  )
-
-  // Pixel colour classifier + dominant-colour box sampling.
-  const redFrame = { data: new Uint8ClampedArray(4 * 4 * 3), width: 4, height: 4, contentWidth: 4, contentHeight: 4 }
-  for (let i = 0; i < redFrame.data.length; i += 3) { redFrame.data[i] = 220; redFrame.data[i + 1] = 20; redFrame.data[i + 2] = 20 }
-  const dom = dominantColorForBox(redFrame, [0, 0, 1, 1])
-  check(
-    'taxonomy: classifyPixelColor + dominantColorForBox agree on a red field',
-    classifyPixelColor(230, 20, 20) === 'red' && classifyPixelColor(248, 248, 248) === 'white'
-      && classifyPixelColor(8, 8, 8) === 'black' && dom?.color === 'red',
-    `dom=${dom?.color}`,
-  )
-
   /* ── Policy: the memory-trust lock ── */
   const gpu = { webgpu: true, f16: true, textureLimit: 16384, storageBufferLimit: 256 * 1024 * 1024 }
   const fourGB = classifyCapability({ ...gpu, browserMemoryGB: 4 })
@@ -646,18 +313,6 @@ try {
     JSON.stringify({ pro: phosmith16GB.profile, ultra: phosmith24GB.profile, src: phosmith16GB.memorySource }),
   )
 
-  /* ── Text lane: on everywhere by default, ?text=0 is the only opt-out ── */
-  check(
-    'capability: the text lane is on by default on every engine, including WebKit',
-    probeTextLane('').ok === true && probeTextLane('').reason === 'ok',
-    JSON.stringify(probeTextLane('')),
-  )
-  check(
-    'capability: ?text=0 disables the lane',
-    probeTextLane('?text=0').ok === false && probeTextLane('?text=0').reason === 'disabled',
-    JSON.stringify(probeTextLane('?text=0')),
-  )
-
   const liteDefault = resolveBudget('', browserEightGB)
   const unknownBudget = resolveBudget('', unknownMemory)
   const provisional = resolveBudget('', null)
@@ -673,8 +328,7 @@ try {
       && liteDefault.maxResidentHeavy === 1 && liteDefault.flagship === false
       && liteDefault.autoEscalate === false && liteDefault.samWebGPU === true
       && liteDefault.exportMaxMP === 12 && liteDefault.exportMaxSide === 5120
-      && liteDefault.hdExportDecode === true && liteDefault.embedPersist === true
-      && liteDefault.detectorDispose === 'idle' && liteDefault.detectorEvictOnEncode === true,
+      && liteDefault.hdExportDecode === true && liteDefault.embedPersist === true,
     JSON.stringify({ draft: liteDefault.draftCacheMax, heavy: liteDefault.maxResidentHeavy,
       escalate: liteDefault.autoEscalate, exportMP: liteDefault.exportMaxMP }),
   )
@@ -728,11 +382,6 @@ try {
       // budget under that declared a healthy app to be in permanent pressure.
       && autoTiered.memBudgetMB === 2200,
     JSON.stringify({ cache: autoTiered.draftCacheMax, exportMP: autoTiered.exportMaxMP, hd: autoTiered.hdExportDecode, esc: autoTiered.autoEscalate, budget: autoTiered.memBudgetMB }),
-  )
-  check(
-    'policy: the detector is evicted before an encode and idles out',
-    autoTiered.detectorEvictOnEncode === true && autoTiered.detectorIdleMs === 120_000,
-    JSON.stringify({ evict: autoTiered.detectorEvictOnEncode, idleMs: autoTiered.detectorIdleMs }),
   )
   const flagged = resolveBudget('?flagship=1', browserEightGB)
   const ultraReq = resolveBudget('?profile=ultra', browserEightGB)
@@ -916,9 +565,9 @@ try {
       JSON.stringify({ crisp: stabilityScore(crisp), mushy: stabilityScore(mushy), pick: byStab.index }),
     )
 
-    // 6. Box prompts. Text search selects exclusively by box, so a candidate
-    //    that spills outside the detector's box is answering about a different
-    //    object. Corners ride as labels 2/3, exactly as the decoder expects.
+    // 6. Box prompts. A candidate that spills outside the drawn box is
+    //    answering about a different object. Corners ride as labels 2/3,
+    //    exactly as the decoder expects.
     const boxed = [
       { x: 32, y: 32, label: 1 },
       { x: 20, y: 20, label: 2 },
@@ -1412,32 +1061,6 @@ try {
           && stale === null && absurd === null && junk === null && loadPostFit(now) === null,
         JSON.stringify({ fresh, staleAfterDays: FIT_TTL_MS / 86_400_000 }),
       )
-      /* Detector lane: the same judgement on the axis a stopwatch can see. It
-         clamps the memory-derived cell cap, never raises it — an ORT arena
-         cannot be timed, so that cap stays with the class signals in policy. */
-      const cellB = { ...PROFILE_PRESETS.standard8 }
-      const cells = (msPerCell) => affordableCells({ ...cellB, detectorMsPerCell: msPerCell })
-      check(
-        'fit: measured per-cell latency reproduces the tile rungs',
-        affordableCells(cellB) === Infinity && affordableCells({ ...cellB, detectorBudgetMs: 0, detectorMsPerCell: 140 }) === Infinity
-          && cells(140) >= 10 && cells(420) >= 5 && cells(420) < 10 && cells(900) < 5 && cells(9000) === 1,
-        JSON.stringify({ ref: cells(140), slow: cells(420), verySlow: cells(900) }),
-      )
-      const cheap = observeDetect(0, 1400, 10)
-      check(
-        'fit: a slow search is believed at once, a fast one has to repeat',
-        cheap === 140 && observeDetect(140, 4200, 5) === 490
-          && observeDetect(140, 100, 5) < 140 && observeDetect(140, 0, 5) === 140,
-        JSON.stringify({ seeded: cheap, spike: observeDetect(140, 4200, 5) }),
-      )
-      saveDetectMsPerCell(240, now)
-      const cellFresh = loadDetectMsPerCell(now + 1000)
-      const cellStale = loadDetectMsPerCell(now + FIT_TTL_MS + 1)
-      check(
-        'fit: the detector measurement persists and expires on the same clock',
-        cellFresh === 240 && cellStale === 0,
-        JSON.stringify({ cellFresh, cellStale }),
-      )
       delete globalThis.localStorage
     }
   }
@@ -1715,16 +1338,6 @@ try {
         && !/^bootProbe\.then\(\(\) => warmUp/m.test(sources['app.js']),
       'app.js warms post-import only',
     )
-    // WebKit ships no byte-level memory API, so the allocation ledger is the
-    // governor's ONLY input there. The text lane runs in its own worker with
-    // its own ORT arena and was absent from that ledger entirely — the one
-    // engine with no measurement was also blind to the heaviest lane.
-    check(
-      'static: the ledger counts the text lane (the only governor input on WebKit)',
-      /mb \+= detectorResidentMB\(\)/.test(sources['app.js'])
-        && /export const detectorResidentMB/.test(sources['sam-client.js']),
-      'detect worker residency is in estimateFootprintMB',
-    )
     check(
       // The rest of the ledger is a step function, so without these terms the
       // estimate cannot move while the user works — the shape of the reported
@@ -1758,24 +1371,6 @@ try {
       !/entry\.blob\.arrayBuffer\(\)/.test(sources['session-store.js'])
         && /await w\.write\(entry\.blob\)/.test(sources['session-store.js']),
       'writeEntry writes the blob straight to the writable',
-    )
-    check(
-      // Terminating mid-detection rejects the in-flight call, which the user
-      // reads as a failed search rather than as memory relief.
-      'static: a shed frees the detect worker only when it is idle',
-      /disposeDetectorIfIdle\(\)/.test(sources['app.js'])
-        && !/[^f]\bdisposeDetector\(\)/.test(sources['app.js'])
-        && /if \(!detectWorker \|\| detectPending\.size\) return false/.test(sources['sam-client.js']),
-      'shedMemory uses the idle-guarded dispose',
-    )
-    check(
-      // A `return` inside finally REPLACES the try's value. The keepAlive path
-      // (an escalating two-pass search) therefore resolved undefined, and every
-      // caller died destructuring `results` off it — a whole lane, silently.
-      'static: the detect worker\'s cleanup never swallows the result',
-      !/if \(keepAlive\) return\b/.test(sources['sam-client.js'])
-        && /if \(!keepAlive\) \{/.test(sources['sam-client.js']),
-      'finally only schedules disposal',
     )
     check(
       // The fill alone leaves the user guessing which pixels are in; the border
@@ -1950,11 +1545,11 @@ try {
     const sw = readFileSync(path.join(ROOT, 'sw.js'), 'utf8')
     check(
       'static: service worker caches only on demand and versions obsolete cache cleanup',
-      /const CACHE_NAME = 'seglab-models-v5'/.test(sw)
+      /const CACHE_NAME = 'seglab-models-v6'/.test(sw)
         && /cache\.match\(request\)/.test(sw)
         && /cache\.put\(request, response\.clone\(\)\)/.test(sw)
         && !/cache\.addAll|event\.waitUntil\([^)]*fetch/i.test(sw),
-      'cache-first after request; no install-time model/Wasm/detector prefetch',
+      'cache-first after request; no install-time model/Wasm prefetch',
     )
     check(
       // A CACHE_NAME bump alone does not update a model: /models/ is served
@@ -2015,9 +1610,7 @@ try {
         const patcher = /S\.epConfig&&Object\.entries/.test(vendor) && /epConfig anchor missing/.test(vendor)
         const decl = /webgpuEP = \(\) => \(\{ name: 'webgpu', epConfig: \{ storageBufferCacheMode: 'lazyRelease' \} \}\)/
           .test(sources['ort-loader.js'])
-        // Mask lane only, and provably so: the detector lane measured WORSE.
         const users = /webgpuEP\(\)/.test(sources['sam21-lane.js'])
-          && !['yoloe-detect.js', 'text-encode.js'].some((f) => /webgpuEP/.test(sources[f]))
         return patched && patcher && decl && users
       })(),
       'the reclaim is invisible at runtime; the build is where it is provable',
@@ -2220,18 +1813,6 @@ try {
   }))
   check('lite: editor is usable while the model warms in the background',
     idleUi.prepHidden && idleUi.stageVisible && idleUi.pickEnabled, JSON.stringify(idleUi))
-  const textModeUi = await page.evaluate(() => {
-    document.getElementById('mode-text')?.click()
-    const tolerance = document.getElementById('tolerance-wrap')
-    const result = { hidden: tolerance?.hidden, display: getComputedStyle(tolerance).display }
-    document.getElementById('mode-click')?.click()
-    return result
-  })
-  check(
-    'text mode: colour tolerance is hidden and cannot be mistaken for text confidence',
-    textModeUi.hidden === true && textModeUi.display === 'none',
-    JSON.stringify(textModeUi),
-  )
   log('phase A (lite) — eager encode warms model + embedding at import…')
   const eager = await page.evaluate(() => window.__seglab.eagerEncode())
   const engEager = await page.evaluate(() => window.__seglab.engineState())
@@ -2355,11 +1936,10 @@ try {
     if (t === 'ellipse') return S.manualEllipse(a.box[0], a.box[1], a.box[2], a.box[3])
     if (t === 'region') return S.manualRegionCircle(a.pt[0], a.pt[1], a.r)
     if (t === 'brush') return S.brushStroke(a.stroke)
-    if (t === 'text') return S.selectBoxes([a.box])
     throw new Error(`unknown tool ${t}`)
   }, { tool, arg })
 
-  const FOLLOWERS = ['box', 'lasso', 'rect', 'ellipse', 'region', 'brush', 'text']
+  const FOLLOWERS = ['box', 'lasso', 'rect', 'ellipse', 'region', 'brush']
   const coexist = []
   for (const tool of FOLLOWERS) {
     await page.evaluate(() => window.__seglab.reset())
@@ -2735,17 +2315,9 @@ try {
 
   /* ── Text-select plumbing + brush (proxy coords) ── */
   const pageE = await newAppPage(context, '?flagship=0', 900)
-  log('phase A6 (text plumbing + brush) — box → mask → union…')
+  log('phase A6 (brush) — stroke → mask…')
   const geoE = await pageE.evaluate(() => window.__seglab.demoGeometry())
   const pE = geoE.proxyScale
-  const discBox = [120 * pE, 230 * pE, 340 * pE, 450 * pE]
-  const squareBox = [515 * pE, 145 * pE, 715 * pE, 345 * pE]
-  const one = await pageE.evaluate((b) => window.__seglab.selectBoxes([b]), discBox)
-  checkDisc('text', one, geoE.disc.x * pE, geoE.disc.y * pE, DISC_FRAC)
-  await pageE.evaluate(() => window.__seglab.reset())
-  const both = await pageE.evaluate(([a, b]) => window.__seglab.selectBoxes([a, b]), [discBox, squareBox])
-  check('text select: "all" unions instances → 2 components', both && both.components === 2, `components=${both?.components}`)
-  await pageE.evaluate(() => window.__seglab.reset())
   const brushAdd = await pageE.evaluate((points) => window.__seglab.brushStroke(points), [[333, 256], [418, 256], [478, 294]])
   const brushErase = await pageE.evaluate((points) => window.__seglab.brushStroke(points, true), [[333, 256], [371, 256]])
   check(
@@ -2755,73 +2327,6 @@ try {
       && brushErase.maskSummary.coverage < brushAdd.maskSummary.coverage,
     `add=${((brushAdd?.maskSummary?.coverage || 0) * 100).toFixed(2)}% erase=${((brushErase?.maskSummary?.coverage || 0) * 100).toFixed(2)}%`,
   )
-  // The phrase→boxes step used to be skipped "to avoid a 151 MB model pull".
-  // The YOLOE and YOLO-World weights are in models/, so the pull never applied
-  // and a whole user-facing feature simply had no coverage. It is gated now.
-  // NOTE: a single match AUTO-SELECTS, which clears the candidate list — so the
-  // MASK is the evidence, not the candidate count. Reading the count instead is
-  // what made this look broken when it was not.
-  const pageT = await newAppPage(context, '', null)
-  await pageT.evaluate(async () => {
-    const blob = await (await fetch('/spikes/yoloe/bus.jpg')).blob()
-    const dt = new DataTransfer()
-    dt.items.add(new File([blob], 'bus.jpg', { type: 'image/jpeg' }))
-    const i = document.getElementById('file')
-    i.files = dt.files
-    i.dispatchEvent(new Event('change', { bubbles: true }))
-  })
-  await pageT.waitForFunction(() => window.__seglab.state().hasImage === true && !!window.__seglab.imageTransform(), null, { timeout: 120_000 })
-  const phrase = async (q) => pageT.evaluate(async (t) => {
-    await window.__seglab.reset()
-    const d = await window.__seglab.detect(t)
-    // A single match auto-selects and runDetect does NOT await it, so poll for
-    // the mask rather than guessing a delay — the first call also pays the
-    // detector's cold load, which a fixed wait cannot cover.
-    const deadline = performance.now() + 30000
-    let s = window.__seglab.state()
-    // The early exit must mean "the app SAID it found nothing", which it says in
-    // the status line. It used to key on `candidates === 0` — but a single match
-    // auto-selects and clears the list, so that is true on the success path too,
-    // and any phrase whose mask took longer than the 3 s grace (the first one
-    // always does: cold detector session) was scored as a miss. Measured: "bus"
-    // reported 0.0% while the very same click reached 30.2% at 965 ms.
-    const saidNoMatch = () => (document.getElementById('status')?.textContent || '').startsWith('No matches')
-    while (performance.now() < deadline && !(s?.maskSummary?.coverage > 0)) {
-      await new Promise((r) => setTimeout(r, 250))
-      s = window.__seglab.state()
-      if (saidNoMatch() && !s?.running) break
-    }
-    // Backend and raw top score: a wasm-EP fallback scores this graph very
-    // differently from WebGPU, and without them a miss looks like a lane bug.
-    const raw = await window.__seglab.testDetectRaw(t, 0.001)
-    return {
-      cov: s?.maskSummary?.coverage || 0, score: s?.score || 0,
-      cands: d?.candidates ?? -1, backend: raw?.backend || '?', top: raw?.top?.[0] ?? -1,
-    }
-  }, q)
-  const tBus = await phrase('bus')
-  const tOpen = await phrase('vehicle')
-  const tNone = await phrase('unicorn')
-  check(
-    'text search: a real phrase detects and selects the object',
-    tBus.cov > 0.05 && tBus.score > 0.5,
-    `"bus" → ${(tBus.cov * 100).toFixed(1)}% of frame, score ${tBus.score.toFixed(2)},`
-    + ` candidates=${tBus.cands} detector=${tBus.backend} raw=${tBus.top}`,
-  )
-  check(
-    // The open-vocab lane's whole point: a word the baked vocab does not carry
-    // still resolves, via the precomputed CLIP embeddings.
-    'text search: an open-vocabulary synonym resolves to the same object',
-    Math.abs(tOpen.cov - tBus.cov) < 0.02 && tOpen.cov > 0.05,
-    `"vehicle" → ${(tOpen.cov * 100).toFixed(1)}% vs "bus" ${(tBus.cov * 100).toFixed(1)}%`,
-  )
-  check(
-    'text search: a phrase with no match says so instead of selecting something',
-    tNone.cov === 0,
-    `"unicorn" → ${(tNone.cov * 100).toFixed(1)}%`,
-  )
-  await pageT.evaluate(async () => (await import('./js/sam21-client.js')).op('shutdown').catch(() => null))
-  await pageT.close()
   await pageE.close()
 
   /* ── Weak device: everything still works on forced WASM ── */
@@ -2831,14 +2336,13 @@ try {
   const pW = geoW.proxyScale
   const wClick = await pageW.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoW.disc.x * pW, y: geoW.disc.y * pW })
   await pageW.evaluate(() => window.__seglab.reset())
-  const wText = await pageW.evaluate((b) => window.__seglab.selectBoxes([b]), [120 * pW, 230 * pW, 340 * pW, 450 * pW])
   const wExport = await pageW.evaluate(() => window.__seglab.exportCutout())
   check(
     // §4: WebGPU is a HARD requirement for the mask lane, so ?force=wasm no
     // longer produces a WASM segmentation lane — the point is that the rest of
-    // the app (click, text, export) still completes.
-    'forced-wasm flag: click + text + export all still complete',
-    !!wClick.maskSummary && !!wText.maskSummary && wExport && wExport.coverage > 0,
+    // the app (click, export) still completes.
+    'forced-wasm flag: click + export both still complete',
+    !!wClick.maskSummary && wExport && wExport.coverage > 0,
     `device=${wClick.device} export=${wExport?.w}×${wExport?.h}`,
   )
   const freed = await pageW.evaluate(() => window.__seglab.relievePressure(3))
@@ -3196,17 +2700,15 @@ try {
       (gOff.disc.x + gOff.disc.r * 1.2) * pOff,
       (gOff.disc.y + gOff.disc.r * 1.2) * pOff,
     ]
-    const oText = await pageO.evaluate((b) => window.__seglab.selectBoxes([b]), dbox)
     const oEx = await pageO.evaluate(() => window.__seglab.exportCutout())
     const oDiag = oEx ? null : await pageO.evaluate(() => window.__seglab.exportDiag())
     check(
       // encoded may be false: the OPFS embedding cache legitimately serves a
       // revisit without encoding. What matters offline is that every stage
       // COMPLETES, which is what this asserts.
-      'offline: fresh import + click + text + export all pass with the network cut',
-      !!oClick?.maskSummary && !!oText?.maskSummary && oEx && oEx.coverage > 0,
+      'offline: fresh import + click + export all pass with the network cut',
+      !!oClick?.maskSummary && oEx && oEx.coverage > 0,
       `click=${!!oClick.maskSummary} encoded=${oClick.lastRun?.encoded} export=${oEx?.w}×${oEx?.h}`
-      + ` text=${((oText?.maskSummary?.coverage || 0) * 100).toFixed(1)}% textRun=${JSON.stringify(oText?.lastRun || null)}`
       + (oDiag ? ` diag=${JSON.stringify(oDiag)}` : ''),
     )
     check('offline: zero successful network fetches during inference', succeeded === 0, `${attempted} attempted, ${succeeded} succeeded`)

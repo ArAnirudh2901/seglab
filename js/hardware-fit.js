@@ -18,7 +18,6 @@
  * are flat in proxy size. Only the CPU post pipeline scales with it — and it is
  * 60-70% of a warm click (measured 2026-08-14).
  *
- * Same judgement, second consumer: the text lane's tile grid (§ detector below).
  */
 
 /**
@@ -283,71 +282,3 @@ export const clearPostFit = () => {
     } catch { /* storage disabled */ }
 }
 
-/* ─── Detector lane ───────────────────────────────────────────────────────
- * The same judgement, applied to the one other thing on this device that is
- * paid per unit of work: the text lane's tile grid.
- *
- * A cell is one 640² pass through the YOLOE graph, and a search runs 1 (full
- * frame) or 1+g² of them. Cells cost MEMORY as well as time, and memory is
- * still ruled by class signals in policy.js — an arena that only grows cannot
- * be benched by a stopwatch. This bounds the other axis: how long a search may
- * spend on inference, which IS measurable and is measured on every search.
- */
-
-/** Reference cost of one cell, measured on this machine (WebGPU, nc swept
- *  1→128: 128·132·134·134·137·138·146 ms — flat in slot count). */
-export const REFERENCE_MS_PER_CELL = 140
-
-export const estimateDetectMsPerCell = (cap = {}) => {
-    const { penalty, reasons, inputs } = classPenalty(cap)
-    return {
-        msPerCell: Math.round(REFERENCE_MS_PER_CELL * penalty * ESTIMATE_HEADROOM),
-        source: 'estimated',
-        penalty,
-        reasons,
-        inputs,
-    }
-}
-
-/**
- * Cells this device can pay for inside `detectorBudgetMs`.
- *
- * Returns Infinity when unjudged, so the caller's own (memory) ceiling stands
- * alone — the same rule the proxy ladder follows: no judgement changes nothing.
- */
-export const affordableCells = (budget = {}) => {
-    const msPerCell = Number(budget.detectorMsPerCell) || 0
-    const budgetMs = Number(budget.detectorBudgetMs) || 0
-    if (msPerCell <= 0 || budgetMs <= 0) return Infinity
-    return Math.max(1, Math.floor(budgetMs / msPerCell))
-}
-
-/** Fold one real search in. Cheap evidence repeats, for the same reason the
- *  band fraction does: a cached-session search is not a cold one. */
-export const observeDetect = (prev, detectMs, cells) => {
-    if (!(detectMs > 0) || !(cells > 0)) return prev || 0
-    const sample = detectMs / cells
-    if (!(prev > 0)) return Math.round(sample)
-    return Math.round(sample > prev ? prev * 0.5 + sample * 0.5 : prev * 0.9 + sample * 0.1)
-}
-
-const CELL_KEY = 'seglab.detectMsPerCell'
-
-export const loadDetectMsPerCell = (now = Date.now()) => {
-    try {
-        const raw = globalThis.localStorage?.getItem(CELL_KEY)
-        if (!raw) return 0
-        const v = JSON.parse(raw)
-        const ms = Number(v?.r)
-        const t = Number(v?.t) || 0
-        if (!Number.isFinite(ms) || ms < 10 || ms > 20_000) return 0
-        return t && now - t >= 0 && now - t <= FIT_TTL_MS ? ms : 0
-    } catch { return 0 }
-}
-
-export const saveDetectMsPerCell = (ms, now = Date.now()) => {
-    try {
-        if (!Number.isFinite(ms) || ms < 10 || ms > 20_000) return
-        globalThis.localStorage?.setItem(CELL_KEY, JSON.stringify({ r: Math.round(ms), t: now }))
-    } catch { /* storage disabled */ }
-}

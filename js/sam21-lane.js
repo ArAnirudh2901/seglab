@@ -92,11 +92,32 @@ const f16to32 = (src) => {
 // pin the weights to it — provenance and cache-busting in one. The pointer file
 // itself is fetched uncached; it is ~800 bytes.
 let versionPromise = null
+// A MISSING pointer means the weights were never installed, which is a different
+// failure from an unversioned dev build and must not wear its error. Without
+// this, ORT is the first thing to notice, and it reports the 404 as "failed to
+// load external data file" — which reads as corruption, not as a setup step.
+export const MODELS_MISSING = 'SAM 2.1 weights are not installed in models/sam21/.'
+    + ' Run `bun run models` (it prints the export command if they need building).'
 const modelURL = (file) => {
     versionPromise ??= fetch(new URL('model.json', DIR), { cache: 'no-cache' })
-        .then((r) => (r.ok ? r.json() : null))
+        .then((r) => {
+            if (r.status === 404) {
+                const e = new Error(MODELS_MISSING)
+                e.weightsAbsent = true
+                throw e
+            }
+            return r.ok ? r.json() : null
+        })
         .then((m) => (m ? `${m.version}-${String(m.sha256).slice(0, 12)}` : 'dev'))
-        .catch(() => 'dev')
+        .catch((err) => {
+            // NEVER latch. The memo exists to spare ~800 bytes per weight URL,
+            // not to make one bad fetch permanent: installing the weights (or a
+            // flaky pointer request recovering) must fix the lane on the next
+            // click, without closing every tab to recycle the shared worker.
+            versionPromise = null
+            if (err?.weightsAbsent) throw err
+            return 'dev'   // genuinely unversioned local build
+        })
     return versionPromise.then((v) => `${DIR}${file}?v=${v}`)
 }
 

@@ -5,7 +5,7 @@
  * Scenario 'wasm': --disable-gpu + ?force=wasm — the GPU-less low-end device.
  *
  * Flow: boot → import 51 MP JPEG (real upload path) → eager-encode settle →
- * click cat #1 (encode+decode) → click cat #2 (cached decode) → YOLOE search →
+ * click cat #1 (encode+decode) → click cat #2 (cached decode) →
  * repeat search (frame cache) → YOLO-World search (int8 on wasm) → cutout PNG.
  * Memory: usedJSHeapSize @250 ms + measureUserAgentSpecificMemory @2.5 s, maxima kept.
  * Verdict vs the 8 GB-class budgets (lite/standard8 memBudgetMB 1800/1900).
@@ -110,37 +110,6 @@ try {
     report.checks.click2 = { mask: await page.evaluate(() => window.__seglab.maskStats()) }
     await snap('after-click2')
 
-    // YOLOE lane, direct module call (returns candidates WITH .color — proves
-    // the detached-frame colour fix on the worker path).
-    t = now()
-    const y1 = await page.evaluate(async () => {
-        const m = await import('./js/text-ui.js')
-        const r = await m.detectCandidatesYoloe('cat', { scale: 's', idleMs: 60000 })
-        return r && { backend: r.backend, n: r.candidates.length, colors: r.candidates.map((c) => c.color), scores: r.candidates.map((c) => Math.round(c.score * 100) / 100) }
-    })
-    report.timings.yoloeColdMs = ms(now() - t)
-    report.checks.yoloeCold = y1
-    t = now()
-    const y2 = await page.evaluate(async () => {
-        const m = await import('./js/text-ui.js')
-        const r = await m.detectCandidatesYoloe('cat', { scale: 's', idleMs: 60000 })
-        return r && { backend: r.backend, n: r.candidates.length }
-    })
-    report.timings.yoloeWarmMs = ms(now() - t)
-    report.checks.yoloeWarm = y2
-    await snap('after-yoloe')
-
-    // YOLO-World lane (int8 on the wasm floor — the QDQ load test).
-    t = now()
-    const yw = await page.evaluate(async () => {
-        const m = await import('./js/text-ui.js')
-        const r = await m.detectCandidatesYoloWorld('cat', { scale: 's', idleMs: 0 })
-        return r && { backend: r.backend, n: r.candidates.length, scores: r.candidates.map((c) => Math.round(c.score * 100) / 100) }
-    })
-    report.timings.yoloWorldMs = ms(now() - t)
-    report.checks.yoloWorld = yw
-    await snap('after-yoloworld')
-
     // Cutout PNG through the real button.
     const dl = page.waitForEvent('download', { timeout: 60000 })
     await page.click('#cutout')
@@ -174,7 +143,7 @@ try {
         withinBudget: (report.milestones.final?.uasMax ?? 0) <= verdictBudget,
     }
     writeFileSync(`${OUT}-report.json`, JSON.stringify(report, null, 2))
-    console.log(JSON.stringify({ scenario: SCENARIO, budget: report.budget, timings: report.timings, verdict: report.verdict, climb: report.checks.climb, residentAfterRelease: report.milestones['after-release'], released: report.checks.released, checks: { eager: report.checks.eagerEncode, yoloeCold: report.checks.yoloeCold, yoloWorld: report.checks.yoloWorld, click1cov: report.checks.click1?.mask?.coverage, click2cov: report.checks.click2?.mask?.coverage } }, null, 1))
+    console.log(JSON.stringify({ scenario: SCENARIO, budget: report.budget, timings: report.timings, verdict: report.verdict, climb: report.checks.climb, residentAfterRelease: report.milestones['after-release'], released: report.checks.released, checks: { eager: report.checks.eagerEncode, click1cov: report.checks.click1?.mask?.coverage, click2cov: report.checks.click2?.mask?.coverage } }, null, 1))
     await browser.close()
 } finally {
     server.kill()

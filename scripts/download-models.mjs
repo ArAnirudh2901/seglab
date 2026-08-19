@@ -11,10 +11,9 @@
  * lib/ and models/ are gitignored (~25 MB fetched, ~92 MB built core).
  * Idempotent: complete files are skipped.
  *
- * Usage: node scripts/download-models.mjs [--detector]
+ * Usage: node scripts/download-models.mjs
  *
  *   (core)       click/box/lasso selection + export run with no network.
- *   --detector   also registers the open-vocabulary text-search artifacts.
  */
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
@@ -50,19 +49,6 @@ const CORE_ASSETS = [
     ['models/sam21/model.json', 'python3 scripts/export-sam21.py'],
 ]
 
-// Open-vocabulary text search. Built locally: no hub publishes a YOLOE
-// text-prompt ONNX, and the text tower has to be the MobileCLIP2-B one
-// YOLOE-26L was trained against or RepRTA receives out-of-distribution vectors.
-const DETECTOR_ASSETS = [
-    ['models/yoloe/yoloe-26l-text.fp16.onnx', 'python3 scripts/export-yoloe-text.py'],
-    ['models/clip-text/mclip2-text.q4.onnx', 'python3 scripts/export-clip-text.py'],
-    ['models/clip-text/mclip2-embed.i8', 'python3 scripts/export-clip-text.py'],
-    ['models/clip-text/mclip2-embed.scale.f32', 'python3 scripts/export-clip-text.py'],
-    ['models/clip-text/merges.txt', 'python3 scripts/export-clip-text.py'],
-]
-
-const withDetector = process.argv.includes('--detector')
-
 const jobs = ORT_WEB_FILES.map((f) => ({
     url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_WEB_VERSION}/dist/${f}`,
     dest: `lib/ort-web/${f}`,
@@ -85,7 +71,9 @@ const patchOrtBundle = (buf) => {
     const src = buf.toString('utf8')
     if (src.includes('S.epConfig')) return buf
     if (!src.includes(ORT_EP_ANCHOR)) {
-        throw new Error(`ORT ${ORT_WEB_VERSION}: epConfig anchor missing — re-derive the patch in download-models.mjs`)
+        throw new Error(`ORT ${ORT_WEB_VERSION}: epConfig anchor missing in the freshly downloaded bundle`
+            + ' — upstream minified shape changed; re-derive ORT_EP_ANCHOR in download-models.mjs.'
+            + ' (If this file was NOT just downloaded, delete lib/ort-web/ and re-run.)')
     }
     return Buffer.from(src.replace(ORT_EP_ANCHOR, ORT_EP_ANCHOR + ORT_EP_PATCH), 'utf8')
 }
@@ -93,14 +81,24 @@ const mb = (n) => `${(n / 1024 / 1024).toFixed(2)} MB`
 
 // Idempotency is manifest-based: CDN content-length reports the compressed
 // size when content-encoding is active, so it cannot be compared to disk.
-const priorBytes = await readFile(path.join(ROOT, 'models', 'manifest.json'), 'utf8')
-    .then((s) => new Map(JSON.parse(s).files.map((f) => [f.path, f.bytes])))
-    .catch(() => new Map())
+const priorManifest = await readFile(path.join(ROOT, 'models', 'manifest.json'), 'utf8')
+    .then((s) => JSON.parse(s))
+    .catch(() => null)
+const priorBytes = new Map((priorManifest?.files || []).map((f) => [f.path, f.bytes]))
+// Size is not identity. The runtime is PINNED, so a bump has to invalidate every
+// vendored ORT file even when the stale one happens to match its recorded size —
+// otherwise the skip path hands patchOrtBundle a bundle from the previous
+// version and the run fails claiming the patch anchor is gone.
+const ortStale = priorManifest?.onnxruntimeWeb !== ORT_WEB_VERSION
+if (ortStale && priorManifest) {
+    log(`ORT pin changed (${priorManifest.onnxruntimeWeb || 'unrecorded'} -> ${ORT_WEB_VERSION}) — refetching lib/ort-web/`)
+}
 
 const download = async ({ url, dest, optional }) => {
     const target = path.join(ROOT, dest)
     const local = await stat(target).catch(() => null)
-    if (local && priorBytes.get(dest) === local.size) {
+    const pinnedRuntime = dest.startsWith('lib/ort-web/')
+    if (local && priorBytes.get(dest) === local.size && !(pinnedRuntime && ortStale)) {
         log(`have ${dest} (${mb(local.size)})`)
         return { path: dest, bytes: local.size }
     }
@@ -156,14 +154,11 @@ for (const job of jobs) {
 }
 
 const missingCore = await verifyBuilt(CORE_ASSETS, files)
-let detectorReady = false
-if (withDetector) detectorReady = (await verifyBuilt(DETECTOR_ASSETS, files)).length === 0
 
 const manifest = {
     onnxruntimeWeb: ORT_WEB_VERSION,
     lane: 'sam2.1-small',
     precision: 'fp16',
-    detector: detectorReady ? 'yoloe-26l-text + mobileclip2-b' : null,
     generatedAt: new Date().toISOString(),
     files,
 }
@@ -171,7 +166,6 @@ await mkdir(path.join(ROOT, 'models'), { recursive: true })
 await writeFile(path.join(ROOT, 'models', 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 const total = files.reduce((sum, f) => sum + f.bytes, 0)
 log(`done — ${files.length} files, ${mb(total)} total; wrote models/manifest.json`)
-if (!withDetector) log('open-vocab text search not registered — re-run with --detector once the export scripts have run')
 // Loud, and last, so it is the thing left on screen: the app cannot segment
 // without these, and a silent manifest would let that surface as a runtime bug.
 if (missingCore.length) {

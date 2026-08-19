@@ -15,7 +15,6 @@
 
 import {
     estimatePostMsPerMP, loadPostFit, clearPostFit,
-    estimateDetectMsPerCell, loadDetectMsPerCell, affordableCells,
 } from './hardware-fit.js'
 
 // ONE configuration (DESIGN-MASK-LANE §11). Five presets plus a capability
@@ -60,28 +59,9 @@ const CONFIG = {
         flagshipCacheMax: 0,
         maxResidentHeavy: 1,
         flagship: false,
-        detectorEvictOnEncode: true,
-        detectorIdleMs: 120_000,
-        // Text lane ceiling (proxy-plan detectorPlan). Cells are 640² detector
-        // inferences in one pass; 10 = full frame + 3x3, the depth §6 of
-        // DESIGN-TEXT-LANE measured small subjects need. The source decode is
-        // derived from the grid these buy (~1670 px at 3x3), so detectorMaxSide
-        // is a guardrail rather than the working limit — it binds only if the
-        // grid is ever raised. maxMP bounds a square/panorama, where a long-edge
-        // cap alone says nothing about the raster.
-        detectorMaxCells: 10,
-        // Inference latency one search may spend, spent by hardware-fit the same
-        // way postBudgetMs is. 2500 ms reproduces today's rungs on the measured
-        // ~140 ms/cell reference (10 cells), demotes to 5 around 420 ms/cell and
-        // to full-frame-only past ~900. Cells cost memory too, and that cap
-        // (above) still comes from class signals — an ORT arena cannot be timed.
-        detectorBudgetMs: 2500,
-        detectorMaxSide: 2048,
-        detectorMaxMP: 3,
         samWebGPU: true,
         autoEscalate: false,     // interaction-time native re-decode → manual tiers only
         hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
-        detectorDispose: 'idle',
         eagerEncode: true,
         cvRefine: true,
         rawDevelop: true,
@@ -147,37 +127,6 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         // WASM on any runtime failure, and ?force=wasm / memory pressure override.
         budget.samWebGPU = cap.gpuTier !== 'none'
         budget.mobile = !!cap.mobile
-        // Text-lane depth, from signals that cannot be spoofed upward (the same
-        // rule capability.js uses: deviceMemory counts DOWNWARD only — a genuine
-        // sub-8 reading demotes, an 8 is the privacy cap and never promotes).
-        // Tiling is what makes small subjects findable, so this is the last
-        // thing to go, not the first: a weak device keeps the 2x2 pass and gives
-        // up only the 3x3 escalation.
-        // memoryGB 0 = the browser would not even guess (WebKit and Gecko ship no
-        // navigator.deviceMemory). That is the same engine where the governor has
-        // no byte API to read, so nothing downstream can catch this lane climbing
-        // either — the shallower pass is the only bound left. Chrome reports a
-        // figure and keeps the full depth.
-        const unmeasurable = cap.memorySource !== 'phosmith' && !cap.memoryGB
-        // integratedGPU: an iGPU shares system RAM, so the detector's tiles are
-        // charged against the same budget the proxy and RAW decode sit in, and
-        // there is no VRAM headroom to absorb the 3x3 escalation. Apple silicon
-        // is deliberately NOT flagged integrated (see gpu-adapter) — unified
-        // memory there comes with the bandwidth to use it.
-        const weak = cap.mobile || cap.gpuTier === 'basic' || cap.integratedGPU
-            || (cap.memoryGB > 0 && cap.memoryGB <= 4)
-        if (weak || unmeasurable) budget.detectorMaxCells = Math.min(budget.detectorMaxCells, 5)
-        // Do NOT also switch this rung to detectorDispose 'now'. It looks like
-        // the obvious companion — terminating the worker is the only true free
-        // of its ORT arena — and measured on this image it does drop the settled
-        // floor 1894 -> 1407 MB. But it makes every later search rebuild the
-        // YOLOE session, which raised the PEAK (1956 -> 2069, then 2284 MB) and
-        // took 2.9 s -> 6.2 s. The failure being defended against is an OOM
-        // kill, and a kill is decided by the peak, not the floor.
-        // No usable WebGPU adapter means the detector falls back to WASM, whose
-        // ORT arena only ever grows and is freed only by terminating the worker.
-        // Every extra cell there is permanent for the life of that worker.
-        if (cap.gpuTier === 'none' || (cap.memoryGB > 0 && cap.memoryGB <= 2)) budget.detectorMaxCells = 1
         // Post-processing throughput (hardware-fit). A measurement stored by an
         // earlier session on THIS device always beats the class estimate — the
         // estimate exists only for a device that has never clicked. It expires
@@ -196,15 +145,6 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.postMsPerMPSource = measured ? 'measured' : 'estimated'
         budget.postFitReasons = estimate.reasons
 
-        // Same judgement for the text lane's tile grid, on the axis a stopwatch
-        // can actually see. Latency only — it clamps the memory cap above, never
-        // raises it.
-        const measuredCell = loadDetectMsPerCell()
-        budget.detectorMsPerCell = measuredCell || estimateDetectMsPerCell(cap).msPerCell
-        budget.detectorMsPerCellSource = measuredCell ? 'measured' : 'estimated'
-        if (params.get('detect') !== '0') {
-            budget.detectorMaxCells = Math.min(budget.detectorMaxCells, affordableCells(budget))
-        }
     }
     budget.memoryLocked = locked
     budget.profileSource = 'single' // kept for telemetry; there is nothing to pick
@@ -233,7 +173,7 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     // ?post=0 turns the hardware judgement off (A/B and bug reports), ?post=reset
     // forgets this device's stored measurement (handled above, before it is
     // loaded); a number is a click-latency budget in ms. Never raises any other
-    // cap. ?detect=0 is the same escape hatch for the text lane's grid.
+    // cap.
     const postq = params.get('post')
     if (postq === '0') budget.postMsPerMP = 0
     else if (postq && Number(postq) >= 40) budget.postBudgetMs = Math.min(2000, Math.round(Number(postq)))
@@ -291,19 +231,9 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.maxResidentHeavy = 1
         next.draftCacheMax = Math.min(next.draftCacheMax || 1, 1)
         next.flagshipCacheMax = 0
-        // NB: pressure does NOT move ANY lane off the GPU. The mask lane can't —
-        // there is no wasm EP left to move it to (sam21-lane checkDevice). The
-        // detector won't: `detectorWebGPU` used to be set false here and was
-        // never read, and wiring it would be the wrong fix. Measured, the old
-        // WASM lane pinned ~3 GB against the GPU's ~0.5 GB, and a wasm arena is
-        // freed only by terminating the worker; the WebGPU detector peaks at
-        // 293 MB and gives 178 MB of it back on dispose. Demoting under pressure
-        // makes swap WORSE, which is the one thing pressure is trying to avoid.
+        // NB: pressure does NOT move the mask lane off the GPU — there is no
+        // wasm EP left to move it to (sam21-lane checkDevice).
         next.eagerEncode = false
-        // Give up the 3x3 escalation before anything the user can see. It is
-        // the deepest pass (10 inferences vs 5) and it only ever runs after the
-        // 2x2 pass already found nothing.
-        next.detectorMaxCells = Math.min(next.detectorMaxCells || 10, 5)
     }
     if (nextLevel >= 2) {
         next.cropMaxSide = Math.min(next.cropMaxSide || 1280, 1280)
@@ -324,11 +254,6 @@ export const applyMemoryPressure = (budget, level = 1) => {
         next.proxyMax = Math.min(next.proxyMax || 768, 768)
         next.proxyShortMax = 0 // give up the per-axis boost before anything visible
         next.displayMax = Math.min(next.displayMax || 1280, 1280)
-        // Full frame only: one 640² inference, and the re-decode that feeds it
-        // shrinks with it (detectorPlan derives the source from the grid).
-        next.detectorMaxCells = 1
-        next.detectorMaxSide = Math.min(next.detectorMaxSide || 768, 768)
-        next.detectorMaxMP = Math.min(next.detectorMaxMP || 1, 1)
         if (next.safeProxyMax) next.safeProxyMax = Math.min(next.safeProxyMax, 768)
     }
     return next

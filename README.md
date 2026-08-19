@@ -1,8 +1,7 @@
 # SEGLAB — on-device segmentation
 
 Import a photo, then select anything — clicks (+/−), a box, or a rough lasso
-that snaps to the object. Everything runs in the browser (SAM 2.1 for masks,
-plus a resource-gated YOLOE text-prompt detector for open-vocabulary search) —
+that snaps to the object. Everything runs in the browser (SAM 2.1 for masks) —
 no server, no upload, zero cloud. WebGPU is required, not preferred.
 
 **Privacy:** images, prompts, masks and all inference stay on this device.
@@ -35,13 +34,6 @@ click/box/lasso selection and export need no network at all — a fresh,
 cache-less browser profile with huggingface.co and jsdelivr blocked still
 works, and `bun verify.mjs` gates exactly that.
 
-Text-select (OWLv2, 163 MB) is **not** vendored by default because the feature
-is optional and disposable at runtime. To make it offline too:
-
-```bash
-bun run models:all   # core + OWLv2 detector (~253 MB total)
-```
-
 Skipping `bun run models` is still fine — the app then loads from the pinned
 CDNs on first use and caches into Cache Storage, which survives reloads but is
 evictable and empty in a fresh profile. Vendoring is the durable answer.
@@ -69,7 +61,7 @@ one — stays on lite. Nothing auto-climbs past standard8.
 A **runtime memory governor** (`memory-governor.js`) then guards it live: it
 watches measured agent-cluster bytes (`measureUserAgentSpecificMemory`, which
 sees the WASM heap the old JS-heap watchdog was blind to) plus timer drift (the
-device-relative swap signal) and sheds — detector → refine → embedding → caps —
+device-relative swap signal) and sheds — refine → embedding → caps —
 the instant real pressure appears. The **profile toggle** in the footer lets you
 force any tier, including above the safe auto ceiling; you're then vouching for
 the device, and the governor still steps back down if it can't keep up.
@@ -83,7 +75,6 @@ is engineered to fit, so a DSLR photo works smoothly on any laptop:
 | Display preview | **decoupled from the model** — a crisp GPU-resident display frame (≤ 2048 px, bounded-safe) so a DSLR photo looks sharp while the model keeps its bounded ≤ 1024 buffer (see *Crisp preview* below) |
 | Model | **SAM 2.1 small, fp16, WebGPU only** — one lane, no switch, no upgrade path |
 | Embeddings | exactly **one** resident, current image only, no OPFS/IndexedDB persistence, no speculative encode before the first selection |
-| Detector | Grounding DINO q4f16 only when accelerated WebGPU is confirmed; otherwise OWLv2 WASM/q8. Loads on a real Text query and is disposed immediately after boxes |
 | Escalation | no automatic native-crop escalation, no HD crop re-decode |
 | Export | explicit user action, capped at **4096 px / 8 MP** (a larger source exports reduced, with a status note) |
 | Working copy | ≤ 1280 px bounded re-decode source on unbounded-decode hosts |
@@ -173,7 +164,7 @@ Build it from a clean checkout with Emscripten on PATH:
 ## One heavy job at a time
 
 `js/heavy-job-queue.js` owns every memory-heavy operation — proxy decode,
-model warm, image encode, prompt decode, detector runs, wasm refinement,
+model warm, image encode, prompt decode, wasm refinement,
 export re-decodes — at concurrency 1, so their peak allocations can never
 stack. Import decode outranks model work; user interaction outranks
 speculative prewarm; a new upload or click invalidates queued stale jobs; a
@@ -240,14 +231,8 @@ is capped there and the crisp on-screen preview is a separate display frame.
 - **Lasso** — draw a rough loop; it snaps to the object and can never bleed outside the loop
 - **Region** — draw an exact freehand mask; it selects the drawn area, not the object inside it
 - **Rect / Ellipse / Polygon** — direct marquee masks; polygon closes with double-click or `Enter`
-- **Magic / Color** — select a contiguous colour region or all matching colours. Tolerance is the allowed RGB colour distance: start at **36**; lower it (16–28) for a crisp edge, raise it (45–60) only to include shadows/highlights. It never affects Text mode.
+- **Magic / Color** — select a contiguous colour region or all matching colours. Tolerance is the allowed RGB colour distance: start at **36**; lower it (16–28) for a crisp edge, raise it (45–60) only to include shadows/highlights.
 - **Brush** — paint a mask; right-click or Alt paints an erase stroke
-- **Text** — describe an object; the first search downloads a ~151 MB accelerated detector or ~163 MB portable fallback.
-  Grounding DINO/OWLv2 return candidates, so results are not a
-  guarantee that every instance in a crowded scene is found. Colour-qualified
-  prompts also rank boxes using local colour evidence. If it cannot load within
-  the safe memory profile, text
-  selection reports itself unavailable instead of retrying heavier backends
 - `Z` undo · `R` reset · **Cutout PNG** downloads the selection with transparency
 
 ## Verify (headless)
@@ -282,7 +267,6 @@ bun verify.mjs   # policy/sizing/queue/embedding/wasm/static suites + real app i
 - `js/cv-refine-worker.js` / `cv-refine-client.js` + `cpp/cv_refine.cpp` — wasm mask cleanup
 - `js/image-raw.js` — RAW embedded-preview extractor (fast path, no demosaic)
 - `js/raw-develop-worker.js` / `raw-develop-client.js` + `cpp/raw_develop.cpp` — LibRaw wasm develop (preview-less fallback, disposed after use)
-- `js/detect-engine.js` / `detect-worker.js` — disposable, resource-gated text detector
 - `js/policy.js` / `capability.js` — lite floor, GPU/core-gated standard8 auto-tier, trusted-host tiers, pressure ladder
 - `js/memory-governor.js` — runtime safety net: measured bytes + timer drift → shed (down) / climb signal (up)
 - `scripts/dev-server.mjs` — cross-origin-isolating static dev server (COOP/COEP)

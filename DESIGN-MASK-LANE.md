@@ -1,5 +1,9 @@
 # SEGLAB — Mask Lane Design
 
+> **2026-08-18 — the open-vocabulary text lane was removed.** Passages below
+> that describe "AI Text", the YOLOE/MobileCLIP2 detector, or the governor
+> counting that worker are history: the lane no longer exists in the app.
+
 Single-configuration architecture for the interactive mask lane: SAM 2.1 from
 `darktable-org/darktable-ai`, YOLOE-first routing, and a memory contract that
 holds on an 8 GB MacBook Air with a 45 MP RAW.
@@ -494,10 +498,6 @@ Two levers that look like they should help and do not:
   3.53 → 3.27 → 3.13 ms — ~11 % of one stage, ~0.4 ms per click — because
   extraction, downsample and `compositeUp` are full-resolution regardless.
   r=8/s=4 is measured-optimal for quality (§10b) and stays.
-
-The same judgement runs on the text lane's tile grid: `detectorMaxCells` is
-clamped by measured per-cell inference (`detectorBudgetMs`, 2500 ms) on top of
-the class-derived memory cap, which stays — an ORT arena cannot be timed.
 
 ### 8.2 SAM encode — on demand, in a worker
 
